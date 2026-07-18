@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -877,9 +876,6 @@ func (s *OpenAIGatewayService) handleFailoverErrorResponsePassthrough(
 	body := s.redactAgentIdentitySensitiveBody(ctx, account, responseBody)
 
 	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(body))
-	if resp.StatusCode >= 400 {
-		slog.Info("upstream_error_raw_body", "account_id", account.ID, "status", resp.StatusCode, "body", truncateString(string(body), 2048))
-	}
 	upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 	upstreamDetail := ""
 	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
