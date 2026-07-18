@@ -1,0 +1,96 @@
+name: Auto-rebase on upstream release
+
+on:
+  schedule:
+    # every 30 min — checks for new upstream release tags
+    - cron: "13 */1 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag/branch to rebase onto (default: latest release)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: fix/persistent-rate-limit-block
+          fetch-depth: 0
+          # PAT with `workflow` scope: the rebased branch includes upstream
+          # workflow files, and the default GITHUB_TOKEN cannot push workflow
+          # changes. The PAT authenticates the checkout so `git push` works.
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git
+          git fetch upstream --tags --no-show-forced-updates
+
+      - name: Resolve target ref
+        id: target
+        run: |
+          if [ -n "${{ github.event.inputs.ref }}" ]; then
+            echo "ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            # latest release tag (vX.Y.Z), by version sort
+            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            echo "Latest upstream tag: $LATEST"
+            echo "ref=$LATEST" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if already on target
+        id: need
+        run: |
+          TARGET=${{ steps.target.outputs.ref }}
+          # find the merge-base between patch branch and target
+          MB=$(git merge-base HEAD "$TARGET" 2>/dev/null || echo "")
+          TARGET_SHA=$(git rev-parse "$TARGET")
+          if [ "$MB" = "$TARGET_SHA" ]; then
+            echo "already rebased on $TARGET — nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebase needed onto $TARGET"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase patch branch onto target
+        if: steps.need.outputs.skip != 'true'
+        run: |
+          TARGET=${{ steps.target.outputs.ref }}
+          # Rebase patch + CI commits onto the upstream release tag. VERSION
+          # conflicts are expected (we stamp it per-build); auto-resolve by
+          # taking the target version, then continue.
+          if ! git rebase "$TARGET"; then
+            for i in $(seq 1 20); do
+              if git diff --name-only --diff-filter=U | grep -q '^backend/cmd/server/VERSION$'; then
+                echo "${TARGET#v}" > backend/cmd/server/VERSION
+                git add backend/cmd/server/VERSION
+              fi
+              # any other conflicts: prefer the patch (ours) so our fixes win
+              git diff --name-only --diff-filter=U | while read -r f; do
+                [ -n "$f" ] && git checkout --ours "$f" 2>/dev/null && git add "$f"
+              done
+              if ! GIT_EDITOR=true git rebase --continue 2>/dev/null; then
+                break
+              fi
+            done
+          fi
+          git log --oneline -6
+
+      - name: Force-push (triggers build-binary.yml)
+        if: steps.need.outputs.skip != 'true'
+        run: |
+          git push --force-with-lease origin fix/persistent-rate-limit-block
+          echo "pushed — build-binary.yml will fire automatically"
+
+      - name: No-op summary
+        if: steps.need.outputs.skip == 'true'
+        run: echo "Already up to date with ${{ steps.target.outputs.ref }}; no rebuild needed."

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -276,6 +277,12 @@ func NewOpenAIGatewayHandler(
 		pingInterval = time.Duration(cfg.Concurrency.PingInterval) * time.Second
 		if cfg.Gateway.MaxAccountSwitches > 0 {
 			maxAccountSwitches = cfg.Gateway.MaxAccountSwitches
+		}
+	}
+	// [env-override] SUB2API_MAX_ACCOUNT_SWITCHES force-overrides failover depth.
+	if v := os.Getenv("SUB2API_MAX_ACCOUNT_SWITCHES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxAccountSwitches = n
 		}
 	}
 	return &OpenAIGatewayHandler{
