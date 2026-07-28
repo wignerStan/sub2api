@@ -52,7 +52,12 @@ jobs:
           TARGET=${{ steps.target.outputs.ref }}
           # find the merge-base between patch branch and target
           MB=$(git merge-base HEAD "$TARGET" 2>/dev/null || echo "")
-          TARGET_SHA=$(git rev-parse "$TARGET")
+          # Peel to the commit: release tags are annotated objects, so
+          # `git rev-parse v0.1.166` returns the tag OBJECT sha, which never
+          # equals the (peeled) merge-base commit sha — making this check a
+          # permanent false-positive that always runs a no-op rebase.
+          # ${TARGET}^{commit} resolves the tag to its commit.
+          TARGET_SHA=$(git rev-parse "$TARGET^{commit}")
           if [ "$MB" = "$TARGET_SHA" ]; then
             echo "already rebased on $TARGET — nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"

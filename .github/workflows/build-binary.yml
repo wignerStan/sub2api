@@ -11,7 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # Full history: the "Stamp VERSION" step runs `git describe --tags`
+          # to find the nearest upstream release (e.g. v0.1.166). A shallow
+          # (depth-1) checkout severs HEAD's parent chain, so describe can't
+          # reach the upstream tag and falls back to the stale VERSION file,
+          # mislabeling every build. fetch-depth: 0 keeps the ancestry intact.
+          fetch-depth: 0
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
