@@ -69,3 +69,34 @@ func TestApplyStaticAssetCacheHeaders(t *testing.T) {
 		})
 	})
 }
+
+func TestLooksLikeStaticAssetRequest(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "hashed_js", path: "assets/index-AbCd1234.js", want: true},
+		{name: "hashed_js_leading_slash", path: "/assets/index-AbCd1234.js", want: true},
+		{name: "unhashed_js", path: "assets/index.js", want: true},
+		{name: "logo_svg", path: "logo.svg", want: true},
+		{name: "favicon", path: "favicon.ico", want: true},
+		{name: "manifest", path: "manifest.json", want: true},
+		{name: "nested_asset", path: "assets/vendor/chunk.js", want: true},
+		{name: "spa_route", path: "dashboard", want: false},
+		{name: "spa_route_nested", path: "users/123", want: false},
+		{name: "spa_route_deep", path: "settings/profile", want: false},
+		{name: "bare_root", path: "", want: false},
+		{name: "index_html", path: "index.html", want: false},
+		{name: "index_html_leading_slash", path: "/index.html", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, looksLikeStaticAssetRequest(tc.path))
+		})
+	}
+}
