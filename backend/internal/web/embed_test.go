@@ -676,6 +676,51 @@ func TestFrontendServer_Middleware(t *testing.T) {
 		assert.Equal(t, http.StatusOK, assetWriter.Code)
 		assert.Equal(t, staticAssetsCacheControl, assetWriter.Header().Get("Cache-Control"))
 	})
+
+	t.Run("returns_404_for_missing_static_assets", func(t *testing.T) {
+		provider := &mockSettingsProvider{
+			settings: map[string]string{"test": "value"},
+		}
+
+		server, err := NewFrontendServer(provider)
+		require.NoError(t, err)
+
+		router := gin.New()
+		router.Use(func(c *gin.Context) {
+			c.Set(middleware.CSPNonceKey, "test-nonce")
+			c.Next()
+		})
+		router.Use(server.Middleware())
+
+		// Stale/missing static assets (e.g. a hashed /assets/*.js carried by
+		// a cached index.html from a previous deploy) must 404. Falling back
+		// to the index.html shell would serve text/html for a .js, which
+		// under X-Content-Type-Options: nosniff renders a blank page.
+		missingAssets := []string{
+			"/assets/index-ThisHashNoLongerExists.js",
+			"/assets/vendor-changedHASH.css",
+			"/favicon-missing.ico",
+			"/no-such-file.png",
+		}
+		for _, p := range missingAssets {
+			t.Run(p, func(t *testing.T) {
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, p, nil)
+				router.ServeHTTP(w, req)
+				assert.Equal(t, http.StatusNotFound, w.Code, "missing asset should 404, not serve the shell")
+				assert.NotContains(t, w.Header().Get("Content-Type"), "text/html")
+			})
+		}
+
+		// Regression guard: extension-less SPA routes still get the shell.
+		for _, p := range []string{"/dashboard", "/users/123", "/settings/profile"} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, p, nil)
+			router.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusOK, w.Code, "SPA route %s should serve shell", p)
+			assert.Contains(t, w.Header().Get("Content-Type"), "text/html")
+		}
+	})
 }
 
 func TestEmbeddedFrontendBypassesBareVideoAPIRoutes(t *testing.T) {
