@@ -99,8 +99,27 @@ func (s *FrontendServer) Middleware() gin.HandlerFunc {
 			cleanPath = "index.html"
 		}
 
-		// For index.html or SPA routes, serve with injected settings
-		if cleanPath == "index.html" || !s.fileExists(cleanPath) {
+		// index.html (and bare "/") always get the settings-injected shell.
+		if cleanPath == "index.html" {
+			s.serveIndexHTML(c)
+			return
+		}
+
+		if !s.fileExists(cleanPath) {
+			if looksLikeStaticAssetRequest(cleanPath) {
+				// A missing static asset (typically a stale content-hashed
+				// /assets/*.js from a previous deploy) MUST 404, not fall back
+				// to index.html. Serving the HTML shell for a missing .js —
+				// combined with X-Content-Type-Options: nosniff — makes the
+				// browser refuse to execute it and renders a blank page. A
+				// 404 lets the client revalidate index.html and pick up the
+				// current asset hashes.
+				c.Status(http.StatusNotFound)
+				c.Abort()
+				return
+			}
+			// SPA client-side route (no file extension) → serve the shell so
+			// the in-browser router can handle it.
 			s.serveIndexHTML(c)
 			return
 		}
@@ -333,6 +352,14 @@ func ServeEmbeddedFrontend() gin.HandlerFunc {
 			return
 		}
 
+		// Missing file: 404 for static-asset-looking paths (stale hashed
+		// assets from a previous deploy), otherwise serve the SPA shell so
+		// client-side routing works. See looksLikeStaticAssetRequest.
+		if looksLikeStaticAssetRequest(cleanPath) {
+			c.Status(http.StatusNotFound)
+			c.Abort()
+			return
+		}
 		serveIndexHTML(c, distFS)
 	}
 }
