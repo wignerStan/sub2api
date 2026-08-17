@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -60,6 +63,95 @@ func newDefaultOpenAIWSClientDialer() openAIWSClientDialer {
 	return &coderOpenAIWSClientDialer{
 		proxyClients: make(map[string]*openAIWSProxyClientEntry),
 	}
+}
+
+// newOpenAIWSClientDialer 依据配置选择 WS 建连器：
+// sidecar 启用时走本地 Rust sidecar（/v1/ws）伪装 TLS 指纹，否则用默认 coder 实现。
+func newOpenAIWSClientDialer(cfg *config.Config) openAIWSClientDialer {
+	if cfg != nil && cfg.Gateway.Sidecar.Enabled {
+		if base, err := url.Parse(cfg.Gateway.Sidecar.BaseURL); err == nil && base.Host != "" && cfg.Gateway.Sidecar.Token != "" {
+			return &sidecarOpenAIWSClientDialer{
+				cfg:      cfg,
+				fallback: newDefaultOpenAIWSClientDialer(),
+			}
+		}
+	}
+	return newDefaultOpenAIWSClientDialer()
+}
+
+// sidecarOpenAIWSClientDialer 将 WS 握手改道本地 sidecar /v1/ws。
+type sidecarOpenAIWSClientDialer struct {
+	cfg      *config.Config
+	fallback openAIWSClientDialer
+}
+
+func (d *sidecarOpenAIWSClientDialer) Dial(
+	ctx context.Context,
+	wsURL string,
+	headers http.Header,
+	proxyURL string,
+) (openAIWSClientConn, int, http.Header, error) {
+	if d == nil || d.cfg == nil {
+		return nil, 0, nil, errors.New("sidecar ws dialer is nil")
+	}
+	sidecarBase, err := url.Parse(d.cfg.Gateway.Sidecar.BaseURL)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("invalid sidecar base_url: %w", err)
+	}
+	sidecarBase.Path = strings.TrimRight(sidecarBase.Path, "/") + "/v1/ws"
+
+	opts := &coderws.DialOptions{
+		HTTPHeader:      cloneHeader(headers),
+		CompressionMode: coderws.CompressionContextTakeover,
+	}
+	opts.HTTPHeader.Set("x-s2s-token", d.cfg.Gateway.Sidecar.Token)
+	opts.HTTPHeader.Set("x-upstream-url", strings.TrimSpace(wsURL))
+	if proxy := strings.TrimSpace(proxyURL); proxy != "" {
+		opts.HTTPHeader.Set("x-upstream-proxy", base64.StdEncoding.EncodeToString([]byte(proxy)))
+	}
+
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       5 * time.Minute,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 0,
+	}
+	opts.HTTPClient = &http.Client{Transport: transport}
+
+	conn, resp, err := coderws.Dial(ctx, sidecarBase.String(), opts)
+	if err != nil {
+		status := 0
+		respHeaders := http.Header(nil)
+		if resp != nil {
+			status = resp.StatusCode
+			respHeaders = cloneHeader(resp.Header)
+		}
+		var body []byte
+		if resp != nil && resp.Body != nil {
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+			_ = resp.Body.Close()
+		}
+		return nil, status, respHeaders, &openAIWSHandshakeError{Body: body, Err: err}
+	}
+	conn.SetReadLimit(openAIWSMessageReadLimitBytes)
+	respHeaders := http.Header(nil)
+	if resp != nil {
+		respHeaders = cloneHeader(resp.Header)
+	}
+	return &coderOpenAIWSClientConn{conn: conn}, 0, respHeaders, nil
+}
+
+func (d *sidecarOpenAIWSClientDialer) SnapshotTransportMetrics() OpenAIWSTransportMetricsSnapshot {
+	if d != nil && d.fallback != nil {
+		if m, ok := d.fallback.(openAIWSTransportMetricsDialer); ok {
+			return m.SnapshotTransportMetrics()
+		}
+	}
+	return OpenAIWSTransportMetricsSnapshot{}
 }
 
 type coderOpenAIWSClientDialer struct {

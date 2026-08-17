@@ -46,7 +46,21 @@ jobs:
             -o /tmp/sub2api \
             ./cmd/server
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sidecar
+        working-directory: rustsidecar
+        run: |
+          cargo build --release --locked
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
       - uses: actions/upload-artifact@v4
         with:
           name: sub2api-linux-amd64
           path: /tmp/sub2api
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-sidecar-linux-amd64
+          path: rustsidecar/target/release/sub2api-sidecar

@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -278,7 +279,14 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
-	resp, err := servertiming.Do(client, req)
+	var resp *http.Response
+	if sidecarClient := s.sidecarHTTPClient(); sidecarClient != nil {
+		// TLS 指纹伪装改道本地 sidecar：sidecar 复用 codex 同款 rustls 客户端栈
+		// 出站（http/ws + 每账号 proxy），本进程只负责业务与状态机。
+		resp, err = s.doViaSidecar(sidecarClient, req, proxyURL)
+	} else {
+		resp, err = servertiming.Do(client, req)
+	}
 	if err != nil {
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
@@ -294,6 +302,57 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	})
 
 	return resp, nil
+}
+
+// sidecarHTTPClient 返回启用 sidecar 时的 loopback 客户端，未启用返回 nil。
+func (s *httpUpstreamService) sidecarHTTPClient() *http.Client {
+	if s == nil || s.cfg == nil || !s.cfg.Gateway.Sidecar.Enabled {
+		return nil
+	}
+	base, err := url.Parse(s.cfg.Gateway.Sidecar.BaseURL)
+	if err != nil || base.Host == "" {
+		slog.Warn("sidecar disabled: invalid base_url", "base_url", s.cfg.Gateway.Sidecar.BaseURL)
+		return nil
+	}
+	if s.cfg.Gateway.Sidecar.Token == "" {
+		slog.Warn("sidecar disabled: empty token")
+		return nil
+	}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       5 * time.Minute,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 0,
+	}
+	return &http.Client{Transport: transport}
+}
+
+// doViaSidecar 将请求原样转发给本地 sidecar，由 sidecar 以 codex 客户端栈
+// 指向真实上游（含每账号 proxy）。返回的上游响应按原样透传。
+func (s *httpUpstreamService) doViaSidecar(client *http.Client, req *http.Request, proxyURL string) (*http.Response, error) {
+	originalURL := req.URL.String()
+	sidecarBase, err := url.Parse(s.cfg.Gateway.Sidecar.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	sidecarBase.Path = strings.TrimRight(sidecarBase.Path, "/") + "/v1/http"
+
+	clone := req.Clone(req.Context())
+	clone.URL = sidecarBase
+	clone.Host = sidecarBase.Host
+	clone.Header = req.Header.Clone()
+	clone.Header.Set("x-s2s-token", s.cfg.Gateway.Sidecar.Token)
+	clone.Header.Set("x-upstream-url", originalURL)
+	if strings.TrimSpace(proxyURL) != "" {
+		clone.Header.Set("x-upstream-proxy", base64.StdEncoding.EncodeToString([]byte(proxyURL)))
+	}
+	// 本地 loopback 转发不再需要原始目标 Host 语义（sidecar 由 x-upstream-url 重建）。
+	clone.Header.Del("Host")
+	return servertiming.Do(client, clone)
 }
 
 func httpClientForUpstreamRequest(client *http.Client, req *http.Request) *http.Client {
