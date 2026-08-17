@@ -391,6 +391,15 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	if s == nil || !isOpenAIAccount(account) {
 		return false
 	}
+	// [persistent-rate-limit] Honor the DB-persisted rate_limit_reset_at in
+	// addition to the in-memory fast-path map below. The in-memory map is
+	// process-local and lost on restart; without this check, a freshly-started
+	// scheduler re-picks accounts still in their OpenAI 5h/7d cooldown and burns
+	// failover switches on guaranteed 429s. handle429 already persists the field
+	// via accountRepo.SetRateLimited (which also refreshes the snapshot).
+	if account != nil && account.RateLimitResetAt != nil && account.RateLimitResetAt.After(time.Now()) {
+		return true
+	}
 	mu := s.openAIAccountRuntimeBlockLock(account.ID)
 	mu.Lock()
 	defer mu.Unlock()
