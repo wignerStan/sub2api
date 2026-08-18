@@ -2527,6 +2527,13 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
 
+	// gateway.sidecar.* keys follow the same zero-value rule: the effective
+	// defaults (disabled + empty base_url/token) are the zero values, and
+	// GatewaySidecarConfig zero state makes sidecarHTTPClient() return nil.
+	viper.SetDefault("gateway.sidecar.enabled", false)
+	viper.SetDefault("gateway.sidecar.base_url", "")
+	viper.SetDefault("gateway.sidecar.token", "")
+
 	// server.trusted_proxies and security.forwarded_client_ip_headers are the
 	// other exception: load() distinguishes explicit configuration from absence
 	// (issue #4600), and viper.IsSet also reports registered defaults, so a
