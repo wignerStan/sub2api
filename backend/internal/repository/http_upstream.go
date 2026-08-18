@@ -215,7 +215,14 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 执行请求
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
-	resp, err := servertiming.Do(client, req)
+	var resp *http.Response
+	if sc := s.sidecarHTTPClient(); sc != nil && isOpenAIUpstreamHost(req) {
+		// OpenAI OAuth/Codex 出口改道本地 sidecar（codex 同款 rustls 客户端栈伪装 TLS），
+		// 覆盖 /v1/responses、chat completions、billing probe 等全部 OpenAI HTTP 上游。
+		resp, err = s.doViaSidecar(sc, req, proxyURL)
+	} else {
+		resp, err = servertiming.Do(client, req)
+	}
 	if err != nil {
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
 		// 请求失败，立即减少计数
@@ -302,6 +309,21 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	})
 
 	return resp, nil
+}
+
+// isOpenAIUpstreamHost 判定请求目标是否为 OpenAI/Codex 出口域。
+func isOpenAIUpstreamHost(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	host := strings.ToLower(req.URL.Hostname())
+	if host == "openai.com" || strings.HasSuffix(host, ".openai.com") {
+		return true
+	}
+	if host == "chatgpt.com" || strings.HasSuffix(host, ".chatgpt.com") {
+		return true
+	}
+	return false
 }
 
 // sidecarHTTPClient 返回启用 sidecar 时的 loopback 客户端，未启用返回 nil。
