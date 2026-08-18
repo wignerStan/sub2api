@@ -52,23 +52,27 @@ struct AppState {
 }
 
 impl AppState {
-    async fn client_for(&self, proxy: Option<String>) -> HttpClient {
+    async fn client_for(&self, proxy: Option<String>) -> Result<HttpClient, Response> {
         let key = proxy.clone().unwrap_or_default();
         if let Some(client) = self.clients.read().await.get(&key) {
-            return client.clone();
+            return Ok(client.clone());
         }
         let mut builder = HttpClientBuilder::new()
             .with_rustls_tls()
             .without_request_logging();
-        if let Some(url) = proxy {
-            builder = builder.with_proxy(url);
+        if let Some(ref url) = proxy {
+            builder = builder.with_proxy(url.clone());
         }
-        let client = match builder.build_direct() {
-            Ok(client) => client,
-            Err(_) => HttpClient::new(reqwest::Client::new()),
-        };
+        // 构建失败(如代理 URL 非法)必须显式失败,绝不静默回退裸 reqwest:
+        // 静默直连会绕过代理与 codex rustls 伪装栈,违背 sidecar 初衷。
+        let client = builder
+            .build_direct()
+            .map_err(|error| {
+                tracing::warn!(error = %error, proxy, "proxy client build failed");
+                StatusCode::BAD_GATEWAY.into_response()
+            })?;
         self.clients.write().await.insert(key, client.clone());
-        client
+        Ok(client)
     }
 }
 
@@ -132,7 +136,10 @@ async fn http_tunnel(State(state): State<AppState>, headers: HeaderMap, axum_req
         Err(response) => return response,
     };
 
-    let client = state.client_for(proxy).await;
+    let client = match state.client_for(proxy).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
     let forwarded = forwarded_headers(&headers);
     let method = axum_request.method().clone();
 
