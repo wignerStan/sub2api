@@ -693,6 +693,10 @@ func registerCodexAssociationBlockRoutes(r *gin.Engine) {
 		"/v1/sdk_exception",
 		"/v1/log_event",
 		"/v1/get_config",
+		"/v1/feedback",
+		"/v1/feedback/*path",
+		"/feedback",
+		"/feedback/*path",
 	} {
 		r.Any(path, block)
 	}

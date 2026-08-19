@@ -120,6 +120,7 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	if metadata := strings.TrimSpace(turnMetadata); metadata != "" {
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
+	ensureStagedCodexFingerprintIDs(c, account)
 	applyStagedCodexFingerprintHeaders(c, account, headers)
 	if account != nil && account.Type == AccountTypeOAuth {
 		sanitizeCodexOutboundAssociationHeaders(headers)

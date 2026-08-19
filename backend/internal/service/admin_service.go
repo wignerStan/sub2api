@@ -103,6 +103,9 @@ type AdminService interface {
 	ForceAntigravityPrivacy(ctx context.Context, account *Account) string
 	SetAccountSchedulable(ctx context.Context, id int64, schedulable bool) (*Account, error)
 	BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error)
+	// ConvergeCodexFingerprints sets every OpenAI OAuth account to session mode
+	// and ensures a valid per-account seed. rotateSeeds replaces existing seeds.
+	ConvergeCodexFingerprints(ctx context.Context, rotateSeeds bool) (*ConvergeCodexFingerprintsResult, error)
 	CheckMixedChannelRisk(ctx context.Context, currentAccountID int64, currentAccountPlatform string, groupIDs []int64) error
 	// RevertAccountProxyFallback 将账号的 proxy_id 切回 proxy_fallback_origin_id，并清空 origin 字段。
 	// 若账号不存在返回 ErrAccountNotFound；若账号存在但不在 fallback 状态，返回 ErrAccountNotInFallback。
@@ -483,6 +486,13 @@ type BulkUpdateAccountsResult struct {
 	FailedIDs                 []int64                   `json:"failed_ids"`
 	Results                   []BulkUpdateAccountResult `json:"results"`
 	LongContextInheritedCount int                       `json:"long_context_inherited_count,omitempty"`
+}
+
+// ConvergeCodexFingerprintsResult is the admin converge response.
+type ConvergeCodexFingerprintsResult struct {
+	Matched     int   `json:"matched"`
+	Updated     int64 `json:"updated"`
+	RotateSeeds bool  `json:"rotate_seeds"`
 }
 
 type CreateProxyInput struct {

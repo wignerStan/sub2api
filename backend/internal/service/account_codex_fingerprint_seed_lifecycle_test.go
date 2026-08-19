@@ -214,6 +214,30 @@ func TestDuplicateCreatePathMintsFreshSeedWhenEligible(t *testing.T) {
 	require.Equal(t, "session", account.Extra[codexFingerprintModeExtraKey])
 }
 
+func TestAdminConvergeCodexFingerprintsTargetsAllOpenAIOAuth(t *testing.T) {
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
+		1: {ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Extra: map[string]any{codexFingerprintModeExtraKey: "off"}},
+		2: {ID: 2, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Extra: nil},
+		3: {ID: 3, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{codexFingerprintModeExtraKey: "off"}},
+		4: {ID: 4, Platform: PlatformAnthropic, Type: AccountTypeOAuth},
+	}}
+
+	result, err := (&adminServiceImpl{accountRepo: repo}).ConvergeCodexFingerprints(context.Background(), false)
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Matched)
+	require.Equal(t, int64(2), result.Updated)
+	require.False(t, result.RotateSeeds)
+	require.Len(t, repo.bulkUpdates, 1)
+	require.Equal(t, "session", repo.bulkUpdates[0].Extra[codexFingerprintModeExtraKey])
+	require.True(t, repo.bulkUpdates[0].EnsureCodexFingerprintSeed)
+	require.False(t, repo.bulkUpdates[0].RotateCodexFingerprintSeed)
+
+	rotated, err := (&adminServiceImpl{accountRepo: repo}).ConvergeCodexFingerprints(context.Background(), true)
+	require.NoError(t, err)
+	require.True(t, rotated.RotateSeeds)
+	require.True(t, repo.bulkUpdates[1].RotateCodexFingerprintSeed)
+}
+
 func TestAccountServiceCreateAndUpdateCodexSeedLifecycle(t *testing.T) {
 	ctx := context.Background()
 	repo := &upstreamBillingProbeAccountRepo{accounts: make(map[int64]*Account)}

@@ -80,7 +80,6 @@ var openaiAllowedHeaders = map[string]bool{
 	"openai-beta":             true,
 	"x-codex-beta-features":   true,
 	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
 	"x-codex-turn-metadata":   true,
 	"x-codex-window-id":       true,
 	responsesLiteHeaderKey:    true,
@@ -89,7 +88,6 @@ var openaiAllowedHeaders = map[string]bool{
 // OpenAI passthrough allowed headers whitelist.
 // locale / timeout / attestation 不透传。beta 先拷贝，OAuth 再由 sanitize 剥离并重建。
 var openaiPassthroughAllowedHeaders = map[string]bool{
-	"accept":                  true,
 	"content-type":            true,
 	"conversation_id":         true,
 	"user-agent":              true,
@@ -98,7 +96,6 @@ var openaiPassthroughAllowedHeaders = map[string]bool{
 	"openai-beta":             true,
 	"x-codex-beta-features":   true,
 	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
 	"x-codex-turn-metadata":   true,
 	"x-codex-window-id":       true,
 	responsesLiteHeaderKey:    true,

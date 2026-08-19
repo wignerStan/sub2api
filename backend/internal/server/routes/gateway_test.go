@@ -58,6 +58,24 @@ func newGatewayRoutesTestRouterWithConfig(cfg *config.Config, platform ...string
 	return router
 }
 
+func TestGatewayRoutesBlockCodexFeedbackAndAnalytics(t *testing.T) {
+	router := newGatewayRoutesTestRouter()
+	for _, path := range []string{
+		"/v1/feedback",
+		"/v1/feedback/submit",
+		"/feedback",
+		"/v1/analytics",
+		"/v1/telemetry",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusNotFound, w.Code, "path=%s", path)
+		require.Contains(t, w.Body.String(), "not_found_error")
+	}
+}
+
 func TestGatewayRoutesOpenAIResponsesCompactPathIsRegistered(t *testing.T) {
 	router := newGatewayRoutesTestRouter()
 

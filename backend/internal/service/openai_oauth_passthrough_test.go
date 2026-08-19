@@ -2070,7 +2070,7 @@ func TestOpenAIGatewayService_CodexFingerprintHTTPRawPassthroughHeaderBodyParity
 	require.Equal(t, gjson.Get(bodyTurnMetadata, "turn_id").String(), gjson.Get(headerTurnMetadata, "turn_id").String())
 }
 
-func TestOpenAIGatewayService_CodexFingerprintCompactDoesNotRewriteBodyCacheKeyOrMetadata(t *testing.T) {
+func TestOpenAIGatewayService_CodexFingerprintCompactAppliesHeaderRewrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -2079,27 +2079,31 @@ func TestOpenAIGatewayService_CodexFingerprintCompactDoesNotRewriteBodyCacheKeyO
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.144.1")
 	c.Request.Header.Set("originator", "codex_cli_rs")
 	c.Request.Header.Set("session-id", "header-session")
+	c.Request.Header.Set("x-codex-installation-id", "client-install")
+	c.Request.Header.Set("x-codex-turn-state", "client-turn-state")
+	c.Request.Header.Set("Accept", "text/html")
 
 	body := []byte(`{"model":"gpt-5.4","stream":false,"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session"},"input":[{"type":"message","role":"user","content":"compress"}]}`)
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
-		Body:       io.NopCloser(strings.NewReader(compactProbeSSESuccessBody)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid-compact"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"cmp_123","usage":{"input_tokens":11,"output_tokens":22}}`)),
 	}}
 	svc := &OpenAIGatewayService{
 		cfg:           &config.Config{},
 		httpUpstream:  upstream,
 		toolCorrector: NewCodexToolCorrector(),
 	}
-	account := newTestOAuthAccount(4403, map[string]any{codexFingerprintModeExtraKey: "session"})
+	account := newTestOAuthAccount(4403, map[string]any{
+		codexFingerprintModeExtraKey:                    "session",
+		"openai_passthrough":                            true,
+		"openai_oauth_responses_websockets_v2_mode":     OpenAIWSIngressModeOff,
+	})
 	account.Name = "oauth-compact"
 	account.Status = StatusActive
 	account.Schedulable = true
 	account.Concurrency = 1
 	account.Credentials = map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"}
-	staleIDs := resolveCodexFingerprintIDs(account, "stale-session", codexFingerprintSession)
-	require.NotNil(t, staleIDs)
-	stageCodexFingerprintIDs(c, staleIDs)
 
 	_, err := svc.Forward(context.Background(), c, account, body)
 	require.NoError(t, err)
@@ -2107,11 +2111,17 @@ func TestOpenAIGatewayService_CodexFingerprintCompactDoesNotRewriteBodyCacheKeyO
 
 	seed, ok := codexFingerprintSeed(account.Extra)
 	require.True(t, ok)
-	require.NotEqual(t, resolveConvergedSessionID(seed), gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
-	require.Equal(t, "body-session", gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
-	require.Equal(t, "body-session", gjson.GetBytes(upstream.lastBody, "client_metadata.session_id").String())
-	require.False(t, gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").Exists())
-	require.Empty(t, upstream.lastReq.Header.Get("x-codex-window-id"))
+	wantInstall := resolveConvergedInstallationID(account, seed)
+	wantSession := resolveConvergedSessionID(seed)
+	require.Equal(t, wantInstall, upstream.lastReq.Header.Get("x-codex-installation-id"))
+	require.NotEqual(t, "client-install", upstream.lastReq.Header.Get("x-codex-installation-id"))
+	require.Equal(t, wantSession, upstream.lastReq.Header.Get("session_id"))
+	require.Empty(t, upstream.lastReq.Header.Get("x-codex-turn-state"))
+	require.Equal(t, "application/json", upstream.lastReq.Header.Get("Accept"))
+	if gjson.GetBytes(upstream.lastBody, "client_metadata").Exists() {
+		require.Equal(t, wantSession, gjson.GetBytes(upstream.lastBody, "client_metadata.session_id").String())
+		require.NotEqual(t, "body-session", gjson.GetBytes(upstream.lastBody, "client_metadata.session_id").String())
+	}
 }
 
 func TestOpenAIGatewayService_CodexFingerprintMessagesBridgeDoesNotInjectBodyPromptCacheKey(t *testing.T) {

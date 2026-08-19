@@ -56,20 +56,30 @@ SET extra = (
   COALESCE(extra, '{}'::jsonb)
   || jsonb_build_object('codex_fingerprint_mode', 'session')
   || CASE
-       WHEN extra->>'codex_fingerprint_seed' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+       WHEN extra->>'codex_fingerprint_seed' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
          AND extra->>'codex_fingerprint_seed' IS NOT NULL
+         AND extra->>'codex_fingerprint_seed' <> '00000000-0000-0000-0000-000000000000'
        THEN '{}'::jsonb
        ELSE jsonb_build_object('codex_fingerprint_seed', gen_random_uuid()::text)
      END
 )
-WHERE platform = 'openai' AND type = 'oauth'
-  AND COALESCE(extra->>'codex_fingerprint_mode', '') NOT IN ('device', 'session', 'full');
+WHERE deleted_at IS NULL
+  AND platform = 'openai' AND type = 'oauth'
+  AND (
+    COALESCE(extra->>'codex_fingerprint_mode', '') NOT IN ('session')
+    OR extra->>'codex_fingerprint_seed' IS NULL
+    OR btrim(extra->>'codex_fingerprint_seed') = ''
+    OR NOT (
+      extra->>'codex_fingerprint_seed' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      AND extra->>'codex_fingerprint_seed' <> '00000000-0000-0000-0000-000000000000'
+    )
+  );
 """
 rotate_sql = """
 UPDATE accounts
 SET extra = extra || jsonb_build_object('codex_fingerprint_seed', gen_random_uuid()::text)
-WHERE platform = 'openai' AND type = 'oauth'
-  AND COALESCE(extra->>'codex_fingerprint_mode', '') IN ('device', 'session', 'full');
+WHERE deleted_at IS NULL
+  AND platform = 'openai' AND type = 'oauth';
 """
 count = """
 SELECT

@@ -42,6 +42,25 @@ func TestBulkUpdateEnsuresCodexFingerprintSeedWithPerRowSQL(t *testing.T) {
 	require.Equal(t, `{"codex_fingerprint_mode":"session"}`, string(payload))
 }
 
+func TestBulkUpdateRotatesCodexFingerprintSeeds(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(0)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	_, err := repo.BulkUpdate(context.Background(), []int64{27, 28}, service.AccountBulkUpdate{
+		Extra: map[string]any{
+			"codex_fingerprint_mode": "session",
+		},
+		EnsureCodexFingerprintSeed: true,
+		RotateCodexFingerprintSeed: true,
+	})
+
+	require.NoError(t, err)
+	require.NotEmpty(t, exec.execQueries)
+	query := normalizeSQLWhitespace(exec.execQueries[0])
+	require.Contains(t, query, "gen_random_uuid()::text")
+	require.NotContains(t, query, "to_jsonb(extra ->> 'codex_fingerprint_seed')")
+}
+
 func TestUpdateExtraEnsuresCodexFingerprintSeedAtomicallyWhenEnabling(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

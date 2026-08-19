@@ -1224,9 +1224,13 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 		t.Fatal("等待 passthrough websocket 结束超时")
 	}
 
-	require.Equal(t, isolateOpenAISessionID(0, "pcache_passthrough"), captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, "turn-state-1", captureDialer.lastHeaders.Get(openAIWSTurnStateHeader))
-	require.Equal(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader))
+	ids := resolveCodexFingerprintIDsFromRequest(account, http.Header{})
+	require.NotNil(t, ids)
+	require.Equal(t, ids.sessionID, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, isolateOpenAISessionID(0, "pcache_passthrough"), captureDialer.lastHeaders.Get("session_id"))
+	require.Empty(t, captureDialer.lastHeaders.Get(openAIWSTurnStateHeader), "client turn-state must not reach upstream")
+	require.NotEqual(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader), "opaque client turn-metadata must be rebuilt")
+	require.Contains(t, captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader), ids.sessionID)
 	require.Len(t, upstreamConn.writes, 1)
 	forwarded := requestToJSONString(upstreamConn.writes[0])
 	require.False(t, gjson.Get(forwarded, `tools.#(type=="namespace")`).Exists())

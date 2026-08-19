@@ -2073,6 +2073,54 @@ func (h *AccountHandler) BatchUpdateCredentials(c *gin.Context) {
 	})
 }
 
+// ConvergeCodexFingerprints sets every OpenAI OAuth account to session mode
+// and ensures a valid seed. POST /api/v1/admin/accounts/codex-fingerprint/converge
+func (h *AccountHandler) ConvergeCodexFingerprints(c *gin.Context) {
+	if h == nil || h.adminService == nil {
+		response.ErrorFrom(c, errors.New("admin service unavailable"))
+		return
+	}
+	rotateSeeds := parseCodexFingerprintRotateSeeds(c)
+	result, err := h.adminService.ConvergeCodexFingerprints(c.Request.Context(), rotateSeeds)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func parseCodexFingerprintRotateSeeds(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if parseTruthyFlag(c.Query("rotate-seeds")) || parseTruthyFlag(c.Query("rotate_seeds")) {
+		return true
+	}
+	var body struct {
+		RotateSeeds *bool `json:"rotate_seeds"`
+		Rotate      *bool `json:"rotate-seeds"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		return false
+	}
+	if body.RotateSeeds != nil {
+		return *body.RotateSeeds
+	}
+	if body.Rotate != nil {
+		return *body.Rotate
+	}
+	return false
+}
+
+func parseTruthyFlag(value string) bool {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // BulkUpdate handles bulk updating accounts with selected fields/credentials.
 // POST /api/v1/admin/accounts/bulk-update
 func (h *AccountHandler) BulkUpdate(c *gin.Context) {
