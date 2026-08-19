@@ -1,5 +1,6 @@
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools:go_mod.bzl", "go_mod_binary", "go_mod_test")
+load("//tools:rust_mod.bzl", "rust_mod_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -35,8 +36,21 @@ go_mod_test(
     timeout = "eternal",
 )
 
+go_mod_test(
+    name = "backend_e2e",
+    srcs = ["//backend:srcs"],
+    mode = "test-e2e",
+    timeout = "long",
+)
+
 go_mod_binary(
     name = "sub2api_linux",
     srcs = ["//backend:srcs"],
     out = "sub2api",
+)
+
+rust_mod_test(
+    name = "sidecar_unit",
+    srcs = ["//rustsidecar:srcs"],
+    timeout = "eternal",
 )

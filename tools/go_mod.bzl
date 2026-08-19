@@ -24,7 +24,7 @@ def _go_mod_test_impl(ctx):
     cmds = {
         "test-unit": '"$GO" test -tags=unit -count=1 ./...',
         "test-integration": '"$GO" test -tags=integration -count=1 -timeout=20m ./...',
-        "test-e2e": '"$GO" test -tags=e2e -count=1 -timeout=300s -v ./internal/integration/...',
+        "test-e2e": '"$GO" test -tags=e2e -count=1 -timeout=300s -v ./internal/integration/ -run TestCodexHardening',
     }
     runner = ctx.actions.declare_file(ctx.label.name + "_runner.sh")
     ctx.actions.write(

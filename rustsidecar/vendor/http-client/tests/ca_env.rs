@@ -9,7 +9,6 @@
 //! parsing, and user-facing errors. The HTTPS probes go further and perform real POSTs against
 //! locally generated certificates, including through a TLS-intercepting CONNECT proxy.
 
-use codex_utils_cargo_bin::cargo_bin;
 use rcgen::BasicConstraints;
 use rcgen::CertificateParams;
 use rcgen::CertifiedIssuer;
@@ -53,6 +52,13 @@ const PROXY_ENV_VARS: &[&str] = &[
     "NO_PROXY",
     "no_proxy",
 ];
+
+fn cargo_bin(name: &str) -> Result<PathBuf, String> {
+    let key = format!("CARGO_BIN_EXE_{}", name.replace('-', "_"));
+    std::env::var(&key)
+        .map(PathBuf::from)
+        .map_err(|_| format!("{key} is unset; custom_ca_probe is a package bin"))
+}
 
 const TEST_CERT_1: &str = include_str!("fixtures/test-ca.pem");
 const TEST_CERT_2: &str = include_str!("fixtures/test-intermediate.pem");

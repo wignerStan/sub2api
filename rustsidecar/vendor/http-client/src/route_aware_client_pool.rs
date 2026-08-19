@@ -37,6 +37,30 @@ use crate::tls_backend_fallback::should_retry_with_rustls;
 
 const MAX_CACHED_ROUTES: usize = 16;
 
+fn error_looks_like_tls_certificate_or_alert(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    let display = error.to_string().to_ascii_lowercase();
+    let debug = format!("{error:?}").to_ascii_lowercase();
+    for haystack in [display.as_str(), debug.as_str()] {
+        if [
+            "invalid peer certificate",
+            "invalidcertificate",
+            "unknownissuer",
+            "unknown issuer",
+            "notvalidforname",
+            "alertreceived",
+            "received fatal alert",
+        ]
+        .iter()
+        .any(|marker| haystack.contains(marker))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum CustomCaFallback {
     #[default]
@@ -121,6 +145,7 @@ impl RouteAwareRequestError {
         while let Some(error) = source {
             if error.downcast_ref::<rustls::Error>().is_some()
                 || error.downcast_ref::<native_tls::Error>().is_some()
+                || error_looks_like_tls_certificate_or_alert(error)
             {
                 return Some(RouteFailureClass::TlsError);
             }

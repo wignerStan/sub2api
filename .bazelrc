@@ -18,6 +18,8 @@ build:remote --strategy=GoCompile=remote
 build:remote --strategy=GoLink=remote
 build:remote --strategy=GoTest=remote
 build:remote --strategy=GoModBuild=remote
+build:remote --strategy=Rustc=remote
+build:remote --strategy=RustcLTO=remote
 build:remote --define=EXECUTOR=remote
 build:remote --action_env=GOTOOLCHAIN=local
 build:remote --action_env=GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
