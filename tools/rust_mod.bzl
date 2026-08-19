@@ -108,3 +108,84 @@ rust_mod_test = rule(
         ),
     },
 )
+
+def _rust_mod_binary_impl(ctx):
+    tc = ctx.toolchains["@rules_rust//rust:toolchain_type"]
+    out = ctx.outputs.out
+    sysroot_path = ""
+    if getattr(tc, "sysroot_anchor", None):
+        sysroot_path = tc.sysroot_anchor.path.rsplit("/", 1)[0]
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = depset(ctx.files.srcs, transitive = [_toolchain_files(tc)]),
+        tools = [tc.rustc, tc.cargo],
+        command = """
+set -euo pipefail
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "FAIL: expected Linux RBE worker, got $(uname -s)" >&2
+  exit 1
+fi
+export RUSTC="$PWD/{rustc}"
+export CARGO="$PWD/{cargo}"
+export PATH="$(dirname "$CARGO"):$(dirname "$RUSTC"):$PATH"
+if [[ -n "{sysroot}" && -d "$PWD/{sysroot}" ]]; then
+  export RUSTFLAGS="--sysroot $PWD/{sysroot} ${{RUSTFLAGS:-}}"
+fi
+OUT="$PWD/{out}"
+if command -v gcc >/dev/null 2>&1; then
+  export CC=gcc
+  export CXX="${{CXX:-g++}}"
+fi
+export CARGO_HOME="$PWD/.cargo-home"
+export CARGO_TARGET_DIR="$PWD/.cargo-target"
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+export RUSTUP_HOME="$PWD/.rustup-missing"
+unset RUSTUP || true
+mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+echo "rust_mod_binary: $($RUSTC --version) $($CARGO --version) host=$(hostname)"
+ROOT=""
+for candidate in rustsidecar "$PWD/rustsidecar"; do
+  if [[ -f "$candidate/Cargo.toml" ]]; then
+    ROOT="$candidate"
+    break
+  fi
+done
+if [[ -z "$ROOT" ]]; then
+  echo "FAIL: rustsidecar/Cargo.toml not in inputs" >&2
+  exit 1
+fi
+WORK="$PWD/sidecar-src"
+rm -rf "$WORK"
+cp -a "$ROOT" "$WORK"
+cd "$WORK"
+if ! "$CARGO" build --release --locked --offline --bin sub2api-sidecar; then
+  echo "rust_mod_binary: offline miss, fetching crates" >&2
+  "$CARGO" build --release --locked --bin sub2api-sidecar
+fi
+cp -f "$CARGO_TARGET_DIR/release/sub2api-sidecar" "$OUT"
+chmod 0755 "$OUT"
+file "$OUT" || true
+""".format(
+            rustc = tc.rustc.path,
+            cargo = tc.cargo.path,
+            sysroot = sysroot_path,
+            out = out.path,
+        ),
+        mnemonic = "CargoReleaseBuild",
+        use_default_shell_env = True,
+    )
+    return [DefaultInfo(files = depset([out]), executable = out)]
+
+rust_mod_binary = rule(
+    implementation = _rust_mod_binary_impl,
+    executable = True,
+    toolchains = ["@rules_rust//rust:toolchain_type"],
+    cfg = _linux_transition,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "out": attr.output(mandatory = True),
+        "_allowlist_function_transition": attr.label(
+            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+        ),
+    },
+)

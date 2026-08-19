@@ -1,6 +1,6 @@
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//tools:go_mod.bzl", "go_mod_binary", "go_mod_test")
-load("//tools:rust_mod.bzl", "rust_mod_test")
+load("//tools:rust_mod.bzl", "rust_mod_binary", "rust_mod_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -53,4 +53,10 @@ rust_mod_test(
     name = "sidecar_unit",
     srcs = ["//rustsidecar:srcs"],
     timeout = "eternal",
+)
+
+rust_mod_binary(
+    name = "sidecar",
+    srcs = ["//rustsidecar:srcs"],
+    out = "sub2api-sidecar",
 )
