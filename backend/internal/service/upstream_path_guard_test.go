@@ -143,6 +143,16 @@ func TestOpenAIResponsesRequestPathSuffixRejectsNonConformingSubpaths(t *testing
 			require.Equal(t, want, openAIResponsesRequestPathSuffix(c))
 		})
 	}
+
+	for _, path := range []string{
+		"/v1/responses/compact/detail",
+		"/v1/responses/resp_123/cancel",
+	} {
+		t.Run("blocked_"+path, func(t *testing.T) {
+			c := newResponsesSuffixTestContext(t, path)
+			require.False(t, IsForwardableOpenAIResponsesRequestPath(c))
+		})
+	}
 }
 
 func TestIsOpenAIResponsesCompactPathUsesLegacyEndpointShape(t *testing.T) {

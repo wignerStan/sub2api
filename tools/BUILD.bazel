@@ -1,0 +1,4 @@
+exports_files([
+    "go_mod.bzl",
+    "remote_smoke.sh",
+])

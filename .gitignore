@@ -148,3 +148,9 @@ output/
 .vite/
 !rustsidecar/vendor/
 !rustsidecar/vendor/**
+
+# Bazel local outputs / convenience symlinks
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-sub2api

@@ -1,0 +1,20 @@
+module(
+    name = "sub2api",
+    version = "0.1.178",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+# Bazel 9 removed the CcInfo builtin; rules_go < 0.59 fails analysis.
+bazel_dep(name = "rules_go", version = "0.59.0")
+
+# Hermetic Go SDK (linux/amd64 on the GHA-like RBE worker). The worker
+# image does not need a system go — it only executes this toolchain.
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+
+go_sdk.from_file(
+    name = "go_sdk",
+    go_mod = "//backend:go.mod",
+)
+
+use_repo(go_sdk, "go_sdk")
