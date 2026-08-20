@@ -393,6 +393,20 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		normalized = policyApplied
+		var fpBody []byte
+		var fpErr error
+		if turn > 1 {
+			fpBody, fpErr = applyStagedCodexFingerprintClientMetadataRawForFollowup(c, account, normalized, true)
+		} else {
+			fpBody, fpErr = applyStagedCodexFingerprintClientMetadataRaw(c, account, normalized)
+		}
+		if fpErr != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", fpErr)
+		}
+		normalized = fpBody
+		if rewrittenKey := strings.TrimSpace(gjson.GetBytes(normalized, "prompt_cache_key").String()); rewrittenKey != "" {
+			promptCacheKey = rewrittenKey
+		}
 		ingressSessionOriginalModel = originalModel
 
 		return openAIWSClientPayload{

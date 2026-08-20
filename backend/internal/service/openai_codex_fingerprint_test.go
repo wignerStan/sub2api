@@ -11,9 +11,40 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 const testCodexFingerprintSeed = "11111111-1111-4111-8111-111111111111"
+
+const leakedCodexWSPassthroughFrame = `{"type":"response.create","model":"gpt-5.1","stream":false,"prompt_cache_key":"body-session","client_metadata":{"session_id":"body-session","x-codex-installation-id":"client-install","cwd":"/Users/alice/secret-repo","workspace":"/Users/alice/secret-repo","git_branch":"feat/leak","os":"darwin","terminal":"iTerm2","plugin":"cursor","mcp":"enabled","trace_id":"orig-trace","x-codex-turn-metadata":"{\"installation_id\":\"body-install\",\"session_id\":\"body-session\",\"thread_id\":\"body-thread\",\"turn_id\":\"body-turn\",\"window_id\":\"body-window\",\"sandbox\":\"seatbelt\",\"cwd\":\"/Users/alice/secret-repo\"}"},"input":[{"type":"input_text","text":"hi"}]}`
+
+const leakedCodexWSPassthroughFrameTurn2 = `{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_fp_first","prompt_cache_key":"body-session-2","client_metadata":{"session_id":"body-session-2","x-codex-installation-id":"client-install-2","cwd":"/Users/bob/other-repo","os":"linux","terminal":"gnome","plugin":"vscode","mcp":"on","trace_id":"orig-trace-2"},"input":[{"type":"input_text","text":"again"}]}`
+
+func requireNoLeakedCodexClientMetadata(t *testing.T, frame []byte) {
+	t.Helper()
+	for _, leaked := range []string{"cwd", "workspace", "git_branch", "os", "terminal", "plugin", "mcp", "trace_id"} {
+		require.Falsef(t, gjson.GetBytes(frame, "client_metadata."+leaked).Exists(), "leaked client_metadata.%s", leaked)
+	}
+	turnMeta := gjson.GetBytes(frame, "client_metadata.x-codex-turn-metadata")
+	if turnMeta.Exists() && turnMeta.Type == gjson.String {
+		require.False(t, gjson.Get(turnMeta.String(), "cwd").Exists())
+		require.False(t, gjson.Get(turnMeta.String(), "sandbox").Exists())
+	}
+}
+
+func requireConvergedCodexWSClientMetadata(t *testing.T, frame []byte, ids *codexFingerprintIDs, originalSession string) {
+	t.Helper()
+	require.NotNil(t, ids)
+	require.Equal(t, ids.installationID, gjson.GetBytes(frame, "client_metadata.x-codex-installation-id").String())
+	require.Equal(t, ids.sessionID, gjson.GetBytes(frame, "client_metadata.session_id").String())
+	require.NotEqual(t, originalSession, gjson.GetBytes(frame, "client_metadata.session_id").String())
+	require.NotEqual(t, "client-install", gjson.GetBytes(frame, "client_metadata.x-codex-installation-id").String())
+	require.NotEqual(t, "client-install-2", gjson.GetBytes(frame, "client_metadata.x-codex-installation-id").String())
+	requireNoLeakedCodexClientMetadata(t, frame)
+	turnMeta := gjson.GetBytes(frame, "client_metadata.x-codex-turn-metadata").String()
+	require.Equal(t, ids.installationID, gjson.Get(turnMeta, "installation_id").String())
+	require.Equal(t, ids.sessionID, gjson.Get(turnMeta, "session_id").String())
+}
 
 func newTestOAuthAccount(id int64, extra map[string]any) *Account {
 	if codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(extra)) {
@@ -833,6 +864,34 @@ func TestApplyCodexFingerprintClientMetadataRaw_Noop(t *testing.T) {
 	assert.Nil(t, out)
 }
 
+func TestValidateNoDuplicateTopLevelJSONKeys(t *testing.T) {
+	require.NoError(t, validateNoDuplicateTopLevelJSONKeys([]byte(`{"model":"gpt-5","client_metadata":{"session_id":"one","session_id":"two"}}`)))
+	require.ErrorContains(t,
+		validateNoDuplicateTopLevelJSONKeys([]byte(`{"model":"gpt-5","client_metadata":{},"client_metadata":{"session_id":"leak"}}`)),
+		`duplicate top-level JSON key "client_metadata"`,
+	)
+	require.ErrorContains(t,
+		validateNoDuplicateTopLevelJSONKeys([]byte(`{"client_metadata":{},"client\u005fmetadata":{"session_id":"leak"}}`)),
+		`duplicate top-level JSON key "client_metadata"`,
+	)
+}
+
+func TestApplyCodexFingerprintClientMetadataRaw_RejectsAmbiguousDuplicateRootKeys(t *testing.T) {
+	account := newTestOAuthAccount(4245, map[string]any{codexFingerprintModeExtraKey: "session"})
+	ids := resolveCodexFingerprintIDs(account, "header-session", codexFingerprintSession)
+	require.NotNil(t, ids)
+
+	for _, body := range []string{
+		`{"model":"gpt-5","client_metadata":{"session_id":"first"},"client_metadata":{"session_id":"leak"}}`,
+		`{"model":"gpt-5","prompt_cache_key":"first","prompt_cache_key":"leak"}`,
+	} {
+		out, changed, err := applyCodexFingerprintClientMetadataRaw([]byte(body), ids)
+		require.ErrorContains(t, err, "duplicate top-level JSON key")
+		require.False(t, changed)
+		require.Equal(t, body, string(out))
+	}
+}
+
 // --- context 暂存与出站头应用（透传/非透传共用 seam）---
 
 func newFingerprintStageTestContext(t *testing.T) *gin.Context {
@@ -878,6 +937,55 @@ func TestEnsureStagedCodexFingerprintIDs_ResolvesWhenUnstaged(t *testing.T) {
 	assert.NotEqual(t, "client-session", h.Get("session_id"))
 	assert.Equal(t, ids.installationID, h.Get("x-codex-installation-id"))
 	assert.NotEqual(t, "client-install", h.Get("x-codex-installation-id"))
+}
+
+func TestApplyStagedCodexFingerprintClientMetadataRaw_WSFrameStripsLeaks(t *testing.T) {
+	c := newFingerprintStageTestContext(t)
+	c.Request.Header.Set("session-id", "header-session")
+	account := newTestOAuthAccount(4501, map[string]any{codexFingerprintModeExtraKey: "session"})
+
+	out, err := applyStagedCodexFingerprintClientMetadataRaw(c, account, []byte(leakedCodexWSPassthroughFrame))
+	require.NoError(t, err)
+	ids := stagedCodexFingerprintIDs(c, account)
+	require.NotNil(t, ids)
+	requireConvergedCodexWSClientMetadata(t, out, ids, "body-session")
+	require.Equal(t, ids.sessionID, gjson.GetBytes(out, "prompt_cache_key").String())
+	require.Equal(t, "gpt-5.1", gjson.GetBytes(out, "model").String())
+}
+
+func TestApplyStagedCodexFingerprintClientMetadataRaw_FollowupRotatesTurnOnly(t *testing.T) {
+	c := newFingerprintStageTestContext(t)
+	c.Request.Header.Set("session-id", "header-session")
+	account := newTestOAuthAccount(4503, map[string]any{codexFingerprintModeExtraKey: "session"})
+
+	first, err := applyStagedCodexFingerprintClientMetadataRaw(c, account, []byte(leakedCodexWSPassthroughFrame))
+	require.NoError(t, err)
+	second, err := applyStagedCodexFingerprintClientMetadataRawForFollowup(c, account, []byte(leakedCodexWSPassthroughFrameTurn2), true)
+	require.NoError(t, err)
+
+	for _, key := range []string{"x-codex-installation-id", "session_id", "thread_id", "x-codex-window-id"} {
+		require.Equal(t,
+			gjson.GetBytes(first, "client_metadata."+key).String(),
+			gjson.GetBytes(second, "client_metadata."+key).String(),
+			"stable WS identity field %s changed between turns", key,
+		)
+	}
+	require.NotEqual(t,
+		gjson.GetBytes(first, "client_metadata.turn_id").String(),
+		gjson.GetBytes(second, "client_metadata.turn_id").String(),
+		"each response.create must have a distinct converged turn identity",
+	)
+	require.Equal(t, gjson.GetBytes(second, "client_metadata.session_id").String(), gjson.GetBytes(second, "prompt_cache_key").String())
+	requireNoLeakedCodexClientMetadata(t, second)
+}
+
+func TestApplyStagedCodexFingerprintClientMetadataRaw_APIKeyUnchanged(t *testing.T) {
+	c := newFingerprintStageTestContext(t)
+	account := &Account{ID: 4502, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	body := []byte(`{"type":"response.create","client_metadata":{"cwd":"/tmp","session_id":"keep-me"}}`)
+	out, err := applyStagedCodexFingerprintClientMetadataRaw(c, account, body)
+	require.NoError(t, err)
+	require.Equal(t, string(body), string(out))
 }
 
 func TestApplyStagedCodexFingerprintRejectsDifferentOAuthAccount(t *testing.T) {
@@ -1020,6 +1128,40 @@ func TestPrepareCodexFingerprintExtraForCreate_DefaultsSession(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestPrepareCodexFingerprintExtraForUpdate_NormalizesLegacyOff(t *testing.T) {
+	account := newTestOAuthAccount(4601, map[string]any{
+		codexFingerprintModeExtraKey: "off",
+		codexFingerprintSeedExtraKey: testCodexFingerprintSeed,
+	})
+	prepared := prepareCodexFingerprintExtraForUpdate(account, map[string]any{
+		codexFingerprintModeExtraKey: "off",
+		"unrelated":                 "keep",
+	})
+	require.Equal(t, "session", prepared[codexFingerprintModeExtraKey])
+	require.Equal(t, testCodexFingerprintSeed, prepared[codexFingerprintSeedExtraKey])
+	require.Equal(t, "keep", prepared["unrelated"])
+}
+
+func TestSanitizedCodexFingerprintExtraUpdates_NormalizesFailClosedMode(t *testing.T) {
+	for _, raw := range []any{"off", "invalid", "", nil, 42} {
+		sanitized := sanitizedCodexFingerprintExtraUpdates(map[string]any{
+			codexFingerprintModeExtraKey: raw,
+			codexFingerprintSeedExtraKey: "client-controlled-seed",
+		})
+		require.Equal(t, "session", sanitized[codexFingerprintModeExtraKey], "raw=%v", raw)
+		require.NotContains(t, sanitized, codexFingerprintSeedExtraKey)
+		require.True(t, ShouldEnsureCodexFingerprintSeedForExtraUpdates(sanitized))
+	}
+
+	device := sanitizedCodexFingerprintExtraUpdates(map[string]any{codexFingerprintModeExtraKey: "device"})
+	require.Equal(t, "device", device[codexFingerprintModeExtraKey])
+	require.True(t, ShouldEnsureCodexFingerprintSeedForExtraUpdates(device))
+
+	unrelated := sanitizedCodexFingerprintExtraUpdates(map[string]any{"codex_5h_used_percent": 10})
+	require.NotContains(t, unrelated, codexFingerprintModeExtraKey)
+	require.False(t, ShouldEnsureCodexFingerprintSeedForExtraUpdates(unrelated))
+}
+
 func TestApplyCodexFingerprintClientMetadata_StripsAssociationFields(t *testing.T) {
 	account := newTestOAuthAccount(1, map[string]any{codexFingerprintModeExtraKey: "session"})
 	ids := resolveCodexFingerprintIDsFromRequest(account, nil)
@@ -1131,7 +1273,9 @@ func TestApplyCodexFingerprintToUsageProbeRequestSanitizesAndConverges(t *testin
 func TestIsAllowedCodexResponsesSuffixIsClosedSet(t *testing.T) {
 	require.True(t, isAllowedCodexResponsesSuffix(""))
 	require.True(t, isAllowedCodexResponsesSuffix("/compact"))
+	require.True(t, isAllowedCodexResponsesSuffix("/input_tokens"))
 	require.False(t, isAllowedCodexResponsesSuffix("/compact/"))
+	require.False(t, isAllowedCodexResponsesSuffix("/input_tokens/"))
 	require.False(t, isAllowedCodexResponsesSuffix("/compact/detail"))
 	require.False(t, isAllowedCodexResponsesSuffix("/feedback"))
 }

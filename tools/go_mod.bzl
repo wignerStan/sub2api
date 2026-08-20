@@ -99,7 +99,7 @@ export GOMODCACHE="$PWD/.gomodcache"
 export GOPROXY="https://goproxy.cn,https://proxy.golang.org,direct"
 mkdir -p "$GOCACHE" "$GOMODCACHE"
 "{go}" version
-"{go}" build -C backend -tags embed -ldflags="-s -w -X main.Version=0.1.178" -trimpath -o "$PWD/{out}" ./cmd/server
+"{go}" build -C backend -tags embed -ldflags="-s -w -X main.Version=0.1.179" -trimpath -o "$PWD/{out}" ./cmd/server
 """.format(
             go = sdk.go.path,
             out = out.path,

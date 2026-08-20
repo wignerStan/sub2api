@@ -550,6 +550,104 @@ func TestPassthroughLifecycle_ResponseCreatedTimeoutClosesWithoutFailover(t *tes
 	}
 }
 
+func TestPassthroughLifecycle_OAuthRewritesClientMetadataOnEveryTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	controlCtx, cancelControl := context.WithCancelCause(context.Background())
+	defer cancelControl(context.Canceled)
+	cfg := passthroughLifecycleConfig()
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.IngressInterTurnIdleTimeoutSeconds = 2
+	upstream := newStagedPassthroughConn()
+	upstream.Send(`{"type":"response.completed","response":{"id":"resp_fp_first","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
+
+	account := newTestOAuthAccount(902, map[string]any{
+		codexFingerprintModeExtraKey:                "session",
+		"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
+	})
+	account.Name = "passthrough-oauth-fingerprint"
+	account.Status = StatusActive
+	account.Schedulable = true
+	account.Concurrency = 1
+	account.Credentials = map[string]any{"access_token": "oauth-token"}
+
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+
+		msgType, firstMessage, err := ReadOpenAIWSClientMessage(
+			controlCtx,
+			conn,
+			3*time.Second,
+			coderws.StatusPolicyViolation,
+			"missing first response.create message",
+		)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if msgType != coderws.MessageText {
+			serverErr <- errors.New("first message was not text")
+			return
+		}
+
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		req := r.Clone(controlCtx)
+		req.Header = req.Header.Clone()
+		req.Header.Set("session-id", "header-session")
+		req.Header.Set("x-codex-installation-id", "client-install")
+		ginCtx.Request = req
+		serverErr <- newPassthroughLifecycleService(cfg, upstream).ProxyResponsesWebSocketFromClient(controlCtx, ginCtx, conn, account, "oauth-token", firstMessage, nil)
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(leakedCodexWSPassthroughFrame))
+	cancelWrite()
+	require.NoError(t, err)
+
+	firstUpstream := requirePassthroughUpstreamWrite(t, upstream, 3*time.Second)
+	ids := resolveCodexFingerprintIDsFromRequest(account, http.Header{"session-id": []string{"header-session"}})
+	requireConvergedCodexWSClientMetadata(t, firstUpstream, ids, "body-session")
+	require.Equal(t, ids.sessionID, gjson.GetBytes(firstUpstream, "prompt_cache_key").String())
+
+	completed, err := readPassthroughLifecycleFrame(t, clientConn, 3*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "resp_fp_first", gjson.GetBytes(completed, "response.id").String())
+
+	writeCtx, cancelWrite = context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(leakedCodexWSPassthroughFrameTurn2))
+	cancelWrite()
+	require.NoError(t, err)
+
+	secondUpstream := requirePassthroughUpstreamWrite(t, upstream, 3*time.Second)
+	requireConvergedCodexWSClientMetadata(t, secondUpstream, ids, "body-session-2")
+	require.Equal(t, ids.sessionID, gjson.GetBytes(secondUpstream, "prompt_cache_key").String())
+	require.NotEqual(t,
+		gjson.GetBytes(firstUpstream, "client_metadata.turn_id").String(),
+		gjson.GetBytes(secondUpstream, "client_metadata.turn_id").String(),
+	)
+	require.Equal(t, "resp_fp_first", gjson.GetBytes(secondUpstream, "previous_response_id").String())
+
+	require.NoError(t, clientConn.Close(coderws.StatusNormalClosure, "done"))
+	select {
+	case <-serverErr:
+	case <-time.After(3 * time.Second):
+		t.Fatal("passthrough fingerprint test did not exit")
+	}
+}
+
 func TestPassthroughLifecycle_SecondTurnTimeoutIsNotFailoverSafe(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())

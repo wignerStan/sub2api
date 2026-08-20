@@ -3,6 +3,8 @@
 # Usage:
 #   tools/codex-converge-accounts.sh
 #   tools/codex-converge-accounts.sh --rotate-seeds   # after cloning a DB onto a new deploy
+# Set CODEX_FINGERPRINT_DEPLOY_DOMAIN to a stable, deployment-unique DNS name
+# in the server service. A cloned deployment must also rotate its copied seeds.
 set -euo pipefail
 
 CONFIG="${SUB2API_CONFIG:-/opt/sub2api/data/config.yaml}"
@@ -12,7 +14,37 @@ if [[ "${1:-}" == "--rotate-seeds" ]]; then
 fi
 
 python3 - "$CONFIG" "$ROTATE" <<'PY'
-import os, re, subprocess, sys
+import json, os, re, subprocess, sys
+
+def strip_yaml_comment(raw):
+    quote = None
+    escaped = False
+    for idx, char in enumerate(raw):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quote = None
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char in ('"', "'"):
+            quote = char
+        elif char == '#' and (idx == 0 or raw[idx - 1].isspace()):
+            return raw[:idx]
+    return raw
+
+def parse_yaml_scalar(raw):
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return json.loads(value)
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
 
 config_path, rotate = sys.argv[1], sys.argv[2] == "1"
 text = open(config_path, encoding="utf-8").read()
@@ -20,7 +52,7 @@ host = user = password = dbname = None
 port = "5432"
 section = None
 for raw in text.splitlines():
-    line = raw.split("#", 1)[0]
+    line = strip_yaml_comment(raw)
     if re.match(r"^\s*database\s*:", line) and "{" not in line:
         section = "database"
         continue
@@ -32,7 +64,7 @@ for raw in text.splitlines():
     m = re.match(r"\s*(host|port|user|password|name|dbname)\s*:\s*(.+)$", line)
     if not m:
         continue
-    key, val = m.group(1), m.group(2).strip().strip("'\"")
+    key, val = m.group(1), parse_yaml_scalar(m.group(2))
     if key in ("name", "dbname"):
         dbname = val
     elif key == "host":
@@ -43,6 +75,9 @@ for raw in text.splitlines():
         user = val
     elif key == "password":
         password = val
+
+if not user or not dbname:
+    raise SystemExit(f"failed to parse database user/name from {config_path}")
 
 os.environ["PGPASSWORD"] = password or ""
 psql = [

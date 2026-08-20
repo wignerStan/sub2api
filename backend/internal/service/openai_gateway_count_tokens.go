@@ -73,6 +73,23 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 	}
 
 	upstreamBody := ReplaceModelInBody(body, prepared.UpstreamModel)
+	// The native input_tokens body can carry the same Codex client_metadata as
+	// /responses. Preserve the documented/future request fields, but never let
+	// client installation/session or association extras bypass convergence on
+	// this newer endpoint.
+	if account.IsOpenAIOAuth() {
+		if validateErr := validateNoDuplicateTopLevelJSONKeys(upstreamBody); validateErr != nil {
+			writeOpenAIResponsesInputTokensError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+			return fmt.Errorf("responses input_tokens: validate request body: %w", validateErr)
+		}
+	}
+	if gjson.GetBytes(upstreamBody, "client_metadata").Exists() {
+		upstreamBody, err = applyStagedCodexFingerprintClientMetadataRaw(c, account, upstreamBody)
+		if err != nil {
+			writeOpenAIResponsesInputTokensError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+			return fmt.Errorf("responses input_tokens: sanitize client metadata: %w", err)
+		}
+	}
 	upstreamReq, err := s.buildInputTokensUpstreamRequest(ctx, c, account, upstreamBody, token)
 	if err != nil {
 		writeOpenAIResponsesInputTokensError(c, http.StatusInternalServerError, "api_error", "Failed to build request")
@@ -472,9 +489,27 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 			}
 		}
 	}
+	customUA := account.GetOpenAIUserAgent()
+	if customUA != "" {
+		req.Header.Set("user-agent", customUA)
+	}
+	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
+		req.Header.Set("user-agent", CodexCanonicalUserAgent())
+	}
+	if account.Type == AccountTypeOAuth {
+		req.Header.Set("originator", resolveOpenAIUpstreamOriginator(c, true))
+		ensureStagedCodexFingerprintIDs(c, account)
+		applyStagedCodexFingerprintHeaders(c, account, req.Header)
+		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
+	}
 
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）
 	account.ApplyHeaderOverrides(req.Header)
+	if account.Type == AccountTypeOAuth {
+		sanitizeCodexOutboundAssociationHeaders(req.Header)
+		applyOpenAICodexBetaFeatures(c, account, req.Header)
+	}
+	applyCodexOutboundAccept(req.Header, true)
 
 	return req, nil
 }

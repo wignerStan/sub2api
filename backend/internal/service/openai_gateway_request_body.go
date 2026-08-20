@@ -418,7 +418,7 @@ func openAIResponsesRequestPathSuffix(c *gin.Context) string {
 // 是否可以安全转发。路由层用它在鉴权后、调度前直接拒绝畸形子路径。
 func isAllowedCodexResponsesSuffix(suffix string) bool {
 	switch suffix {
-	case "", "/compact":
+	case "", "/compact", "/input_tokens":
 		return true
 	default:
 		return false
@@ -748,6 +748,9 @@ func extractOpenAIRequestMetaFromBody(body []byte) (model string, stream bool, p
 func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
+	}
+	if err := validateNoDuplicateTopLevelJSONKeys(body); err != nil {
+		return body, false, fmt.Errorf("normalize passthrough body: %w", err)
 	}
 
 	normalized := body

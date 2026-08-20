@@ -453,6 +453,27 @@ To change after installation:
    sudo systemctl restart sub2api
    ```
 
+#### Codex Fingerprint Deployment Identity
+
+Give every independent deployment a stable, unique DNS identity so derived
+Codex installation IDs cannot be correlated across installations that happen
+to contain the same account seed:
+
+```ini
+[Service]
+Environment=CODEX_FINGERPRINT_DEPLOY_DOMAIN=api.example.com
+```
+
+After cloning a database into another deployment, rotate the copied per-account
+seeds before serving traffic:
+
+```bash
+sudo /opt/sub2api/tools/codex-converge-accounts.sh --rotate-seeds
+```
+
+Changing the deployment domain or rotating seeds causes a one-time Codex
+installation/session identity change for each OpenAI OAuth account.
+
 #### Gemini OAuth Configuration
 
 If you need to use AI Studio OAuth for Gemini accounts, add the OAuth client credentials to the systemd service file:

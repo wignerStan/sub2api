@@ -75,6 +75,132 @@ func applyStagedCodexFingerprintClientMetadata(c *gin.Context, account *Account,
 	return applyCodexFingerprintClientMetadata(reqBody, stagedCodexFingerprintIDs(c, account))
 }
 
+// applyStagedCodexFingerprintClientMetadataRaw 按暂存（未暂存则现场解析）的
+// 收敛 ID 改写原始 JSON 帧/体中的 client_metadata。WS passthrough 不走 HTTP
+// Forward 的解析 seam，必须 ensure 后再改写，否则帧体仍是客户端原值。
+func applyStagedCodexFingerprintClientMetadataRaw(c *gin.Context, account *Account, body []byte) ([]byte, error) {
+	if len(body) == 0 || account == nil || !account.IsOpenAIOAuth() {
+		return body, nil
+	}
+	next, _, err := applyCodexFingerprintClientMetadataRaw(body, ensureStagedCodexFingerprintIDs(c, account))
+	if err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+// applyStagedCodexFingerprintClientMetadataRawForFollowup rewrites a later WS
+// frame with the connection's stable installation/session/thread IDs while
+// giving each response.create its own turn identity. The first frame must use
+// applyStagedCodexFingerprintClientMetadataRaw so its body and handshake
+// compatibility headers share exactly the same turn fields.
+func applyStagedCodexFingerprintClientMetadataRawForFollowup(
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	newTurn bool,
+) ([]byte, error) {
+	if len(body) == 0 || account == nil || !account.IsOpenAIOAuth() {
+		return body, nil
+	}
+	base := ensureStagedCodexFingerprintIDs(c, account)
+	if base == nil {
+		return body, nil
+	}
+	ids := *base
+	// Body-session capture is frame-local. Reusing the first frame's value can
+	// otherwise rewrite an unrelated prompt_cache_key on a later WS frame.
+	ids.originalBodySessionID = ""
+	ids.originalBodySessionIDCaptured = false
+	if newTurn && (ids.mode == codexFingerprintSession || ids.mode == codexFingerprintFull) {
+		ids.turnID = uuid.Must(uuid.NewV7()).String()
+		ids.turnStartedAtUnixMs = time.Now().UnixMilli()
+	}
+	next, _, err := applyCodexFingerprintClientMetadataRaw(body, &ids)
+	if err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+// validateNoDuplicateTopLevelJSONKeys rejects ambiguous JSON objects before a
+// raw passthrough path evaluates or rewrites them. Different JSON consumers
+// disagree on whether the first or last duplicate wins; allowing duplicates
+// would let a sanitized client_metadata (or policy field) coexist with a
+// second value that the upstream might interpret instead.
+func validateNoDuplicateTopLevelJSONKeys(body []byte) error {
+	i := 0
+	for i < len(body) && isJSONWhitespace(body[i]) {
+		i++
+	}
+	if i >= len(body) || body[i] != '{' {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	depth := 0
+	expectRootKey := false
+	for i < len(body) {
+		switch body[i] {
+		case '{', '[':
+			depth++
+			if depth == 1 {
+				expectRootKey = true
+			}
+			i++
+		case '}', ']':
+			depth--
+			if depth < 0 {
+				return fmt.Errorf("invalid JSON nesting")
+			}
+			i++
+			if depth == 0 {
+				return nil
+			}
+		case ',':
+			if depth == 1 {
+				expectRootKey = true
+			}
+			i++
+		case '"':
+			start := i
+			i++
+			for i < len(body) {
+				if body[i] == '\\' {
+					i += 2
+					continue
+				}
+				if body[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			if i > len(body) || i == len(body) && body[i-1] != '"' {
+				return fmt.Errorf("unterminated JSON string")
+			}
+			if depth == 1 && expectRootKey {
+				var key string
+				if err := json.Unmarshal(body[start:i], &key); err != nil {
+					return fmt.Errorf("decode top-level JSON key: %w", err)
+				}
+				if _, exists := seen[key]; exists {
+					return fmt.Errorf("duplicate top-level JSON key %q", key)
+				}
+				seen[key] = struct{}{}
+				expectRootKey = false
+			}
+		default:
+			i++
+		}
+	}
+	return fmt.Errorf("unterminated JSON object")
+}
+
+func isJSONWhitespace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+}
+
 // codexFingerprintMode 控制 OAuth 账号出站请求的设备指纹收敛强度。
 // 多人共享同一 OAuth 账号时，每个用户的 Codex 客户端会携带各自不同的
 // installation_id / session_id / thread_id，上游据此判定设备数和会话数。
@@ -228,17 +354,12 @@ func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]an
 	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
 		return prepared
 	}
+	prepared, mode := persistDefaultCodexFingerprintMode(prepared)
 	if seed, ok := codexFingerprintSeed(account.Extra); ok {
-		if prepared == nil {
-			prepared = make(map[string]any, 1)
-		}
 		prepared[codexFingerprintSeedExtraKey] = seed
 		return prepared
 	}
-	if codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
-		if prepared == nil {
-			prepared = make(map[string]any, 1)
-		}
+	if codexFingerprintModeRequiresSeed(mode) {
 		prepared[codexFingerprintSeedExtraKey] = newCodexFingerprintSeed()
 	}
 	return prepared
@@ -250,6 +371,13 @@ func sanitizedCodexFingerprintExtraUpdates(updates map[string]any) map[string]an
 	}
 	sanitized := maps.Clone(updates)
 	delete(sanitized, codexFingerprintSeedExtraKey)
+	if raw, exists := sanitized[codexFingerprintModeExtraKey]; exists {
+		rawMode, _ := raw.(string)
+		mode, valid := explicitCodexFingerprintMode(rawMode)
+		if !valid || mode == codexFingerprintOff {
+			sanitized[codexFingerprintModeExtraKey] = string(codexFingerprintSession)
+		}
+	}
 	return sanitized
 }
 
@@ -651,6 +779,9 @@ func applyCodexFingerprintClientMetadataRaw(body []byte, ids *codexFingerprintID
 	if !root.IsObject() {
 		captureCodexFingerprintOriginalBodySessionIDRaw(ids, gjson.Result{})
 		return body, false, nil
+	}
+	if err := validateNoDuplicateTopLevelJSONKeys(body); err != nil {
+		return body, false, fmt.Errorf("validate fingerprint JSON object: %w", err)
 	}
 
 	existing := map[string]any{}

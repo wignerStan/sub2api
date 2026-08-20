@@ -32,6 +32,16 @@ func TestNormalizeOpenAIPassthroughOAuthBody_CompactRemovesUnsupportedUser(t *te
 	require.False(t, gjson.GetBytes(normalized, "store").Exists())
 }
 
+func TestNormalizeOpenAIPassthroughOAuthBody_RejectsDuplicateTopLevelKeys(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","metadata":{"safe":true},"metadata":{"user_id":"leak"}}`)
+
+	normalized, changed, err := normalizeOpenAIPassthroughOAuthBody(body, false)
+
+	require.ErrorContains(t, err, `duplicate top-level JSON key "metadata"`)
+	require.False(t, changed)
+	require.Equal(t, body, normalized)
+}
+
 func TestNormalizeOpenAIPassthroughOAuthBody_StringInputWrappedAsArray(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","input":"hello world"}`)
 
