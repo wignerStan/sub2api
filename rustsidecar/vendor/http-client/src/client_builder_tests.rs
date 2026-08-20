@@ -53,14 +53,16 @@ async fn custom_ca_fallback_preserves_builder_configuration() {
 
 #[test]
 fn invalid_manual_proxy_fails_closed() {
-    let error = HttpClientBuilder::new()
-        .with_proxy("not-a-proxy-url".to_string())
-        .build_direct()
-        .expect_err("invalid proxy must not build a direct client");
-    assert!(matches!(
-        error,
-        BuildCustomCaTransportError::InvalidManualProxy
-    ));
+    for url in ["not-a-proxy-url", "ftp://127.0.0.1:21", "://bad"] {
+        let error = HttpClientBuilder::new()
+            .with_proxy(url.to_string())
+            .build_direct()
+            .expect_err("invalid proxy must not build a direct client");
+        assert!(
+            matches!(error, BuildCustomCaTransportError::InvalidManualProxy),
+            "{url}"
+        );
+    }
 }
 
 #[test]

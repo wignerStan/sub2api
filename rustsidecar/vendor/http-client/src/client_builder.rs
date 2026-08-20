@@ -232,7 +232,7 @@ impl HttpClientBuilder {
         proxy_routing: ProxyRouting,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
         if let Some(proxy_url) = &self.manual_proxy {
-            if reqwest::Proxy::all(proxy_url).is_err() {
+            if !manual_proxy_url_is_valid(proxy_url) {
                 return Err(BuildCustomCaTransportError::InvalidManualProxy);
             }
         }
@@ -319,19 +319,20 @@ impl HttpClientBuilder {
             };
         }
         if let Some(proxy_url) = &self.manual_proxy {
-            match reqwest::Proxy::all(proxy_url) {
-                Ok(proxy) => builder = builder.proxy(proxy),
-                Err(_) => {
-                    // Callers of build_direct/build_with_proxy_routing already
-                    // fail closed. If this builder is used via a path that
-                    // cannot return an error, refuse host-IP egress by forcing
-                    // an unusable local proxy instead of omitting proxy().
-                    tracing::error!("invalid manual proxy URL; refusing direct connect");
-                    builder = builder.proxy(
-                        reqwest::Proxy::all("http://127.0.0.1:1")
-                            .expect("static deny-proxy URL is valid"),
-                    );
-                }
+            if manual_proxy_url_is_valid(proxy_url) {
+                builder = builder.proxy(
+                    reqwest::Proxy::all(proxy_url).expect("validated manual proxy URL"),
+                );
+            } else {
+                // Callers of build_direct/build_with_proxy_routing already
+                // fail closed. If this builder is used via a path that
+                // cannot return an error, refuse host-IP egress by forcing
+                // an unusable local proxy instead of omitting proxy().
+                tracing::error!("invalid manual proxy URL; refusing direct connect");
+                builder = builder.proxy(
+                    reqwest::Proxy::all("http://127.0.0.1:1")
+                        .expect("static deny-proxy URL is valid"),
+                );
             }
         }
         builder
@@ -351,6 +352,20 @@ impl Default for HttpClientBuilder {
             manual_proxy: None,
         }
     }
+}
+
+fn manual_proxy_url_is_valid(proxy_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(proxy_url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        _ => return false,
+    }
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return false;
+    }
+    reqwest::Proxy::all(proxy_url).is_ok()
 }
 
 #[derive(Clone, Copy)]
