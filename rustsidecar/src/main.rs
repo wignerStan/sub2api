@@ -25,6 +25,9 @@ use tokio_tungstenite::tungstenite::Message as TsMessage;
 use tokio_tungstenite::tungstenite::handshake::client::Request as TsRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+mod upstream;
+use upstream::allowed_codex_upstream_url;
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     let name = name.as_str().to_ascii_lowercase();
     matches!(
@@ -152,6 +155,9 @@ async fn http_tunnel(State(state): State<AppState>, headers: HeaderMap, axum_req
     let Some(target) = headers.get(UPSTREAM_URL_HEADER).and_then(|v| v.to_str().ok()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !allowed_codex_upstream_url(target) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let proxy = match decode_proxy(&headers) {
         Ok(proxy) => proxy,
         Err(response) => return response,
@@ -280,6 +286,9 @@ async fn ws_tunnel(State(state): State<AppState>, headers: HeaderMap, ws: WebSoc
     let Some(target) = headers.get(UPSTREAM_URL_HEADER).and_then(|v| v.to_str().ok()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !allowed_codex_upstream_url(target) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let Ok(all_target) = target.parse::<axum::http::Uri>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -356,6 +365,18 @@ async fn main() {
     let addr: std::net::SocketAddr = addr
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:21333".parse().unwrap());
+    if !addr.ip().is_loopback() {
+        let allow_non_loopback = std::env::var("SUB2API_SIDECAR_ALLOW_NON_LOOPBACK")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !allow_non_loopback {
+            tracing::error!(
+                %addr,
+                "sidecar must bind loopback unless SUB2API_SIDECAR_ALLOW_NON_LOOPBACK=1"
+            );
+            std::process::exit(1);
+        }
+    }
 
     let state = AppState {
         token,
