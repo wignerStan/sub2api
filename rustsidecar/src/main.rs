@@ -1,9 +1,9 @@
-//! sub2api-sidecar: TLS-disguise egress shim for sub2api's OpenAI OAuth traffic.
+//! sub2api-sidecar: TLS-disguise egress shim for ChatGPT /backend-api/codex.
 //!
-//! Listens on loopback and re-emits HTTP/WS requests toward chatgpt.com using the
-//! exact client stack shipped by openai/codex (codex-http-client, codex-websocket-client,
-//! rustls 0.23 + aws-lc-rs), so the observed TLS ClientHello matches official Codex.
-//! Business logic stays in the Go process; this binary only disguises transport.
+//! Go forwards chatgpt.com /backend-api/codex/* (HTTP + WS: responses, compact,
+//! models, CUA/live, and siblings). Other REST stays in the Go process. This
+//! binary re-emits those requests with openai/codex rustls 0.23 + aws-lc-rs so
+//! the TLS ClientHello matches official Codex.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get};
 use axum::Router;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::{HttpClient, HttpClientBuilder};
@@ -63,14 +63,13 @@ impl AppState {
         if let Some(ref url) = proxy {
             builder = builder.with_proxy(url.clone());
         }
-        // 构建失败(如代理 URL 非法)必须显式失败,绝不静默回退裸 reqwest:
-        // 静默直连会绕过代理与 codex rustls 伪装栈,违背 sidecar 初衷。
-        let client = builder
-            .build_direct()
-            .map_err(|error| {
-                tracing::warn!(error = %error, proxy, "proxy client build failed");
-                StatusCode::BAD_GATEWAY.into_response()
-            })?;
+        // Invalid proxy URLs must fail here. Vendor HttpClientBuilder used to
+        // swallow Proxy::all errors and connect directly, which would egress
+        // the sidecar host IP instead of the account proxy.
+        let client = builder.build_direct().map_err(|error| {
+            tracing::warn!(error = %error, "proxy client build failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })?;
         self.clients.write().await.insert(key, client.clone());
         Ok(client)
     }
@@ -96,7 +95,29 @@ fn decode_proxy(headers: &HeaderMap) -> Result<Option<String>, Response> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw)
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     let url = String::from_utf8(bytes).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
-    Ok(Some(url))
+    normalize_proxy_url(url)
+}
+
+fn normalize_proxy_url(raw: String) -> Result<Option<String>, Response> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut parsed =
+        reqwest::Url::parse(trimmed).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        _ => return Err(StatusCode::BAD_REQUEST.into_response()),
+    }
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+    if parsed.scheme() == "socks5" {
+        if parsed.set_scheme("socks5h").is_err() {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+    }
+    Ok(Some(parsed.to_string()))
 }
 
 fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
@@ -343,7 +364,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/http", post(http_tunnel))
+        .route("/v1/http", any(http_tunnel))
         .route("/v1/ws", get(ws_tunnel))
         .with_state(state);
 

@@ -231,6 +231,11 @@ impl HttpClientBuilder {
         self,
         proxy_routing: ProxyRouting,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
+        if let Some(proxy_url) = &self.manual_proxy {
+            if reqwest::Proxy::all(proxy_url).is_err() {
+                return Err(BuildCustomCaTransportError::InvalidManualProxy);
+            }
+        }
         let request_logging = self.request_logging;
         build_reqwest_client_with_custom_ca(self.reqwest_builder(proxy_routing))
             .map(|inner| HttpClient::from_parts(inner, request_logging))
@@ -316,10 +321,17 @@ impl HttpClientBuilder {
         if let Some(proxy_url) = &self.manual_proxy {
             match reqwest::Proxy::all(proxy_url) {
                 Ok(proxy) => builder = builder.proxy(proxy),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "invalid manual proxy URL; connecting directly"
-                ),
+                Err(_) => {
+                    // Callers of build_direct/build_with_proxy_routing already
+                    // fail closed. If this builder is used via a path that
+                    // cannot return an error, refuse host-IP egress by forcing
+                    // an unusable local proxy instead of omitting proxy().
+                    tracing::error!("invalid manual proxy URL; refusing direct connect");
+                    builder = builder.proxy(
+                        reqwest::Proxy::all("http://127.0.0.1:1")
+                            .expect("static deny-proxy URL is valid"),
+                    );
+                }
             }
         }
         builder

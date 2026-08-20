@@ -129,6 +129,11 @@ pub enum BuildCustomCaTransportError {
     #[error("Failed to build HTTP client while using system root certificates: {0}")]
     BuildClientWithSystemRoots(#[source] reqwest::Error),
 
+    /// Manual outbound proxy URL was not accepted by reqwest (http/https/socks5/socks5h).
+    /// The URL itself is omitted so credentials cannot leak into logs or error strings.
+    #[error("invalid manual proxy URL")]
+    InvalidManualProxy,
+
     /// One parsed certificate block could not be registered with the websocket TLS root store.
     #[error(
         "Failed to register certificate #{certificate_index} from {} selected by {} in rustls root store: {source}. {hint}",
@@ -157,6 +162,9 @@ impl From<BuildCustomCaTransportError> for io::Error {
             }
             BuildCustomCaTransportError::BuildClientWithCustomCa { .. }
             | BuildCustomCaTransportError::BuildClientWithSystemRoots(_) => io::Error::other(error),
+            BuildCustomCaTransportError::InvalidManualProxy => {
+                io::Error::new(io::ErrorKind::InvalidInput, error)
+            }
         }
     }
 }

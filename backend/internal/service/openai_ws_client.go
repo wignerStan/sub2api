@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -66,7 +65,8 @@ func newDefaultOpenAIWSClientDialer() openAIWSClientDialer {
 }
 
 // newOpenAIWSClientDialer 依据配置选择 WS 建连器：
-// sidecar 启用时走本地 Rust sidecar（/v1/ws）伪装 TLS 指纹，否则用默认 coder 实现。
+// sidecar 启用时，仅 chatgpt.com /backend-api/codex/* 握手改道
+// 本地 /v1/ws；其它 WS 仍用默认 coder 实现。
 func newOpenAIWSClientDialer(cfg *config.Config) openAIWSClientDialer {
 	if cfg != nil && cfg.Gateway.Sidecar.Enabled {
 		if base, err := url.Parse(cfg.Gateway.Sidecar.BaseURL); err == nil && base.Host != "" && cfg.Gateway.Sidecar.Token != "" {
@@ -79,7 +79,7 @@ func newOpenAIWSClientDialer(cfg *config.Config) openAIWSClientDialer {
 	return newDefaultOpenAIWSClientDialer()
 }
 
-// sidecarOpenAIWSClientDialer 将 WS 握手改道本地 sidecar /v1/ws。
+// sidecarOpenAIWSClientDialer 将 Codex /backend-api/codex WS 握手改道本地 sidecar /v1/ws。
 type sidecarOpenAIWSClientDialer struct {
 	cfg      *config.Config
 	fallback openAIWSClientDialer
@@ -94,6 +94,12 @@ func (d *sidecarOpenAIWSClientDialer) Dial(
 	if d == nil || d.cfg == nil {
 		return nil, 0, nil, errors.New("sidecar ws dialer is nil")
 	}
+	if !ShouldUseSidecarTLSURL(wsURL) {
+		if d.fallback == nil {
+			return nil, 0, nil, errors.New("sidecar ws fallback dialer is nil")
+		}
+		return d.fallback.Dial(ctx, wsURL, headers, proxyURL)
+	}
 	sidecarBase, err := url.Parse(d.cfg.Gateway.Sidecar.BaseURL)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("invalid sidecar base_url: %w", err)
@@ -106,8 +112,12 @@ func (d *sidecarOpenAIWSClientDialer) Dial(
 	}
 	opts.HTTPHeader.Set("x-s2s-token", d.cfg.Gateway.Sidecar.Token)
 	opts.HTTPHeader.Set("x-upstream-url", strings.TrimSpace(wsURL))
-	if proxy := strings.TrimSpace(proxyURL); proxy != "" {
-		opts.HTTPHeader.Set("x-upstream-proxy", base64.StdEncoding.EncodeToString([]byte(proxy)))
+	encodedProxy, err := EncodeSidecarUpstreamProxy(proxyURL)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if encodedProxy != "" {
+		opts.HTTPHeader.Set("x-upstream-proxy", encodedProxy)
 	}
 
 	transport := &http.Transport{

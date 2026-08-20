@@ -50,3 +50,23 @@ async fn custom_ca_fallback_preserves_builder_configuration() {
             .any(|line| line.eq_ignore_ascii_case("x-builder-test: preserved"))
     );
 }
+
+#[test]
+fn invalid_manual_proxy_fails_closed() {
+    let error = HttpClientBuilder::new()
+        .with_proxy("not-a-proxy-url".to_string())
+        .build_direct()
+        .expect_err("invalid proxy must not build a direct client");
+    assert!(matches!(
+        error,
+        BuildCustomCaTransportError::InvalidManualProxy
+    ));
+}
+
+#[test]
+fn socks_manual_proxy_builds() {
+    HttpClientBuilder::new()
+        .with_proxy("socks5h://127.0.0.1:1080".to_string())
+        .build_direct()
+        .expect("socks5h proxy should build with the socks feature enabled");
+}
