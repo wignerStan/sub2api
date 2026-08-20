@@ -106,8 +106,12 @@ func (d *sidecarOpenAIWSClientDialer) Dial(
 	}
 	sidecarBase.Path = strings.TrimRight(sidecarBase.Path, "/") + "/v1/ws"
 
+	header := cloneHeader(headers)
+	if header == nil {
+		header = make(http.Header)
+	}
 	opts := &coderws.DialOptions{
-		HTTPHeader:      cloneHeader(headers),
+		HTTPHeader:      header,
 		CompressionMode: coderws.CompressionContextTakeover,
 	}
 	opts.HTTPHeader.Set("x-s2s-token", d.cfg.Gateway.Sidecar.Token)

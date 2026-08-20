@@ -34,13 +34,13 @@ func TestSidecarOpenAIWSClientDialerFallsBackOutsideCodex(t *testing.T) {
 	cfg.Gateway.Sidecar.Token = "tok"
 	dialer := &sidecarOpenAIWSClientDialer{cfg: cfg, fallback: fallback}
 
-	_, _, _, err := dialer.Dial(context.Background(), "wss://api.openai.com/v1/responses", nil, "")
+	_, _, _, err := dialer.Dial(context.Background(), "wss://api.openai.com/v1/responses", http.Header{}, "")
 	require.EqualError(t, err, "fallback used")
 	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, _, _, err = dialer.Dial(ctx, "wss://chatgpt.com/backend-api/codex/call_proxy", nil, "")
+	_, _, _, err = dialer.Dial(ctx, "wss://chatgpt.com/backend-api/codex/call_proxy", http.Header{}, "")
 	require.Error(t, err)
 	require.NotEqual(t, "fallback used", err.Error())
 	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
@@ -57,7 +57,7 @@ func TestSidecarOpenAIWSClientDialerRejectsInvalidProxy(t *testing.T) {
 	_, _, _, err := dialer.Dial(
 		context.Background(),
 		"wss://chatgpt.com/backend-api/codex/call_proxy",
-		nil,
+		http.Header{},
 		"ftp://127.0.0.1:21",
 	)
 	require.Error(t, err)
