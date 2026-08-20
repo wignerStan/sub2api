@@ -2095,9 +2095,9 @@ func TestOpenAIGatewayService_CodexFingerprintCompactAppliesHeaderRewrite(t *tes
 		toolCorrector: NewCodexToolCorrector(),
 	}
 	account := newTestOAuthAccount(4403, map[string]any{
-		codexFingerprintModeExtraKey:                    "session",
-		"openai_passthrough":                            true,
-		"openai_oauth_responses_websockets_v2_mode":     OpenAIWSIngressModeOff,
+		codexFingerprintModeExtraKey:                "session",
+		"openai_passthrough":                        true,
+		"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeOff,
 	})
 	account.Name = "oauth-compact"
 	account.Status = StatusActive

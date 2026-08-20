@@ -1135,7 +1135,7 @@ func TestPrepareCodexFingerprintExtraForUpdate_NormalizesLegacyOff(t *testing.T)
 	})
 	prepared := prepareCodexFingerprintExtraForUpdate(account, map[string]any{
 		codexFingerprintModeExtraKey: "off",
-		"unrelated":                 "keep",
+		"unrelated":                  "keep",
 	})
 	require.Equal(t, "session", prepared[codexFingerprintModeExtraKey])
 	require.Equal(t, testCodexFingerprintSeed, prepared[codexFingerprintSeedExtraKey])
@@ -1179,7 +1179,8 @@ func TestApplyCodexFingerprintClientMetadata_StripsAssociationFields(t *testing.
 		},
 	}
 	require.True(t, applyCodexFingerprintClientMetadata(reqBody, ids))
-	cm := reqBody["client_metadata"].(map[string]any)
+	cm, ok := reqBody["client_metadata"].(map[string]any)
+	require.True(t, ok, "请求体应包含 client_metadata")
 	for _, leaked := range []string{"cwd", "workspace", "git_branch", "os", "terminal", "plugin", "mcp", "trace_id"} {
 		assert.NotContains(t, cm, leaked)
 	}
