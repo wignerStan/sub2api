@@ -983,9 +983,11 @@ type GatewayConfig struct {
 	OpenAICompactModel string `mapstructure:"openai_compact_model"`
 	// OpenAIWS: OpenAI Responses WebSocket 配置（默认开启，可按需回滚到 HTTP）
 	OpenAIWS GatewayOpenAIWSConfig `mapstructure:"openai_ws"`
-	// Sidecar: 本地 Rust sidecar TLS 伪装层。启用后仅 chatgpt.com
-	// /backend-api/codex/*（HTTP 与 WS：responses、compact、models、CUA 等）
-	// 改道 loopback sidecar 的 rustls 栈；api.openai.com 等仍走本进程传输。
+	// Sidecar: 本地 Rust sidecar TLS 伪装层。启用后 OpenAI OAuth 账号的
+	// 全生命周期出站（chatgpt.com / chat.openai.com / auth.openai.com 的
+	// HTTP 与 WS：token 交换刷新、whoami、agent identity、codex 推理、
+	// quota/privacy 等）改道 loopback sidecar 的 rustls 栈；
+	// api.openai.com API Key 流量仍走本进程传输。
 	Sidecar GatewaySidecarConfig `mapstructure:"sidecar"`
 	// Live: ChatGPT Frameless Live 会话配置。
 	Live GatewayLiveConfig `mapstructure:"live"`
@@ -1146,7 +1148,7 @@ type GatewayOpenAIHTTP2Config struct {
 
 // GatewaySidecarConfig 本地 Rust sidecar(子进程)配置。
 type GatewaySidecarConfig struct {
-	// Enabled: 是否将 ChatGPT /backend-api/codex/* 出口改道到 loopback sidecar。
+	// Enabled: 是否将 OpenAI OAuth 出口（chatgpt.com / auth.openai.com）改道到 loopback sidecar。
 	Enabled bool `mapstructure:"enabled"`
 	// BaseURL: sidecar 监听地址，如 http://127.0.0.1:21333。
 	BaseURL string `mapstructure:"base_url"`

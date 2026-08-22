@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -15,16 +16,17 @@ import (
 )
 
 // NewOpenAIOAuthClient creates a new OpenAI OAuth client
-func NewOpenAIOAuthClient() service.OpenAIOAuthClient {
-	return &openaiOAuthService{tokenURL: openai.TokenURL}
+func NewOpenAIOAuthClient(cfg *config.Config) service.OpenAIOAuthClient {
+	return &openaiOAuthService{tokenURL: openai.TokenURL, cfg: cfg}
 }
 
 type openaiOAuthService struct {
 	tokenURL string
+	cfg      *config.Config
 }
 
 func (s *openaiOAuthService) ExchangeCode(ctx context.Context, code, codeVerifier, redirectURI, proxyURL, clientID string) (*openai.TokenResponse, error) {
-	client, err := createOpenAIReqClient(proxyURL)
+	client, err := createOpenAIReqClient(s.cfg, proxyURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_CLIENT_INIT_FAILED", "create HTTP client: %v", err)
 	}
@@ -83,7 +85,7 @@ func (s *openaiOAuthService) RefreshTokenWithClientID(ctx context.Context, refre
 }
 
 func (s *openaiOAuthService) refreshTokenWithClientID(ctx context.Context, refreshToken, proxyURL, clientID string) (*openai.TokenResponse, error) {
-	client, err := createOpenAIReqClient(proxyURL)
+	client, err := createOpenAIReqClient(s.cfg, proxyURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_CLIENT_INIT_FAILED", "create HTTP client: %v", err)
 	}
@@ -119,11 +121,16 @@ func (s *openaiOAuthService) refreshTokenWithClientID(ctx context.Context, refre
 	return &tokenResp, nil
 }
 
-func createOpenAIReqClient(proxyURL string) (*req.Client, error) {
-	return getSharedReqClient(reqClientOptions{
+func createOpenAIReqClient(cfg *config.Config, proxyURL string) (*req.Client, error) {
+	opts := reqClientOptions{
 		ProxyURL: proxyURL,
 		Timeout:  120 * time.Second,
-	})
+	}
+	sidecar := sidecarOptsFromConfig(cfg)
+	opts.SidecarEnabled = sidecar.SidecarEnabled
+	opts.SidecarBaseURL = sidecar.SidecarBaseURL
+	opts.SidecarToken = sidecar.SidecarToken
+	return getSharedReqClient(opts)
 }
 
 func shouldReturnOpenAINoProxyHint(ctx context.Context, proxyURL string, err error) bool {

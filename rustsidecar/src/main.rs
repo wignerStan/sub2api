@@ -1,8 +1,10 @@
-//! sub2api-sidecar: TLS-disguise egress shim for ChatGPT /backend-api/codex.
+//! sub2api-sidecar: TLS-disguise egress shim for OpenAI OAuth traffic.
 //!
-//! Go forwards chatgpt.com /backend-api/codex/* (HTTP + WS: responses, compact,
-//! models, CUA/live, and siblings). Other REST stays in the Go process. This
-//! binary re-emits those requests with openai/codex rustls 0.23 + aws-lc-rs so
+//! Go forwards official OAuth hosts (chatgpt.com / chat.openai.com /
+//! auth.openai.com — HTTP + WS: token exchange/refresh, whoami, agent
+//! identity, codex responses/models/CUA/live, quota and privacy surfaces).
+//! api.openai.com API-key traffic stays in the Go process. This binary
+//! re-emits forwarded requests with openai/codex rustls 0.23 + aws-lc-rs so
 //! the TLS ClientHello matches official Codex.
 
 use std::collections::HashMap;

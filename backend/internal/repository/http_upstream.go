@@ -216,8 +216,8 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	client = httpClientWithGrokAccessDeniedFallback(client)
 	var resp *http.Response
 	if sc := s.sidecarHTTPClient(); sc != nil && service.ShouldUseSidecarTLS(req) {
-		// 仅 chatgpt.com /backend-api/codex/* 改道 sidecar rustls；
-		// api.openai.com 与其它 chatgpt.com REST 仍走本进程传输。
+		// OpenAI OAuth hosts (chatgpt.com / auth.openai.com) 改道 sidecar rustls；
+		// api.openai.com 等 API Key 流量仍走本进程传输。
 		resp, err = s.doViaSidecar(sc, req, proxyURL)
 	} else {
 		resp, err = servertiming.Do(client, req)
@@ -310,57 +310,19 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 // sidecarHTTPClient 返回启用 sidecar 时的 loopback 客户端，未启用返回 nil。
 func (s *httpUpstreamService) sidecarHTTPClient() *http.Client {
-	if s == nil || s.cfg == nil || !s.cfg.Gateway.Sidecar.Enabled {
+	if s == nil {
 		return nil
 	}
-	base, err := url.Parse(s.cfg.Gateway.Sidecar.BaseURL)
-	if err != nil || base.Host == "" {
-		slog.Warn("sidecar disabled: invalid base_url", "base_url", s.cfg.Gateway.Sidecar.BaseURL)
-		return nil
-	}
-	if s.cfg.Gateway.Sidecar.Token == "" {
-		slog.Warn("sidecar disabled: empty token")
-		return nil
-	}
-	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          8,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       5 * time.Minute,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 0,
-	}
-	return &http.Client{Transport: transport}
+	return service.NewSidecarLoopbackClient(s.cfg)
 }
 
-// doViaSidecar 将请求原样转发给本地 sidecar，由 sidecar 以 codex 客户端栈
-// 指向真实上游（含每账号 proxy）。返回的上游响应按原样透传。
+// doViaSidecar 将请求原样转发给本地 sidecar，由 sidecar 以 Codex CLI rustls
+// 栈指向真实上游（含每账号 proxy）。返回的上游响应按原样透传。
 func (s *httpUpstreamService) doViaSidecar(client *http.Client, req *http.Request, proxyURL string) (*http.Response, error) {
-	originalURL := req.URL.String()
-	sidecarBase, err := url.Parse(s.cfg.Gateway.Sidecar.BaseURL)
-	if err != nil {
-		return nil, err
+	if s == nil {
+		return nil, fmt.Errorf("http upstream is nil")
 	}
-	sidecarBase.Path = strings.TrimRight(sidecarBase.Path, "/") + "/v1/http"
-
-	clone := req.Clone(req.Context())
-	clone.URL = sidecarBase
-	clone.Host = sidecarBase.Host
-	clone.Header = req.Header.Clone()
-	clone.Header.Set("x-s2s-token", s.cfg.Gateway.Sidecar.Token)
-	clone.Header.Set("x-upstream-url", originalURL)
-	encodedProxy, err := service.EncodeSidecarUpstreamProxy(proxyURL)
-	if err != nil {
-		return nil, err
-	}
-	if encodedProxy != "" {
-		clone.Header.Set("x-upstream-proxy", encodedProxy)
-	}
-	// 本地 loopback 转发不再需要原始目标 Host 语义（sidecar 由 x-upstream-url 重建）。
-	clone.Header.Del("Host")
-	return servertiming.Do(client, clone)
+	return service.ForwardHTTPViaSidecar(s.cfg, client, req, proxyURL)
 }
 
 func httpClientForUpstreamRequest(client *http.Client, req *http.Request) *http.Client {

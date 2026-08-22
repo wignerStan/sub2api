@@ -96,7 +96,7 @@ func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredSOCKSProxy(t *testing.T) {
 	require.Equal(t, int64(1), upstreamCalls.Load())
 }
 
-func TestHTTPUpstreamSidecarOnlyChatGPTCodex(t *testing.T) {
+func TestHTTPUpstreamSidecarOpenAIOAuthHosts(t *testing.T) {
 	var sidecarHits atomic.Int64
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sidecarHits.Add(1)
@@ -128,7 +128,7 @@ func TestHTTPUpstreamSidecarOnlyChatGPTCodex(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, int64(1), sidecarHits.Load())
 
-	req, err = http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/models", nil)
+	req, err = http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req, "", 7, 1)
 	require.NoError(t, err)
@@ -136,13 +136,21 @@ func TestHTTPUpstreamSidecarOnlyChatGPTCodex(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, int64(2), sidecarHits.Load())
 
+	req, err = http.NewRequest(http.MethodPost, "https://auth.openai.com/oauth/token", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req, "", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(3), sidecarHits.Load())
+
 	req, err = http.NewRequest(http.MethodGet, direct.URL+"/v1/models", nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req, "", 7, 1)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusTeapot, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
-	require.Equal(t, int64(2), sidecarHits.Load(), "non-chatgpt Codex URLs must not use sidecar TLS")
+	require.Equal(t, int64(3), sidecarHits.Load(), "non-OAuth hosts must not use sidecar TLS")
 	require.Equal(t, int64(1), directHits.Load())
 
 	req, err = http.NewRequest(http.MethodGet, direct.URL+"/v1/messages", nil)
@@ -151,7 +159,7 @@ func TestHTTPUpstreamSidecarOnlyChatGPTCodex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusTeapot, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
-	require.Equal(t, int64(2), sidecarHits.Load(), "non-codex DoWithTLS must not use sidecar TLS")
+	require.Equal(t, int64(3), sidecarHits.Load(), "non-OAuth DoWithTLS must not use sidecar TLS")
 	require.Equal(t, int64(2), directHits.Load())
 }
 

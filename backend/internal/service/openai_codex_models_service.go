@@ -478,6 +478,7 @@ func (s *OpenAIGatewayService) fetchCodexModelsManifestUpstream(ctx context.Cont
 		if clientErr != nil {
 			return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_CODEX_MODELS_PROXY_INVALID", "invalid proxy configuration: %v", clientErr)
 		}
+		client = ApplySidecarHTTPClient(s.cfg, client, request.proxyURL)
 		resp, err = client.Do(req)
 	}
 	if err != nil {
