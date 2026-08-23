@@ -844,6 +844,21 @@ database:
   conn_max_idle_time_minutes: 5
 
 # =============================================================================
+# Database Backup Configuration
+# 数据库备份配置
+# =============================================================================
+backup:
+  # Optional proxy for backup S3 egress (upload/restore against R2/OSS/S3).
+  # 备份上传与恢复下载（R2/OSS/S3 兼容存储）的可选出站代理；留空直连。
+  # Schemes: http / https / socks5 (normalized to socks5h, DNS via proxy).
+  # 协议：http / https / socks5（自动归一化为 socks5h，DNS 走代理）。
+  # Invalid values fail startup; environment variable BACKUP_PROXY_URL also works.
+  # 配置非法时启动失败（不回退直连）；也可用环境变量 BACKUP_PROXY_URL 设置。
+  # Example: "socks5://127.0.0.1:1083"
+  # 示例："socks5://127.0.0.1:1083"
+  proxy_url: ""
+
+# =============================================================================
 # Redis Configuration
 # Redis 配置
 # =============================================================================
