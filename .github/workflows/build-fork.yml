@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - sync-upstream-v0.1.177
+      - sync-upstream-v0.1.179
   workflow_dispatch:
 
 jobs:
