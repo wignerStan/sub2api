@@ -37,10 +37,12 @@ jobs:
       - name: Build binary
         working-directory: backend
         env:
-          VERSION: 0.1.177-fork
           COMMIT: ${{ github.sha }}
           DATE: ${{ github.event.repository.updated_at }}
         run: |
+          # Track the merged upstream base automatically (e.g. 0.1.179 -> 0.1.179-fork)
+          VERSION="$(tr -d '[:space:]' < cmd/server/VERSION)-fork"
+          echo "Building version: $VERSION"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
             -tags embed \
             -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT:0:12} -X main.Date=${DATE} -X main.BuildType=release" \
