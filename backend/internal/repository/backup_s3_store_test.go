@@ -46,3 +46,34 @@ func TestS3BackupStore_UploadFile(t *testing.T) {
 	require.Equal(t, int64(len(content)), receivedLength)
 	require.Equal(t, content, received)
 }
+
+func TestS3ProxyFunc(t *testing.T) {
+	t.Parallel()
+
+	// 空代理：nil 表示直连。
+	proxyFn, err := s3ProxyFunc("")
+	require.NoError(t, err)
+	require.Nil(t, proxyFn)
+
+	proxyFn, err = s3ProxyFunc("   ")
+	require.NoError(t, err)
+	require.Nil(t, proxyFn)
+
+	// socks5 代理：解析为配置的 URL（socks5h 由 proxyurl 层归一化），
+	// net/http 对 https 目标自动走隧道并远端解析域名。
+	proxyFn, err = s3ProxyFunc("socks5h://127.0.0.1:1083")
+	require.NoError(t, err)
+	require.NotNil(t, proxyFn)
+
+	req, err := http.NewRequest(http.MethodGet, "https://example-account.r2.cloudflarestorage.com/bucket/key", nil)
+	require.NoError(t, err)
+	got, err := proxyFn(req)
+	require.NoError(t, err)
+	require.Equal(t, "socks5h://127.0.0.1:1083", got.String())
+
+	// 非法 URL：fail-fast，不回退直连。
+	_, err = s3ProxyFunc("://bad")
+	require.Error(t, err)
+	_, err = s3ProxyFunc("not a url")
+	require.Error(t, err)
+}
