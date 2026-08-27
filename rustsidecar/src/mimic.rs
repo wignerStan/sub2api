@@ -409,9 +409,21 @@ pub fn sanitize_client_metadata(
         // 4. Validate fingerprint consistency across flat client_metadata fields (Do not align; reject divergence with 403)
         let flat_session = map.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
         let flat_thread = map.get("thread_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_install = map.get("x-codex-installation-id").or_else(|| map.get("installation_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_parent_thread = map.get("x-codex-parent-thread-id").or_else(|| map.get("parent_thread_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_subagent = map.get("x-openai-subagent").or_else(|| map.get("subagent_header")).and_then(|v| v.as_str()).map(|s| s.to_string());
         let flat_win_id = map.get("window_id").or_else(|| map.get("x-codex-window-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
         let flat_win_num = map.get("window_number").and_then(|v| v.as_u64());
         let flat_prev_win = map.get("previous_window_id").or_else(|| map.get("context_window_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        // Validate parent_thread_id UUID format if present
+        if let Some(ref p_th) = flat_parent_thread {
+            if uuid::Uuid::parse_str(p_th).is_err() {
+                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                    "flat parent_thread_id '{p_th}' is not a valid UUID"
+                )));
+            }
+        }
 
         if let Some(ref win_id) = flat_win_id {
             if let Some(pos) = win_id.rfind(':') {
@@ -476,6 +488,33 @@ pub fn sanitize_client_metadata(
                                 if tm_th != fth {
                                     return Err(MimicError::ForbiddenDivergingFingerprint(format!(
                                         "turn_metadata thread_id '{tm_th}' diverges from flat thread_id '{fth}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_inst) = tm_map.get("installation_id").and_then(|v| v.as_str()) {
+                            if let Some(ref finst) = flat_install {
+                                if tm_inst != finst {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata installation_id '{tm_inst}' diverges from flat installation_id '{finst}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
+                            if let Some(ref fparent) = flat_parent_thread {
+                                if tm_parent != fparent {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata parent_thread_id '{tm_parent}' diverges from flat parent_thread_id '{fparent}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
+                            if let Some(ref fsub) = flat_subagent {
+                                if tm_sub != fsub {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata subagent_header '{tm_sub}' diverges from flat subagent '{fsub}'"
                                     )));
                                 }
                             }
@@ -995,6 +1034,22 @@ pub fn sanitize_and_inject_headers(
             headers.insert(HeaderName::from_static("version"), v);
         }
 
+        let hdr_parent_thread = headers
+            .get("x-codex-parent-thread-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string());
+        if let Some(ref p_th) = hdr_parent_thread {
+            if uuid::Uuid::parse_str(p_th).is_err() {
+                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                    "x-codex-parent-thread-id header '{p_th}' is not a valid UUID"
+                )));
+            }
+        }
+        let hdr_subagent = headers
+            .get("x-openai-subagent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string());
+
         // Validate or generate valid UUID for x-client-request-id
         let needs_client_req_id = match headers.get("x-client-request-id").and_then(|v| v.to_str().ok()) {
             Some(s) => uuid::Uuid::parse_str(s).is_err(),
@@ -1024,6 +1079,24 @@ pub fn sanitize_and_inject_headers(
                                 return Err(MimicError::ForbiddenDivergingFingerprint(format!(
                                     "x-codex-turn-metadata thread_id '{tm_th}' diverges from x-codex-window-id prefix '{win_tid}'"
                                 )));
+                            }
+                        }
+                        if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
+                            if let Some(ref hp) = hdr_parent_thread {
+                                if tm_parent != hp {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "x-codex-turn-metadata parent_thread_id '{tm_parent}' diverges from header '{hp}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
+                            if let Some(ref hs) = hdr_subagent {
+                                if tm_sub != hs {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "x-codex-turn-metadata subagent_header '{tm_sub}' diverges from header '{hs}'"
+                                    )));
+                                }
                             }
                         }
                         if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
@@ -1464,6 +1537,78 @@ mod tests {
             HeaderValue::from_static("{\"session_id\":\"sess_1\",\"thread_id\":\"th_abc\",\"window_id\":\"th_abc:2\",\"window_number\":2,\"previous_window_id\":\"th_abc:1\"}"),
         );
         assert!(sanitize_and_inject_headers(&mut hdr_w2, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+    }
+
+    #[test]
+    fn subagent_and_parent_thread_consistency() {
+        let identity = ConvergedIdentity::new("group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0);
+
+        // 1. Consistent parent_thread_id and subagent_header in metadata -> Ok(())
+        let mut valid_meta = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_child",
+            "window_id": "th_child:0",
+            "x-codex-parent-thread-id": "018f3a7e-4b21-7000-8000-112233445566",
+            "x-openai-subagent": "collab_spawn",
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_child",
+                "window_id": "th_child:0",
+                "parent_thread_id": "018f3a7e-4b21-7000-8000-112233445566",
+                "subagent_header": "collab_spawn",
+            }).to_string()
+        });
+        assert!(sanitize_client_metadata(&mut valid_meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // 2. Invalid parent_thread_id UUID -> 403 Forbidden
+        let mut bad_uuid_meta = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_child",
+            "window_id": "th_child:0",
+            "x-codex-parent-thread-id": "not-a-valid-uuid",
+        });
+        assert!(matches!(
+            sanitize_client_metadata(&mut bad_uuid_meta, &identity, UnknownFieldPolicy::Forbidden),
+            Err(MimicError::ForbiddenDivergingFingerprint(_))
+        ));
+
+        // 3. Diverging parent_thread_id between flat and nested -> 403 Forbidden
+        let mut diverging_parent_meta = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_child",
+            "window_id": "th_child:0",
+            "x-codex-parent-thread-id": "018f3a7e-4b21-7000-8000-112233445566",
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_child",
+                "window_id": "th_child:0",
+                "parent_thread_id": "018f3a7e-4b21-7000-8000-999999999999", // Diverged!
+            }).to_string()
+        });
+        assert!(matches!(
+            sanitize_client_metadata(&mut diverging_parent_meta, &identity, UnknownFieldPolicy::Forbidden),
+            Err(MimicError::ForbiddenDivergingFingerprint(_))
+        ));
+
+        // 4. Headers: consistent parent thread and subagent headers -> Ok(())
+        let mut valid_sub_headers = HeaderMap::new();
+        valid_sub_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+        valid_sub_headers.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("th_child"));
+        valid_sub_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_child:0"));
+        valid_sub_headers.insert(HeaderName::from_static("x-codex-parent-thread-id"), HeaderValue::from_static("018f3a7e-4b21-7000-8000-112233445566"));
+        valid_sub_headers.insert(HeaderName::from_static("x-openai-subagent"), HeaderValue::from_static("collab_spawn"));
+        assert!(sanitize_and_inject_headers(&mut valid_sub_headers, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // 5. Headers: invalid parent thread UUID -> 403 Forbidden
+        let mut bad_uuid_headers = HeaderMap::new();
+        bad_uuid_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+        bad_uuid_headers.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("th_child"));
+        bad_uuid_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_child:0"));
+        bad_uuid_headers.insert(HeaderName::from_static("x-codex-parent-thread-id"), HeaderValue::from_static("bad-uuid"));
+        assert!(matches!(
+            sanitize_and_inject_headers(&mut bad_uuid_headers, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden),
+            Err(MimicError::ForbiddenDivergingFingerprint(_))
+        ));
     }
 
     #[test]

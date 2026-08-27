@@ -230,6 +230,12 @@ fn strip_response_encoding(headers: &mut HeaderMap) {
     headers.remove(CONTENT_ENCODING);
     headers.remove(CONTENT_LENGTH);
     headers.remove(TRANSFER_ENCODING);
+    // Strip upstream tracking/cookie headers from egress response to prevent downstream leakage
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove(HeaderName::from_static("cf-ray"));
+    headers.remove(HeaderName::from_static("cf-cache-status"));
+    headers.remove(HeaderName::from_static("x-envoy-upstream-service-time"));
+    headers.remove(HeaderName::from_static("x-openai-backend"));
 }
 
 async fn http_tunnel(
