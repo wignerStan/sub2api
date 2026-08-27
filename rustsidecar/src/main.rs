@@ -68,6 +68,7 @@ struct AppState {
     unknown_field_policy: UnknownFieldPolicy,
     clients: Arc<RwLock<HashMap<String, HttpClient>>>,
     db: DbProxyResolver,
+    debug: bool,
 }
 
 impl AppState {
@@ -297,7 +298,7 @@ async fn http_tunnel(
         Err(response) => return response,
     };
 
-    let client = match state.client_for(proxy).await {
+    let client = match state.client_for(proxy.clone()).await {
         Ok(client) => client,
         Err(response) => return response,
     };
@@ -314,7 +315,7 @@ async fn http_tunnel(
         Method::POST => client.post(target),
         Method::DELETE => client.delete(target),
         Method::HEAD => client.head(target),
-        _ => client.request(method, target),
+        _ => client.request(method.clone(), target),
     };
     builder = builder.headers(forwarded);
     builder = builder.header(ACCEPT_ENCODING, "identity");
@@ -339,11 +340,36 @@ async fn http_tunnel(
         Err(err) => return err.into_response(),
     };
 
-    builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
-    builder = builder.body(transformed_body);
+    let start = std::time::Instant::now();
+    if state.debug {
+        tracing::info!(
+            target = %target,
+            method = %method,
+            account_id = profile.account_id,
+            proxy = ?proxy,
+            agent_version = ?agent_version,
+            window_number,
+            body_len = transformed_body.len(),
+            "sidecar http_tunnel forward request"
+        );
+        if let Ok(body_str) = std::str::from_utf8(&transformed_body) {
+            tracing::info!(body = %body_str, "sidecar http_tunnel transformed request body");
+        }
+    }
 
     let response = match builder.send().await {
-        Ok(response) => response,
+        Ok(response) => {
+            if state.debug {
+                tracing::info!(
+                    target = %target,
+                    status = %response.status(),
+                    elapsed_ms = start.elapsed().as_millis(),
+                    headers = ?response.headers(),
+                    "sidecar http_tunnel upstream response"
+                );
+            }
+            response
+        }
         Err(error) => {
             tracing::warn!(error = %error, target, "upstream request failed");
             return StatusCode::BAD_GATEWAY.into_response();
@@ -390,7 +416,7 @@ async fn http_tunnel_e2ee(
         Ok(res) => res,
         Err(response) => return response,
     };
-    let client = match state.client_for(proxy).await {
+    let client = match state.client_for(proxy.clone()).await {
         Ok(client) => client,
         Err(response) => return response,
     };
@@ -407,7 +433,7 @@ async fn http_tunnel_e2ee(
         Method::POST => client.post(target),
         Method::DELETE => client.delete(target),
         Method::HEAD => client.head(target),
-        _ => client.request(method, target),
+        _ => client.request(method.clone(), target),
     };
     builder = builder.headers(forwarded);
     builder = builder.header(ACCEPT_ENCODING, "identity");
@@ -446,11 +472,36 @@ async fn http_tunnel_e2ee(
         Err(err) => return err.into_response(),
     };
 
-    builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
-    builder = builder.body(transformed_body);
+    let start = std::time::Instant::now();
+    if state.debug {
+        tracing::info!(
+            target = %target,
+            method = %method,
+            account_id = profile.account_id,
+            proxy = ?proxy,
+            agent_version = ?agent_version,
+            window_number,
+            body_len = transformed_body.len(),
+            "sidecar http_tunnel_e2ee forward request"
+        );
+        if let Ok(body_str) = std::str::from_utf8(&transformed_body) {
+            tracing::info!(body = %body_str, "sidecar http_tunnel_e2ee transformed request body");
+        }
+    }
 
     let response = match builder.send().await {
-        Ok(response) => response,
+        Ok(response) => {
+            if state.debug {
+                tracing::info!(
+                    target = %target,
+                    status = %response.status(),
+                    elapsed_ms = start.elapsed().as_millis(),
+                    headers = ?response.headers(),
+                    "sidecar http_tunnel_e2ee upstream response"
+                );
+            }
+            response
+        }
         Err(error) => {
             tracing::warn!(error = %error, target, "upstream request failed");
             return StatusCode::BAD_GATEWAY.into_response();
@@ -654,9 +705,20 @@ async fn ws_tunnel(
         _ => None,
     };
     let is_e2ee = e2ee_key.is_some();
+    if state.debug {
+        tracing::info!(
+            target = %target,
+            account_id = profile.account_id,
+            proxy = ?proxy,
+            agent_version = ?agent_version,
+            window_number,
+            "sidecar ws_tunnel connecting upstream"
+        );
+    }
     let profile_for_ws = profile.clone();
     let salt_for_ws = state.deployment_salt.clone();
     let policy_for_ws = state.unknown_field_policy;
+    let is_debug_for_ws = state.debug;
 
     let mut response = ws.on_upgrade(move |socket| async move {
         let connector = match WebSocketConnector::new_with_tls_mode(
@@ -693,7 +755,12 @@ async fn ws_tunnel(
             .connect_via(request, WebSocketConfig::default(), proxy)
             .await
         {
-            Ok(connection) => connection,
+            Ok(connection) => {
+                if is_debug_for_ws {
+                    tracing::info!("sidecar ws_tunnel upstream connected successfully");
+                }
+                connection
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "upstream WS connect failed");
                 return;
@@ -763,12 +830,21 @@ async fn main() {
         tracing::info!("direct database account proxy & fingerprint resolution enabled");
     }
 
+    let debug = std::env::var("SUB2API_SIDECAR_DEBUG")
+        .or_else(|_| std::env::var("GATEWAY_SIDECAR_DEBUG"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if debug {
+        tracing::info!("sidecar debug wire capture mode enabled");
+    }
+
     let state = AppState {
         token,
         deployment_salt,
         unknown_field_policy,
         clients: Arc::new(RwLock::new(HashMap::new())),
         db,
+        debug,
     };
 
     let app = Router::new()

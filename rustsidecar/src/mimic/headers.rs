@@ -17,10 +17,8 @@ pub fn is_leaked_non_x_header(key: &str) -> bool {
         || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)
 }
 
-/// Sanitize and normalize outbound HTTP request headers.
-/// 1. Allowed x- headers: kept / converged.
-/// 2. Explicitly stripped x- headers (e.g. attestation) or non-x tracking headers: stripped normally.
-/// 3. Unknown extra x- header: follows UnknownFieldPolicy (Forbidden returns 403, Strip drops header).
+/// Sanitize and normalize outbound HTTP request headers (test helper for default non-compact paths).
+#[cfg(test)]
 pub fn sanitize_and_inject_headers(
     headers: &mut HeaderMap,
     seed: &str,
