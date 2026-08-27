@@ -15,6 +15,6 @@ pub mod types;
 mod tests;
 
 pub use body::{transform_request_body, transform_ws_frame};
-pub use headers::{sanitize_and_inject_headers, sanitize_and_inject_headers_for_request};
+pub use headers::sanitize_and_inject_headers_for_request;
 pub use identity::{extract_client_version_from_headers, extract_window_number};
 pub use types::{MimicError, UnknownFieldPolicy};
