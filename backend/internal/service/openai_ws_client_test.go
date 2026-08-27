@@ -1,13 +1,70 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
+
+type recordingOpenAIWSDialer struct {
+	urls []string
+}
+
+func (d *recordingOpenAIWSDialer) Dial(
+	_ context.Context,
+	wsURL string,
+	_ http.Header,
+	_ string,
+) (openAIWSClientConn, int, http.Header, error) {
+	d.urls = append(d.urls, wsURL)
+	return nil, 0, nil, errors.New("fallback used")
+}
+
+func TestSidecarOpenAIWSClientDialerFallsBackOutsideCodex(t *testing.T) {
+	fallback := &recordingOpenAIWSDialer{}
+	settings := SidecarSettings{
+		Enabled: true,
+		BaseURL: "http://127.0.0.1:9",
+		Token:   "tok",
+	}
+	dialer := &sidecarOpenAIWSClientDialer{cfg: &config.Config{}, settings: settings, fallback: fallback}
+
+	_, _, _, err := dialer.Dial(context.Background(), "wss://api.openai.com/v1/responses", http.Header{}, "")
+	require.EqualError(t, err, "fallback used")
+	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, _, err = dialer.Dial(ctx, "wss://chatgpt.com/backend-api/codex/call_proxy", http.Header{}, "")
+	require.Error(t, err)
+	require.NotEqual(t, "fallback used", err.Error())
+	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
+}
+
+func TestSidecarOpenAIWSClientDialerRejectsInvalidProxy(t *testing.T) {
+	fallback := &recordingOpenAIWSDialer{}
+	settings := SidecarSettings{
+		Enabled: true,
+		BaseURL: "http://127.0.0.1:9",
+		Token:   "tok",
+	}
+	dialer := &sidecarOpenAIWSClientDialer{cfg: &config.Config{}, settings: settings, fallback: fallback}
+
+	_, _, _, err := dialer.Dial(
+		context.Background(),
+		"wss://chatgpt.com/backend-api/codex/call_proxy",
+		http.Header{},
+		"ftp://127.0.0.1:21",
+	)
+	require.Error(t, err)
+	require.Empty(t, fallback.urls)
+}
 
 func TestCoderOpenAIWSClientDialer_ProxyHTTPClientReuse(t *testing.T) {
 	dialer := newDefaultOpenAIWSClientDialer()

@@ -215,7 +215,14 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 执行请求
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
-	resp, err := servertiming.Do(client, req)
+	var resp *http.Response
+	if sc := s.sidecarHTTPClient(); sc != nil && service.ShouldUseSidecarTLS(req) {
+		// OpenAI OAuth hosts (chatgpt.com / auth.openai.com) 改道 sidecar rustls；
+		// api.openai.com 等 API Key 流量仍走本进程传输。
+		resp, err = s.doViaSidecar(sc, req, proxyURL)
+	} else {
+		resp, err = servertiming.Do(client, req)
+	}
 	if err != nil {
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
 		// 请求失败，立即减少计数
@@ -279,7 +286,12 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
-	resp, err := servertiming.Do(client, req)
+	var resp *http.Response
+	if sidecarClient := s.sidecarHTTPClient(); sidecarClient != nil && service.ShouldUseSidecarTLS(req) {
+		resp, err = s.doViaSidecar(sidecarClient, req, proxyURL)
+	} else {
+		resp, err = servertiming.Do(client, req)
+	}
 	if err != nil {
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
@@ -295,6 +307,23 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	})
 
 	return resp, nil
+}
+
+// sidecarHTTPClient 返回启用 sidecar 时的 loopback 客户端，未启用返回 nil。
+func (s *httpUpstreamService) sidecarHTTPClient() *http.Client {
+	if s == nil {
+		return nil
+	}
+	return service.NewSidecarLoopbackClient(s.cfg)
+}
+
+// doViaSidecar 将请求原样转发给本地 sidecar，由 sidecar 以 Codex CLI rustls
+// 栈指向真实上游（含每账号 proxy）。返回的上游响应按原样透传。
+func (s *httpUpstreamService) doViaSidecar(client *http.Client, req *http.Request, proxyURL string) (*http.Response, error) {
+	if s == nil {
+		return nil, fmt.Errorf("http upstream is nil")
+	}
+	return service.ForwardHTTPViaSidecar(s.cfg, client, req, proxyURL)
 }
 
 func httpClientForUpstreamRequest(client *http.Client, req *http.Request) *http.Client {

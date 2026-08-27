@@ -7,18 +7,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/servertiming"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/imroc/req/v3"
 )
 
 // reqClientOptions 定义 req 客户端的构建参数
 type reqClientOptions struct {
-	ProxyURL    string        // 代理 URL（支持 http/https/socks5）
-	Timeout     time.Duration // 请求超时时间
-	Impersonate bool          // 是否模拟 Chrome 浏览器指纹
-	ForceHTTP2  bool          // 是否强制使用 HTTP/2
+	ProxyURL       string        // 代理 URL（支持 http/https/socks5）
+	Timeout        time.Duration // 请求超时时间
+	Impersonate    bool          // 是否模拟 Chrome 浏览器指纹
+	ForceHTTP2     bool          // 是否强制使用 HTTP/2
+	SidecarEnabled bool
+	SidecarBaseURL string
+	SidecarToken   string
 }
 
 // sharedReqClients 存储按配置参数缓存的 req 客户端实例
@@ -60,6 +65,13 @@ func getSharedReqClient(opts reqClientOptions) (*req.Client, error) {
 		client.SetProxyURL(trimmed)
 	}
 	client = instrumentReqClient(client)
+	if opts.SidecarEnabled {
+		proxyForSidecar := trimmed
+		client.GetTransport().WrapRoundTripFunc(func(rt http.RoundTripper) req.HttpRoundTripFunc {
+			wrapped := service.NewSidecarAwareRoundTripper(nil, rt, proxyForSidecar)
+			return wrapped.RoundTrip
+		})
+	}
 
 	actual, _ := sharedReqClients.LoadOrStore(key, client)
 	if c, ok := actual.(*req.Client); ok {
@@ -80,21 +92,52 @@ func instrumentReqClient(client *req.Client) *req.Client {
 }
 
 func buildReqClientKey(opts reqClientOptions) string {
-	return fmt.Sprintf("%s|%s|%t|%t",
+	return fmt.Sprintf("%s|%s|%t|%t|%t|%s|%s",
 		strings.TrimSpace(opts.ProxyURL),
 		opts.Timeout.String(),
 		opts.Impersonate,
 		opts.ForceHTTP2,
+		opts.SidecarEnabled,
+		strings.TrimSpace(opts.SidecarBaseURL),
+		strings.TrimSpace(opts.SidecarToken),
 	)
+}
+
+func sidecarOptsFromConfig(cfg *config.Config) reqClientOptions {
+	settings := service.ResolveSidecarSettings(cfg)
+	if !settings.Enabled || settings.Token == "" || settings.BaseURL == "" {
+		return reqClientOptions{}
+	}
+	return reqClientOptions{
+		SidecarEnabled: true,
+		SidecarBaseURL: settings.BaseURL,
+		SidecarToken:   settings.Token,
+	}
 }
 
 // CreatePrivacyReqClient creates an HTTP client for OpenAI privacy settings API
 // This is exported for use by OpenAIPrivacyService
-// Uses Chrome TLS fingerprint impersonation to bypass Cloudflare checks
 func CreatePrivacyReqClient(proxyURL string) (*req.Client, error) {
-	return getSharedReqClient(reqClientOptions{
+	return CreatePrivacyReqClientWithConfig(nil, proxyURL)
+}
+
+// NewPrivacyReqClientFactory returns a privacy client factory that sends
+// official OpenAI OAuth hosts through the rustls sidecar when enabled.
+func NewPrivacyReqClientFactory(cfg *config.Config) service.PrivacyClientFactory {
+	return func(proxyURL string) (*req.Client, error) {
+		return CreatePrivacyReqClientWithConfig(cfg, proxyURL)
+	}
+}
+
+func CreatePrivacyReqClientWithConfig(cfg *config.Config, proxyURL string) (*req.Client, error) {
+	opts := reqClientOptions{
 		ProxyURL:    proxyURL,
 		Timeout:     30 * time.Second,
-		Impersonate: true, // Enable Chrome TLS fingerprint impersonation
-	})
+		Impersonate: true, // unmatched hosts (tests / CF-only fallbacks) keep Chrome impersonation
+	}
+	sidecar := sidecarOptsFromConfig(cfg)
+	opts.SidecarEnabled = sidecar.SidecarEnabled
+	opts.SidecarBaseURL = sidecar.SidecarBaseURL
+	opts.SidecarToken = sidecar.SidecarToken
+	return getSharedReqClient(opts)
 }

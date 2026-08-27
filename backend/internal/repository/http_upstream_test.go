@@ -2,6 +2,7 @@ package repository
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -94,6 +95,118 @@ func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredSOCKSProxy(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, int64(1), proxyCalls.Load())
 	require.Equal(t, int64(1), upstreamCalls.Load())
+}
+
+func TestHTTPUpstreamSidecarOpenAIOAuthHosts(t *testing.T) {
+	var sidecarHits atomic.Int64
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sidecarHits.Add(1)
+		require.Equal(t, "/v1/http", r.URL.Path)
+		require.Equal(t, "tok", r.Header.Get("x-s2s-token"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(sidecar.Close)
+
+	var directHits atomic.Int64
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directHits.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(direct.Close)
+
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "true")
+	t.Setenv("GATEWAY_SIDECAR_BASE_URL", sidecar.URL)
+	t.Setenv("GATEWAY_SIDECAR_TOKEN", "tok")
+	client := NewHTTPUpstream(&config.Config{})
+
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", bytes.NewReader([]byte(`{}`)))
+	require.NoError(t, err)
+	resp, err := client.Do(req, "", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(1), sidecarHits.Load())
+
+	req, err = http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req, "", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(2), sidecarHits.Load())
+
+	req, err = http.NewRequest(http.MethodPost, "https://auth.openai.com/oauth/token", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req, "", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(3), sidecarHits.Load())
+
+	req, err = http.NewRequest(http.MethodGet, direct.URL+"/v1/models", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req, "", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusTeapot, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(3), sidecarHits.Load(), "non-OAuth hosts must not use sidecar TLS")
+	require.Equal(t, int64(1), directHits.Load())
+
+	req, err = http.NewRequest(http.MethodGet, direct.URL+"/v1/messages", nil)
+	require.NoError(t, err)
+	resp, err = client.DoWithTLS(req, "", 7, 1, &tlsfingerprint.Profile{Name: "chrome"})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusTeapot, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(3), sidecarHits.Load(), "non-OAuth DoWithTLS must not use sidecar TLS")
+	require.Equal(t, int64(2), directHits.Load())
+}
+
+func TestHTTPUpstreamSidecarForwardsNormalizedProxy(t *testing.T) {
+	var gotProxy string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := r.Header.Get("x-upstream-proxy")
+		decoded, err := base64.StdEncoding.DecodeString(raw)
+		require.NoError(t, err)
+		gotProxy = string(decoded)
+		require.Equal(t, "https://chatgpt.com/backend-api/codex/models", r.Header.Get("x-upstream-url"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sidecar.Close)
+
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "true")
+	t.Setenv("GATEWAY_SIDECAR_BASE_URL", sidecar.URL)
+	t.Setenv("GATEWAY_SIDECAR_TOKEN", "tok")
+	client := NewHTTPUpstream(&config.Config{})
+
+	req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/models", nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req, "socks5://127.0.0.1:1080", 7, 1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, "socks5h://127.0.0.1:1080", gotProxy)
+}
+
+func TestHTTPUpstreamSidecarRejectsInvalidProxy(t *testing.T) {
+	var sidecarHits atomic.Int64
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sidecarHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(sidecar.Close)
+
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "true")
+	t.Setenv("GATEWAY_SIDECAR_BASE_URL", sidecar.URL)
+	t.Setenv("GATEWAY_SIDECAR_TOKEN", "tok")
+	client := NewHTTPUpstream(&config.Config{})
+
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", bytes.NewReader([]byte(`{}`)))
+	require.NoError(t, err)
+	_, err = client.Do(req, "ftp://127.0.0.1:21", 7, 1)
+	require.Error(t, err)
+	require.Zero(t, sidecarHits.Load(), "invalid proxy must fail closed before sidecar")
 }
 
 func TestTLSFingerprintHTTPSProxyFallsBackWithoutBypassingProxy(t *testing.T) {
