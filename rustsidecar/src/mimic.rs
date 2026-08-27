@@ -90,6 +90,20 @@ pub fn extract_window_number(window_id_str: Option<&str>, metadata: Option<&Valu
                 }
             }
         }
+        if let Some(turn_meta_str) = meta.get("x-codex-turn-metadata").and_then(|v| v.as_str()) {
+            if let Ok(tm) = serde_json::from_str::<Value>(turn_meta_str) {
+                if let Some(num) = tm.get("window_number").and_then(|v| v.as_u64()) {
+                    return num;
+                }
+                if let Some(w_val) = tm.get("window_id").and_then(|v| v.as_str()) {
+                    if let Some(pos) = w_val.rfind(':') {
+                        if let Ok(num) = w_val[pos + 1..].trim().parse::<u64>() {
+                            return num;
+                        }
+                    }
+                }
+            }
+        }
     }
     0
 }
@@ -388,11 +402,64 @@ pub fn sanitize_client_metadata(
             map.remove(&key);
         }
 
-        // Open Schema on nested x-codex-turn-metadata: ONLY sanitize workspaces (strip git remotes & normalize path)
+        // 4. Fingerprint double check & synchronize flat identity fields
+        if map.contains_key("session_id") {
+            map.insert("session_id".to_string(), json!(identity.session_id));
+        }
+        if map.contains_key("thread_id") {
+            map.insert("thread_id".to_string(), json!(identity.thread_id));
+        }
+        if map.contains_key("x-codex-installation-id") {
+            map.insert("x-codex-installation-id".to_string(), json!(identity.installation_id));
+        }
+        if map.contains_key("installation_id") {
+            map.insert("installation_id".to_string(), json!(identity.installation_id));
+        }
+        if map.contains_key("x-codex-window-id") {
+            map.insert("x-codex-window-id".to_string(), json!(identity.window_id));
+        }
+        if map.contains_key("window_id") {
+            map.insert("window_id".to_string(), json!(identity.window_id));
+        }
+        if map.contains_key("window_number") {
+            map.insert("window_number".to_string(), json!(identity.window_number));
+        }
+        if map.contains_key("turn_id") {
+            map.insert("turn_id".to_string(), json!(identity.turn_id));
+        }
+        if identity.window_number > 0 {
+            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
+            if map.contains_key("previous_window_id") {
+                map.insert("previous_window_id".to_string(), json!(prev_win));
+            }
+            if map.contains_key("context_window_id") {
+                map.insert("context_window_id".to_string(), json!(prev_win));
+            }
+        }
+
+        // 5. Open Schema on nested x-codex-turn-metadata: sanitize workspaces, synchronize identity & window fields
         if let Some(turn_meta_val) = map.get_mut("x-codex-turn-metadata") {
             if let Some(turn_meta_str) = turn_meta_val.as_str() {
                 if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
                     if let Some(tm_map) = tm.as_object_mut() {
+                        tm_map.insert("installation_id".to_string(), json!(identity.installation_id));
+                        tm_map.insert("session_id".to_string(), json!(identity.session_id));
+                        tm_map.insert("thread_id".to_string(), json!(identity.thread_id));
+                        tm_map.insert("turn_id".to_string(), json!(identity.turn_id));
+                        tm_map.insert("window_id".to_string(), json!(identity.window_id));
+                        tm_map.insert("window_number".to_string(), json!(identity.window_number));
+
+                        if identity.window_number > 0 {
+                            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
+                            tm_map.insert("previous_window_id".to_string(), json!(prev_win));
+                        }
+
+                        if !tm_map.contains_key("turn_started_at_unix_ms")
+                            || tm_map.get("turn_started_at_unix_ms").and_then(|v| v.as_i64()).unwrap_or(0) <= 0
+                        {
+                            tm_map.insert("turn_started_at_unix_ms".to_string(), json!(identity.turn_started_at_unix_ms));
+                        }
+
                         if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
                             let mut sanitized_workspaces = serde_json::Map::new();
                             for (ws_path, ws_info) in workspaces.iter_mut() {
@@ -467,6 +534,16 @@ pub fn transform_request_body(
     );
 
     let mut modified = false;
+
+    // If prompt_cache_key matches client session, rewrite to converged session_id
+    if let Some(pck) = obj.get("prompt_cache_key").and_then(|v| v.as_str()) {
+        if let Some(ref csess) = client_session_id {
+            if pck == csess {
+                obj.insert("prompt_cache_key".to_string(), json!(identity.session_id));
+                modified = true;
+            }
+        }
+    }
 
     // If client_metadata is present, validate, sanitize, and converge
     if let Some(metadata) = obj.get_mut("client_metadata") {
@@ -543,11 +620,29 @@ pub fn transform_ws_frame(
 
     let mut modified = false;
 
+    // If prompt_cache_key matches client session, rewrite to converged session_id
+    if let Some(pck) = obj.get("prompt_cache_key").and_then(|v| v.as_str()) {
+        if let Some(ref csess) = client_session_id {
+            if pck == csess {
+                obj.insert("prompt_cache_key".to_string(), json!(identity.session_id));
+                modified = true;
+            }
+        }
+    }
+
     if let Some(metadata) = obj.get_mut("client_metadata") {
         sanitize_client_metadata(metadata, &identity, policy)?;
         modified = true;
     }
     if let Some(response) = obj.get_mut("response").and_then(|r| r.as_object_mut()) {
+        if let Some(pck) = response.get("prompt_cache_key").and_then(|v| v.as_str()) {
+            if let Some(ref csess) = client_session_id {
+                if pck == csess {
+                    response.insert("prompt_cache_key".to_string(), json!(identity.session_id));
+                    modified = true;
+                }
+            }
+        }
         if let Some(metadata) = response.get_mut("client_metadata") {
             sanitize_client_metadata(metadata, &identity, policy)?;
             modified = true;
@@ -756,21 +851,40 @@ pub fn sanitize_and_inject_headers(
         }
     }
 
-    // 3. For Inference / Responses paths only: inject deterministic fallback headers if missing
+    // 3. For Inference / Responses paths only: inject and synchronize deterministic headers
     if is_responses_path {
-        if !headers.contains_key("session-id") && !headers.contains_key("session_id") {
-            if let Ok(v) = HeaderValue::from_str(&identity.session_id) {
-                headers.insert(HeaderName::from_static("session-id"), v);
-            }
+        // Enforce consistent session-id
+        headers.remove("session_id");
+        if let Ok(v) = HeaderValue::from_str(&identity.session_id) {
+            headers.insert(HeaderName::from_static("session-id"), v);
         }
-        if !headers.contains_key("thread-id") {
-            if let Ok(v) = HeaderValue::from_str(&identity.thread_id) {
-                headers.insert(HeaderName::from_static("thread-id"), v);
-            }
+
+        // Enforce consistent thread-id
+        headers.remove("thread_id");
+        if let Ok(v) = HeaderValue::from_str(&identity.thread_id) {
+            headers.insert(HeaderName::from_static("thread-id"), v);
         }
-        if !headers.contains_key("x-codex-window-id") {
-            if let Ok(v) = HeaderValue::from_str(&identity.window_id) {
-                headers.insert(HeaderName::from_static("x-codex-window-id"), v);
+
+        // Enforce consistent x-codex-window-id (<thread_id>:<window_number>)
+        if let Ok(v) = HeaderValue::from_str(&identity.window_id) {
+            headers.insert(HeaderName::from_static("x-codex-window-id"), v);
+        }
+
+        // Ensure originator and version headers
+        headers.insert(HeaderName::from_static("originator"), HeaderValue::from_static("codex_cli_rs"));
+        if let Ok(v) = HeaderValue::from_str(&identity.client_version) {
+            headers.insert(HeaderName::from_static("version"), v);
+        }
+
+        // Ensure valid UUID for x-client-request-id
+        let needs_client_req_id = match headers.get("x-client-request-id").and_then(|v| v.to_str().ok()) {
+            Some(s) => uuid::Uuid::parse_str(s).is_err(),
+            None => true,
+        };
+        if needs_client_req_id {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            if let Ok(v) = HeaderValue::from_str(&req_id) {
+                headers.insert(HeaderName::from_static("x-client-request-id"), v);
             }
         }
 
@@ -778,6 +892,24 @@ pub fn sanitize_and_inject_headers(
             if let Ok(turn_meta_str) = turn_meta_val.to_str() {
                 if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
                     if let Some(tm_map) = tm.as_object_mut() {
+                        tm_map.insert("installation_id".to_string(), json!(identity.installation_id));
+                        tm_map.insert("session_id".to_string(), json!(identity.session_id));
+                        tm_map.insert("thread_id".to_string(), json!(identity.thread_id));
+                        tm_map.insert("turn_id".to_string(), json!(identity.turn_id));
+                        tm_map.insert("window_id".to_string(), json!(identity.window_id));
+                        tm_map.insert("window_number".to_string(), json!(identity.window_number));
+
+                        if identity.window_number > 0 {
+                            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
+                            tm_map.insert("previous_window_id".to_string(), json!(prev_win));
+                        }
+
+                        if !tm_map.contains_key("turn_started_at_unix_ms")
+                            || tm_map.get("turn_started_at_unix_ms").and_then(|v| v.as_i64()).unwrap_or(0) <= 0
+                        {
+                            tm_map.insert("turn_started_at_unix_ms".to_string(), json!(identity.turn_started_at_unix_ms));
+                        }
+
                         if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
                             let mut sanitized_workspaces = serde_json::Map::new();
                             for (ws_path, ws_info) in workspaces.iter_mut() {
@@ -798,7 +930,7 @@ pub fn sanitize_and_inject_headers(
                 }
             }
         } else {
-            let turn_metadata = json!({
+            let mut turn_metadata = json!({
                 "installation_id": identity.installation_id,
                 "session_id": identity.session_id,
                 "thread_id": identity.thread_id,
@@ -807,6 +939,10 @@ pub fn sanitize_and_inject_headers(
                 "window_number": identity.window_number,
                 "turn_started_at_unix_ms": identity.turn_started_at_unix_ms,
             });
+            if identity.window_number > 0 {
+                let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
+                turn_metadata["previous_window_id"] = json!(prev_win);
+            }
             if let Ok(json_str) = serde_json::to_string(&turn_metadata) {
                 if let Ok(v) = HeaderValue::from_str(&json_str) {
                     headers.insert(HeaderName::from_static("x-codex-turn-metadata"), v);
@@ -923,8 +1059,8 @@ mod tests {
         assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
         assert!(meta.get("ws_request_header_traceparent").is_none());
         assert!(meta.get("ws_request_header_tracestate").is_none());
-        assert_eq!(meta.get("session_id").unwrap(), "client_original_session");
-        assert_eq!(meta.get("thread_id").unwrap(), "client_original_thread");
+        assert_eq!(meta.get("session_id").unwrap(), &identity.session_id);
+        assert_eq!(meta.get("thread_id").unwrap(), &identity.thread_id);
         assert_eq!(meta.get("window_number").unwrap(), 1);
 
         // Unknown extra field in flat client_metadata -> Err(ForbiddenMetadataKey) (HTTP 403) under Forbidden policy
@@ -946,7 +1082,99 @@ mod tests {
         let res_strip = sanitize_client_metadata(&mut strip_meta, &identity, UnknownFieldPolicy::Strip);
         assert!(res_strip.is_ok());
         assert!(strip_meta.get("unknown_extra_telemetry").is_none());
-        assert_eq!(strip_meta.get("session_id").unwrap(), "sess_123");
+        assert_eq!(strip_meta.get("session_id").unwrap(), &identity.session_id);
+    }
+
+    #[test]
+    fn fingerprint_double_check_and_window_consistency() {
+        let identity = ConvergedIdentity::new("test_group_seed", Some("raw_client_session"), None, "salt_1", Some("0.1.183"), 2);
+        assert_eq!(identity.window_number, 2);
+        assert_eq!(identity.window_id, format!("{}:2", identity.thread_id));
+
+        // 1. Flat metadata and nested turn metadata consistency check
+        let mut meta = json!({
+            "session_id": "raw_client_session",
+            "thread_id": "raw_client_thread",
+            "window_id": "raw_client_thread:2",
+            "window_number": 2,
+            "previous_window_id": "wrong_prev_thread:1",
+            "x-codex-turn-metadata": json!({
+                "installation_id": "wrong_install",
+                "session_id": "wrong_session",
+                "thread_id": "wrong_thread",
+                "window_id": "wrong_thread:2",
+                "window_number": 2,
+                "previous_window_id": "wrong_prev:1",
+                "workspaces": {
+                    "/develop/sub2api": {
+                        "associated_remote_urls": ["https://github.com/leaked/secret.git"]
+                    }
+                }
+            }).to_string()
+        });
+
+        assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // Flat metadata synchronized
+        assert_eq!(meta.get("session_id").unwrap(), &identity.session_id);
+        assert_eq!(meta.get("thread_id").unwrap(), &identity.thread_id);
+        assert_eq!(meta.get("window_id").unwrap(), &identity.window_id);
+        assert_eq!(meta.get("window_number").unwrap(), 2);
+        let expected_prev_win = format!("{}:1", identity.thread_id);
+        assert_eq!(meta.get("previous_window_id").unwrap(), &expected_prev_win);
+
+        // Nested turn metadata synchronized
+        let tm_str = meta.get("x-codex-turn-metadata").unwrap().as_str().unwrap();
+        let tm: Value = serde_json::from_str(tm_str).unwrap();
+        assert_eq!(tm.get("installation_id").unwrap(), &identity.installation_id);
+        assert_eq!(tm.get("session_id").unwrap(), &identity.session_id);
+        assert_eq!(tm.get("thread_id").unwrap(), &identity.thread_id);
+        assert_eq!(tm.get("window_id").unwrap(), &identity.window_id);
+        assert_eq!(tm.get("window_number").unwrap(), 2);
+        assert_eq!(tm.get("previous_window_id").unwrap(), &expected_prev_win);
+        assert!(tm.get("turn_started_at_unix_ms").unwrap().as_i64().unwrap() > 0);
+
+        // Workspaces remote stripped
+        assert!(tm_str.contains("/home/") || tm_str.contains("/Users/"));
+        assert!(!tm_str.contains("secret.git"));
+
+        // 2. Request body transform rewrites prompt_cache_key matching client session
+        let body_json = json!({
+            "prompt_cache_key": "raw_client_session",
+            "session_id": "raw_client_session",
+            "client_metadata": {
+                "session_id": "raw_client_session",
+                "thread_id": "raw_client_thread"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body_json).unwrap();
+        let transformed = transform_request_body(
+            &body_bytes,
+            "test_group_seed",
+            None,
+            "salt_1",
+            Some("0.1.183"),
+            Some(2),
+            UnknownFieldPolicy::Forbidden,
+        ).unwrap().expect("transformed body");
+
+        let res_json: Value = serde_json::from_slice(&transformed).unwrap();
+        assert_eq!(res_json.get("prompt_cache_key").unwrap(), &identity.session_id);
+        assert_eq!(res_json.pointer("/client_metadata/session_id").unwrap(), &identity.session_id);
+        assert_eq!(res_json.pointer("/client_metadata/thread_id").unwrap(), &identity.thread_id);
+
+        // 3. HTTP Header injection and synchronization
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("session_id"), HeaderValue::from_static("old_raw_session"));
+        headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("mismatched_thread:2"));
+        assert!(sanitize_and_inject_headers(&mut headers, "test_group_seed", Some("raw_client_session"), None, "salt_1", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+
+        assert_eq!(headers.get("session-id").unwrap().to_str().unwrap(), &identity.session_id);
+        assert_eq!(headers.get("thread-id").unwrap().to_str().unwrap(), &identity.thread_id);
+        assert_eq!(headers.get("x-codex-window-id").unwrap().to_str().unwrap(), &identity.window_id);
+        assert_eq!(headers.get("originator").unwrap().to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(headers.get("version").unwrap().to_str().unwrap(), "0.1.183");
+        assert!(headers.get("x-client-request-id").is_some());
     }
 
     #[test]
@@ -991,16 +1219,17 @@ mod tests {
         let transformed = transform_request_body(&raw, "seed_42", None, "salt_1", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_slice(&transformed).unwrap();
 
+        let expected_identity = ConvergedIdentity::new("seed_42", Some("client_session_abc"), None, "salt_1", Some("0.1.183"), 2);
         assert_eq!(parsed.get("model").unwrap(), "gpt-4o");
         let meta = parsed.get("client_metadata").unwrap();
 
         // Explicitly stripped tracking keys stripped
         assert!(meta.get("ws_request_header_traceparent").is_none());
 
-        // Allowed fields kept
-        assert_eq!(meta.get("session_id").unwrap(), "client_session_abc");
+        // Allowed fields converged and synchronized
+        assert_eq!(meta.get("session_id").unwrap(), &expected_identity.session_id);
         assert_eq!(meta.get("window_number").unwrap(), 2);
-        assert_eq!(parsed.get("prompt_cache_key").unwrap(), "client_session_abc");
+        assert_eq!(parsed.get("prompt_cache_key").unwrap(), &expected_identity.session_id);
 
         // Unknown extra field returns Forbidden error under Forbidden policy
         let bad_input = json!({
@@ -1032,9 +1261,10 @@ mod tests {
         let transformed = transform_ws_frame(&raw_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_str(&transformed).unwrap();
 
+        let expected_identity = ConvergedIdentity::new("seed_ws", Some("ws_client_sess"), None, "salt_ws", Some("0.1.183"), 1);
         let meta = parsed.get("client_metadata").unwrap();
         assert!(meta.get("ws_request_header_tracestate").is_none());
-        assert_eq!(meta.get("session_id").unwrap(), "ws_client_sess");
+        assert_eq!(meta.get("session_id").unwrap(), &expected_identity.session_id);
         assert_eq!(meta.get("window_number").unwrap(), 1);
 
         // Unknown extra field returns Forbidden error under Forbidden policy
