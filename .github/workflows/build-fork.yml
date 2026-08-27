@@ -1,0 +1,70 @@
+name: build-fork
+
+on:
+  push:
+    branches:
+      - sync-upstream-v0.1.177
+      - sync-upstream-v0.1.179
+      - sync-upstream-v0.1.180
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build binary
+        working-directory: backend
+        env:
+          COMMIT: ${{ github.sha }}
+          DATE: ${{ github.event.repository.updated_at }}
+        run: |
+          # Track the merged upstream base automatically (e.g. 0.1.179 -> 0.1.179-fork)
+          VERSION="$(tr -d '[:space:]' < cmd/server/VERSION)-fork"
+          echo "Building version: $VERSION"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -tags embed \
+            -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT:0:12} -X main.Date=${DATE} -X main.BuildType=release" \
+            -trimpath \
+            -o /tmp/sub2api \
+            ./cmd/server
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sidecar
+        working-directory: rustsidecar
+        run: |
+          cargo build --release --locked
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-linux-amd64
+          path: /tmp/sub2api
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-sidecar-linux-amd64
+          path: rustsidecar/target/release/sub2api-sidecar

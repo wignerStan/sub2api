@@ -1,0 +1,25 @@
+# ~/.bazelrc is already loaded as the user rc; do not import it again.
+try-import %workspace%/.bazelrc.user
+
+common --enable_bzlmod
+common --lockfile_mode=off
+common --incompatible_strict_action_env
+common --verbose_failures
+common --test_output=errors
+
+# Full remote execution on the GitHub Actions-like Linux worker.
+# Use the hermetic rules_go toolchain. Do not fall back to a host go/rustc.
+build:remote --extra_execution_platforms=//:rbe_linux
+build:remote --host_platform=//:rbe_linux
+build:remote --platforms=//:rbe_linux
+build:remote --strategy=Genrule=remote
+build:remote --strategy=TestRunner=remote
+build:remote --strategy=GoCompile=remote
+build:remote --strategy=GoLink=remote
+build:remote --strategy=GoTest=remote
+build:remote --strategy=GoModBuild=remote
+build:remote --strategy=Rustc=remote
+build:remote --strategy=RustcLTO=remote
+build:remote --define=EXECUTOR=remote
+build:remote --action_env=GOTOOLCHAIN=local
+build:remote --action_env=GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["vendor/http-client", "vendor/websocket-client", "vendor/utils-rustls-provider", "vendor/infra-utils", "."]
+
+[workspace.dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+
+[package]
+name = "sub2api-sidecar"
+version = "0.1.183"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "sub2api-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+codex-http-client = { path = "vendor/http-client" }
+codex-websocket-client = { path = "vendor/websocket-client" }
+codex-utils-rustls-provider = { path = "vendor/utils-rustls-provider" }
+infra-utils = { path = "vendor/infra-utils" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls-native-roots"] }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["proxy", "rustls-tls-native-roots"] }
+futures = { workspace = true }
+http = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aws-lc-rs = "1.18.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+moka = { version = "0.12", features = ["future"] }
+ahash = "0.8"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+
+[profile.release]
+lto = true
+strip = true

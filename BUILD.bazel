@@ -1,0 +1,62 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools:go_mod.bzl", "go_mod_binary", "go_mod_test")
+load("//tools:rust_mod.bzl", "rust_mod_binary", "rust_mod_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# GitHub Actions-like Linux worker. No Chromium RBE image.
+# The image runs hermetic toolchains; it does not provide system go.
+platform(
+    name = "rbe_linux",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    exec_properties = {
+        "OSFamily": "Linux",
+    },
+)
+
+sh_test(
+    name = "remote_smoke",
+    srcs = ["//tools:remote_smoke.sh"],
+)
+
+go_mod_test(
+    name = "backend_unit",
+    srcs = ["//backend:srcs"],
+    mode = "test-unit",
+    timeout = "long",
+)
+
+go_mod_test(
+    name = "backend_integration",
+    srcs = ["//backend:srcs"],
+    mode = "test-integration",
+    timeout = "eternal",
+)
+
+go_mod_test(
+    name = "backend_e2e",
+    srcs = ["//backend:srcs"],
+    mode = "test-e2e",
+    timeout = "long",
+)
+
+go_mod_binary(
+    name = "sub2api_linux",
+    srcs = ["//backend:srcs"],
+    out = "sub2api",
+)
+
+rust_mod_test(
+    name = "sidecar_unit",
+    srcs = ["//rustsidecar:srcs"],
+    timeout = "eternal",
+)
+
+rust_mod_binary(
+    name = "sidecar",
+    srcs = ["//rustsidecar:srcs"],
+    out = "sub2api-sidecar",
+)

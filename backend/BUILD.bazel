@@ -1,0 +1,35 @@
+exports_files([
+    "go.mod",
+    "go.sum",
+])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(
+        [
+            "go.mod",
+            "go.sum",
+            "**/*.go",
+            "**/*.sql",
+            "**/*.txt",
+            "**/*.html",
+            "**/*.json",
+            "**/*.yaml",
+            "**/*.yml",
+            "**/*.js",
+            "**/*.css",
+            "**/*.svg",
+            "**/*.woff",
+            "**/*.woff2",
+            "internal/web/dist/**",
+            "cmd/server/VERSION",
+            "scripts/resolve-version.sh",
+        ],
+        exclude = [
+            "bin/**",
+            "data/**",
+        ],
+        allow_empty = True,
+    ),
+    visibility = ["//visibility:public"],
+)
