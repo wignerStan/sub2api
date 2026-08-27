@@ -1259,7 +1259,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 	require.Equal(t, "all_turns", gjson.Get(forwarded, "reasoning.context").String())
 	require.Equal(t, ids.sessionID, gjson.Get(forwarded, "client_metadata.session_id").String())
 	require.Equal(t, ids.installationID, gjson.Get(forwarded, "client_metadata.x-codex-installation-id").String())
-	require.False(t, gjson.Get(forwarded, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").Exists())
+	require.True(t, gjson.Get(forwarded, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").Exists())
 	require.True(t, gjson.Get(forwarded, "parallel_tool_calls").Exists())
 	require.False(t, gjson.Get(forwarded, "parallel_tool_calls").Bool())
 }

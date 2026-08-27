@@ -223,8 +223,8 @@ impl ConvergedIdentity {
     }
 }
 
-/// Upstream-audited allowed flat client_metadata keys.
-#[allow(dead_code)]
+/// Upstream-audited allowed flat client_metadata keys (used in exact snapshot fidelity testing).
+#[cfg(test)]
 pub const UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "parent_turn_id",
     "root_turn_id",
@@ -242,14 +242,13 @@ pub const UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
 ];
 
 /// Upstream-audited explicitly stripped flat client_metadata keys (APM / tracing channels).
-#[allow(dead_code)]
 pub const UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "ws_request_header_traceparent",
     "ws_request_header_tracestate",
 ];
 
 /// sub2api-specific extensions to flat client_metadata keys (normalized from TurnMetadata).
-#[allow(dead_code)]
+#[cfg(test)]
 pub const SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "context_window_id",
     "previous_window_id",
@@ -257,7 +256,7 @@ pub const SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "window_number",
 ];
 
-/// Allowed keys in flat `client_metadata` (Strict Fail-Closed Whitelist).
+/// Allowed keys in flat `client_metadata` (Strict Whitelist).
 /// Codex Core wire schema is Option<HashMap<String, String>>.
 pub const ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "context_window_id",
@@ -279,6 +278,58 @@ pub const ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
     "x-openai-subagent",
 ];
 
+/// Strategy for handling unrecognized/unknown wire metadata fields and headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownFieldPolicy {
+    /// Direct reject with HTTP 403 Forbidden (Strict Fail-Closed Default).
+    #[default]
+    Forbidden,
+    /// Strip unknown field silently without rejecting the request.
+    Strip,
+}
+
+impl UnknownFieldPolicy {
+    /// Resolve strategy from environment variables (defaults to Forbidden).
+    pub fn from_env() -> Self {
+        let val = std::env::var("SIDECAR_UNKNOWN_FIELD_POLICY")
+            .or_else(|_| std::env::var("SUB2API_SIDECAR_UNKNOWN_FIELD_POLICY"))
+            .or_else(|_| std::env::var("GATEWAY_SIDECAR_UNKNOWN_FIELD_POLICY"))
+            .unwrap_or_else(|_| "forbidden".to_string())
+            .to_ascii_lowercase();
+
+        match val.trim() {
+            "strip" | "drop" => Self::Strip,
+            _ => Self::Forbidden, // default
+        }
+    }
+}
+
+/// Sidecar mimicry and validation errors.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum MimicError {
+    ForbiddenHeader(String),
+    ForbiddenMetadataKey(String),
+    InvalidJson(String),
+}
+
+impl std::fmt::Display for MimicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForbiddenHeader(hdr) => write!(f, "Forbidden: unrecognized wire x- header '{hdr}'"),
+            Self::ForbiddenMetadataKey(key) => write!(f, "Forbidden: unrecognized wire client_metadata key '{key}'"),
+            Self::InvalidJson(err) => write!(f, "Invalid JSON body: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for MimicError {}
+
+impl axum::response::IntoResponse for MimicError {
+    fn into_response(self) -> axum::response::Response {
+        (axum::http::StatusCode::FORBIDDEN, self.to_string()).into_response()
+    }
+}
+
 /// Sanitize workspace root path to ensure consistency with simulated workstation OS
 /// while eliminating private physical paths and usernames.
 pub fn sanitize_workspace_path(raw_path: &str, identity: &ConvergedIdentity) -> String {
@@ -297,15 +348,45 @@ pub fn sanitize_workspace_path(raw_path: &str, identity: &ConvergedIdentity) -> 
 }
 
 /// Sanitize client_metadata in place:
-/// 1. Strict FAIL-CLOSED on flat client_metadata: retain ONLY official allowed keys.
-/// 2. Open Schema on nested x-codex-turn-metadata (NOT fail-closed): strips git remote URLs,
-///    makes workspace paths consistent with simulated OS, preserves all other rich metadata fields.
-pub fn sanitize_client_metadata(metadata: &mut Value, identity: &ConvergedIdentity) {
+/// 1. Allowed keys (in ALLOWED_FLAT_CLIENT_METADATA_KEYS): kept.
+/// 2. Explicitly stripped keys (in UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS / EXPLICITLY_STRIPPED_*): stripped normally.
+/// 3. Unknown extra field: follows UnknownFieldPolicy (Forbidden returns 403, Strip drops the field).
+/// 4. Open Schema on nested x-codex-turn-metadata: ONLY sanitize workspaces (strip git remotes & normalize path).
+pub fn sanitize_client_metadata(
+    metadata: &mut Value,
+    identity: &ConvergedIdentity,
+    policy: UnknownFieldPolicy,
+) -> Result<(), MimicError> {
     if let Value::Object(ref mut map) = metadata {
-        // 1. Strict Fail-Closed on flat client_metadata
-        map.retain(|key, _| ALLOWED_FLAT_CLIENT_METADATA_KEYS.contains(&key.as_str()));
+        let mut keys_to_remove: Vec<String> = Vec::new();
 
-        // 2. Open Schema on nested x-codex-turn-metadata: ONLY sanitize workspaces (strip git remotes & normalize path)
+        for key in map.keys() {
+            if ALLOWED_FLAT_CLIENT_METADATA_KEYS.contains(&key.as_str()) {
+                // In allowlist -> keep
+            } else if UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS.contains(&key.as_str())
+                || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key.as_str())
+                || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key.as_str())
+            {
+                // In explicit strip list -> strip normally
+                keys_to_remove.push(key.clone());
+            } else {
+                // Unknown extra field: follow policy
+                match policy {
+                    UnknownFieldPolicy::Forbidden => {
+                        return Err(MimicError::ForbiddenMetadataKey(key.clone()));
+                    }
+                    UnknownFieldPolicy::Strip => {
+                        keys_to_remove.push(key.clone());
+                    }
+                }
+            }
+        }
+
+        for key in keys_to_remove {
+            map.remove(&key);
+        }
+
+        // Open Schema on nested x-codex-turn-metadata: ONLY sanitize workspaces (strip git remotes & normalize path)
         if let Some(turn_meta_val) = map.get_mut("x-codex-turn-metadata") {
             if let Some(turn_meta_str) = turn_meta_val.as_str() {
                 if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
@@ -330,9 +411,10 @@ pub fn sanitize_client_metadata(metadata: &mut Value, identity: &ConvergedIdenti
             }
         }
     }
+    Ok(())
 }
 
-/// Transform HTTP JSON request body: apply fail-closed leak sanitization and identity convergence.
+/// Transform HTTP JSON request body: apply explicit strip sanitization, policy-based validation, and identity convergence.
 pub fn transform_request_body(
     body_bytes: &[u8],
     seed: &str,
@@ -340,18 +422,19 @@ pub fn transform_request_body(
     salt: &str,
     agent_version: Option<&str>,
     header_window_number: Option<u64>,
-) -> Option<Vec<u8>> {
+    policy: UnknownFieldPolicy,
+) -> Result<Option<Vec<u8>>, MimicError> {
     if body_bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut val: Value = match serde_json::from_slice(body_bytes) {
         Ok(v) => v,
-        Err(_) => return None, // Non-JSON, leave unmodified
+        Err(_) => return Ok(None), // Non-JSON, leave unmodified
     };
 
     let obj = match val.as_object_mut() {
         Some(obj) => obj,
-        None => return None,
+        None => return Ok(None),
     };
 
     // Extract client session ID if provided by the client
@@ -381,17 +464,24 @@ pub fn transform_request_body(
         window_num,
     );
 
-    // If client_metadata is present, sanitize and converge
+    let mut modified = false;
+
+    // If client_metadata is present, validate, sanitize, and converge
     if let Some(metadata) = obj.get_mut("client_metadata") {
-        sanitize_client_metadata(metadata, &identity);
+        sanitize_client_metadata(metadata, &identity, policy)?;
+        modified = true;
     }
 
-    // prompt_cache_key convergence is handled by the Go backend — sidecar does NOT touch it.
-
-    serde_json::to_vec(&val).ok()
+    if modified {
+        serde_json::to_vec(&val)
+            .map(Some)
+            .map_err(|e| MimicError::InvalidJson(e.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
-/// Transform WebSocket text frame (e.g. `response.create`): strip leaks and converge.
+/// Transform WebSocket text frame (e.g. `response.create`): validate, strip leaks and converge.
 pub fn transform_ws_frame(
     frame_text: &str,
     seed: &str,
@@ -399,15 +489,19 @@ pub fn transform_ws_frame(
     salt: &str,
     agent_version: Option<&str>,
     header_window_number: Option<u64>,
-) -> Option<String> {
+    policy: UnknownFieldPolicy,
+) -> Result<Option<String>, MimicError> {
+    if frame_text.is_empty() {
+        return Ok(None);
+    }
     let mut val: Value = match serde_json::from_str(frame_text) {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
 
     let obj = match val.as_object_mut() {
         Some(obj) => obj,
-        None => return None,
+        None => return Ok(None),
     };
 
     let client_session_id = obj
@@ -448,31 +542,31 @@ pub fn transform_ws_frame(
     let mut modified = false;
 
     if let Some(metadata) = obj.get_mut("client_metadata") {
-        sanitize_client_metadata(metadata, &identity);
+        sanitize_client_metadata(metadata, &identity, policy)?;
         modified = true;
     }
     if let Some(response) = obj.get_mut("response").and_then(|r| r.as_object_mut()) {
         if let Some(metadata) = response.get_mut("client_metadata") {
-            sanitize_client_metadata(metadata, &identity);
+            sanitize_client_metadata(metadata, &identity, policy)?;
             modified = true;
         }
     }
 
     if modified {
-        serde_json::to_string(&val).ok()
+        serde_json::to_string(&val)
+            .map(Some)
+            .map_err(|e| MimicError::InvalidJson(e.to_string()))
     } else {
-        None
+        Ok(None)
     }
 }
 
 /// Upstream-audited allowed x- headers for Account endpoints (/accounts/check, /usage, etc.).
-#[allow(dead_code)]
 pub const UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &[
     "x-openai-fedramp",
 ];
 
 /// Upstream-audited explicitly stripped x- headers for Account endpoints.
-#[allow(dead_code)]
 pub const UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS: &[&str] = &[];
 
 /// Allowed x- headers on Account/Status requests (/api/codex/..., /wham/..., /usage, /status).
@@ -480,7 +574,7 @@ pub const UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS: &[&str] = &[];
 pub const ALLOWED_ACCOUNT_X_HEADERS: &[&str] = UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS;
 
 /// Upstream-audited allowed x- headers for Responses (Inference HTTP & WebSocket).
-#[allow(dead_code)]
+#[cfg(test)]
 pub const UPSTREAM_ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-codex-beta-features",
@@ -498,20 +592,19 @@ pub const UPSTREAM_ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
 ];
 
 /// Upstream-audited explicitly stripped x- headers for Responses (e.g. attestation).
-#[allow(dead_code)]
 pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-oai-attestation",
 ];
 
 /// sub2api-specific extensions to responses x- headers (e.g. installation ID header bridge).
-#[allow(dead_code)]
+#[cfg(test)]
 pub const SUB2API_EXTENDED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-codex-installation-id",
     "x-codex-ws-stream-request-start-ms",
 ];
 
 /// Allowed x- headers on Inference/Responses requests (/responses, /responses/compact, WebSocket).
-/// Strict Fail-Closed for x- beginning headers.
+/// Strict Whitelist for x- beginning headers.
 pub const ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-codex-beta-features",
@@ -557,8 +650,9 @@ pub fn is_leaked_non_x_header(key: &str) -> bool {
 }
 
 /// Sanitize and normalize outbound HTTP request headers.
-/// Strict Fail-Closed is applied ONLY to headers beginning with `x-`.
-/// Non-x headers pass through naturally, only stripping APM tracing, cookies, and attestation.
+/// 1. Allowed x- headers: kept / converged.
+/// 2. Explicitly stripped x- headers (e.g. attestation) or non-x tracking headers: stripped normally.
+/// 3. Unknown extra x- header: follows UnknownFieldPolicy (Forbidden returns 403, Strip drops header).
 pub fn sanitize_and_inject_headers(
     headers: &mut HeaderMap,
     seed: &str,
@@ -568,7 +662,8 @@ pub fn sanitize_and_inject_headers(
     agent_version: Option<&str>,
     window_number: u64,
     is_responses_path: bool,
-) {
+    policy: UnknownFieldPolicy,
+) -> Result<(), MimicError> {
     let identity = ConvergedIdentity::new(
         seed,
         client_session_id,
@@ -578,25 +673,42 @@ pub fn sanitize_and_inject_headers(
         window_number,
     );
 
-    let allowed_x_headers = if is_responses_path {
-        ALLOWED_RESPONSES_X_HEADERS
+    let (allowed_x_headers, stripped_x_headers) = if is_responses_path {
+        (ALLOWED_RESPONSES_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS)
     } else {
-        ALLOWED_ACCOUNT_X_HEADERS
+        (ALLOWED_ACCOUNT_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS)
     };
 
-    // 1. Strict Fail-Closed ONLY for x- headers; strip APM/tracking for non-x headers
-    let keys_to_remove: Vec<HeaderName> = headers
-        .keys()
-        .filter(|name| {
-            let key = name.as_str();
-            if key.starts_with("x-") {
-                !allowed_x_headers.contains(&key)
+    let mut keys_to_remove: Vec<HeaderName> = Vec::new();
+
+    for name in headers.keys() {
+        let key = name.as_str();
+        if key.starts_with("x-") {
+            if allowed_x_headers.contains(&key) {
+                // In allowlist -> keep
+            } else if stripped_x_headers.contains(&key)
+                || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key)
+                || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)
+            {
+                // In explicit strip list -> strip normally
+                keys_to_remove.push(name.clone());
             } else {
-                is_leaked_non_x_header(key)
+                // Unknown extra x- header: follow policy
+                match policy {
+                    UnknownFieldPolicy::Forbidden => {
+                        return Err(MimicError::ForbiddenHeader(key.to_string()));
+                    }
+                    UnknownFieldPolicy::Strip => {
+                        keys_to_remove.push(name.clone());
+                    }
+                }
             }
-        })
-        .cloned()
-        .collect();
+        } else if is_leaked_non_x_header(key) {
+            // Non-x header in explicit strip list -> strip normally
+            keys_to_remove.push(name.clone());
+        }
+    }
+
     for key in keys_to_remove {
         headers.remove(key);
     }
@@ -689,6 +801,7 @@ pub fn sanitize_and_inject_headers(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -784,35 +897,43 @@ mod tests {
 
     #[test]
     fn fail_closed_metadata_sanitization_and_mimic() {
-        let identity = ConvergedIdentity::new("test_seed", Some("client_sess"), None, "salt", Some("0.1.135"), 1);
+        let identity = ConvergedIdentity::new("test_seed", Some("client_sess"), None, "salt", Some("0.1.183"), 1);
         let mut meta = json!({
-            "cwd": "/Users/victim/secret_project",
-            "workspace": "/develop/proprietary",
-            "git_branch": "feature/leak",
-            "terminal": "iterm2",
-            "mcp": { "secret": "token" },
-            "custom_instructions": "do not leak",
-            "unknown_future_telemetry": "should_be_dropped",
+            "ws_request_header_traceparent": "00-trace-01",
+            "ws_request_header_tracestate": "state-01",
             "window_number": 1,
             "session_id": "client_original_session",
             "thread_id": "client_original_thread",
         });
 
-        sanitize_client_metadata(&mut meta, &identity);
-
-        // Leaked/non-standard keys are stripped from flat client_metadata (Fail-Closed)
-        assert!(meta.get("workspace").is_none());
-        assert!(meta.get("mcp").is_none());
-        assert!(meta.get("custom_instructions").is_none());
-        assert!(meta.get("unknown_future_telemetry").is_none()); // strict fail-closed on flat client_metadata
-        assert!(meta.get("cwd").is_none());
-        assert!(meta.get("git_branch").is_none());
-        assert!(meta.get("terminal").is_none());
-
-        // Identity fields are NOT overwritten by sidecar — pass through for Go to handle
+        // Explicitly stripped keys are stripped normally with Ok(())
+        assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
+        assert!(meta.get("ws_request_header_traceparent").is_none());
+        assert!(meta.get("ws_request_header_tracestate").is_none());
         assert_eq!(meta.get("session_id").unwrap(), "client_original_session");
         assert_eq!(meta.get("thread_id").unwrap(), "client_original_thread");
         assert_eq!(meta.get("window_number").unwrap(), 1);
+
+        // Unknown extra field in flat client_metadata -> Err(ForbiddenMetadataKey) (HTTP 403) under Forbidden policy
+        let mut invalid_meta = json!({
+            "unknown_extra_telemetry": "bad_field",
+            "session_id": "sess_123"
+        });
+        let res = sanitize_client_metadata(&mut invalid_meta, &identity, UnknownFieldPolicy::Forbidden);
+        assert_eq!(
+            res,
+            Err(MimicError::ForbiddenMetadataKey("unknown_extra_telemetry".to_string()))
+        );
+
+        // Unknown extra field in flat client_metadata under Strip policy -> Ok(()) and stripped!
+        let mut strip_meta = json!({
+            "unknown_extra_telemetry": "bad_field",
+            "session_id": "sess_123"
+        });
+        let res_strip = sanitize_client_metadata(&mut strip_meta, &identity, UnknownFieldPolicy::Strip);
+        assert!(res_strip.is_ok());
+        assert!(strip_meta.get("unknown_extra_telemetry").is_none());
+        assert_eq!(strip_meta.get("session_id").unwrap(), "sess_123");
     }
 
     #[test]
@@ -820,14 +941,16 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static("traceparent"), HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
         headers.insert(HeaderName::from_static("cookie"), HeaderValue::from_static("oai_session=leaked_cookie"));
+        headers.insert(HeaderName::from_static("x-oai-attestation"), HeaderValue::from_static("attest_token"));
         headers.insert(HeaderName::from_static("x-codex-turn-state"), HeaderValue::from_static("server_turn_state_token_123"));
         headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("client_th:2"));
         headers.insert(axum::http::header::USER_AGENT, HeaderValue::from_static("OpenAI/Codex/0.1.183 (Unknown 1.0)"));
 
-        sanitize_and_inject_headers(&mut headers, "seed", Some("sess"), None, "salt", Some("0.1.183"), 2, true);
+        assert!(sanitize_and_inject_headers(&mut headers, "seed", Some("sess"), None, "salt", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
 
         assert!(headers.get("traceparent").is_none());
         assert!(headers.get("cookie").is_none());
+        assert!(headers.get("x-oai-attestation").is_none());
         // x-codex-turn-state MUST be preserved for server routing!
         assert_eq!(headers.get("x-codex-turn-state").unwrap().to_str().unwrap(), "server_turn_state_token_123");
         assert!(headers.get("session-id").is_some());
@@ -847,30 +970,39 @@ mod tests {
             "prompt_cache_key": "client_session_abc",
             "client_metadata": {
                 "session_id": "client_session_abc",
-                "cwd": "/home/dev/repo",
-                "git_branch": "feature/123",
-                "custom_instructions": "secret",
+                "ws_request_header_traceparent": "00-trace-01",
                 "window_number": 2,
             }
         });
         let raw = serde_json::to_vec(&input).unwrap();
-        let transformed = transform_request_body(&raw, "seed_42", None, "salt_1", Some("0.1.183"), None).unwrap();
+        let transformed = transform_request_body(&raw, "seed_42", None, "salt_1", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_slice(&transformed).unwrap();
 
         assert_eq!(parsed.get("model").unwrap(), "gpt-4o");
         let meta = parsed.get("client_metadata").unwrap();
 
-        // Non-standard flat keys stripped
-        assert!(meta.get("cwd").is_none());
-        assert!(meta.get("git_branch").is_none());
-        assert!(meta.get("custom_instructions").is_none());
+        // Explicitly stripped tracking keys stripped
+        assert!(meta.get("ws_request_header_traceparent").is_none());
 
-        // Identity fields pass through untouched — Go handles convergence
+        // Allowed fields kept
         assert_eq!(meta.get("session_id").unwrap(), "client_session_abc");
         assert_eq!(meta.get("window_number").unwrap(), 2);
-
-        // prompt_cache_key is NOT rewritten by sidecar — Go handles it
         assert_eq!(parsed.get("prompt_cache_key").unwrap(), "client_session_abc");
+
+        // Unknown extra field returns Forbidden error under Forbidden policy
+        let bad_input = json!({
+            "client_metadata": {
+                "unauthorized_field": "123"
+            }
+        });
+        let bad_raw = serde_json::to_vec(&bad_input).unwrap();
+        let res = transform_request_body(&bad_raw, "seed_42", None, "salt_1", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden);
+        assert_eq!(res, Err(MimicError::ForbiddenMetadataKey("unauthorized_field".to_string())));
+
+        // Unknown extra field stripped under Strip policy
+        let res_strip = transform_request_body(&bad_raw, "seed_42", None, "salt_1", Some("0.1.183"), None, UnknownFieldPolicy::Strip).unwrap().unwrap();
+        let parsed_strip: Value = serde_json::from_slice(&res_strip).unwrap();
+        assert!(parsed_strip.pointer("/client_metadata/unauthorized_field").is_none());
     }
 
     #[test]
@@ -878,24 +1010,34 @@ mod tests {
         let input = json!({
             "type": "response.create",
             "client_metadata": {
-                "cwd": "/tmp/leak",
-                "workspace": "/home/user",
+                "ws_request_header_tracestate": "state-01",
                 "session_id": "ws_client_sess",
                 "window_number": 1,
             }
         });
         let raw_str = serde_json::to_string(&input).unwrap();
-        let transformed = transform_ws_frame(&raw_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None).unwrap();
+        let transformed = transform_ws_frame(&raw_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_str(&transformed).unwrap();
 
         let meta = parsed.get("client_metadata").unwrap();
-        // Non-standard flat keys stripped
-        assert!(meta.get("cwd").is_none());
-        assert!(meta.get("workspace").is_none());
-
-        // Identity fields pass through untouched — Go handles convergence
+        assert!(meta.get("ws_request_header_tracestate").is_none());
         assert_eq!(meta.get("session_id").unwrap(), "ws_client_sess");
         assert_eq!(meta.get("window_number").unwrap(), 1);
+
+        // Unknown extra field returns Forbidden error under Forbidden policy
+        let bad_input = json!({
+            "client_metadata": {
+                "bad_telemetry": "leak"
+            }
+        });
+        let bad_str = serde_json::to_string(&bad_input).unwrap();
+        let res = transform_ws_frame(&bad_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden);
+        assert_eq!(res, Err(MimicError::ForbiddenMetadataKey("bad_telemetry".to_string())));
+
+        // Unknown extra field stripped under Strip policy
+        let res_strip = transform_ws_frame(&bad_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None, UnknownFieldPolicy::Strip).unwrap().unwrap();
+        let parsed_strip: Value = serde_json::from_str(&res_strip).unwrap();
+        assert!(parsed_strip.pointer("/client_metadata/bad_telemetry").is_none());
     }
 
     #[test]
@@ -922,7 +1064,7 @@ mod tests {
             "x-codex-turn-metadata": serde_json::to_string(&turn_meta_raw).unwrap(),
         });
 
-        sanitize_client_metadata(&mut meta, &identity);
+        assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
 
         let sanitized_tm_str = meta.get("x-codex-turn-metadata").unwrap().as_str().unwrap();
         let sanitized_tm: Value = serde_json::from_str(sanitized_tm_str).unwrap();
@@ -969,7 +1111,7 @@ mod tests {
             // User-Agent
             let mut headers = HeaderMap::new();
             headers.insert(axum::http::header::USER_AGENT, HeaderValue::from_static("OpenAI/Codex/0.1.183 (Unknown)"));
-            sanitize_and_inject_headers(&mut headers, &seed, None, None, "salt", Some("0.1.183"), 0, true);
+            assert!(sanitize_and_inject_headers(&mut headers, &seed, None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
 
             let ua = headers.get(axum::http::header::USER_AGENT).unwrap().to_str().unwrap();
             if identity.os == "darwin" {
@@ -986,25 +1128,31 @@ mod tests {
         account_headers.insert(HeaderName::from_static("authorization"), HeaderValue::from_static("Bearer token123"));
         account_headers.insert(HeaderName::from_static("chatgpt-account-id"), HeaderValue::from_static("acc_org_123"));
         account_headers.insert(HeaderName::from_static("x-openai-fedramp"), HeaderValue::from_static("true"));
-        account_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("thread_123:0"));
-        account_headers.insert(HeaderName::from_static("x-codex-turn-metadata"), HeaderValue::from_static("{}"));
         account_headers.insert(HeaderName::from_static("traceparent"), HeaderValue::from_static("00-trace-01"));
         account_headers.insert(HeaderName::from_static("x-oai-attestation"), HeaderValue::from_static("attest_token"));
-        account_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
 
         // Account path (e.g. /wham/usage, /api/codex/usage, /status):
-        sanitize_and_inject_headers(&mut account_headers, "seed", None, None, "salt", Some("0.1.183"), 0, false);
+        assert!(sanitize_and_inject_headers(&mut account_headers, "seed", None, None, "salt", Some("0.1.183"), 0, false, UnknownFieldPolicy::Forbidden).is_ok());
 
         assert!(account_headers.get("authorization").is_some());
         assert!(account_headers.get("chatgpt-account-id").is_some());
         assert!(account_headers.get("x-openai-fedramp").is_some());
         assert!(account_headers.get("user-agent").is_some());
-        // All unallowed x- headers and tracking headers MUST be stripped on account path
-        assert!(account_headers.get("x-codex-window-id").is_none());
-        assert!(account_headers.get("x-codex-turn-metadata").is_none());
-        assert!(account_headers.get("x-custom-leak").is_none());
         assert!(account_headers.get("traceparent").is_none());
         assert!(account_headers.get("x-oai-attestation").is_none());
+
+        // Unknown extra x- header on account path -> Err(ForbiddenHeader) (HTTP 403) under Forbidden policy
+        let mut bad_account_headers = HeaderMap::new();
+        bad_account_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
+        let err = sanitize_and_inject_headers(&mut bad_account_headers, "seed", None, None, "salt", Some("0.1.183"), 0, false, UnknownFieldPolicy::Forbidden);
+        assert_eq!(err, Err(MimicError::ForbiddenHeader("x-custom-leak".to_string())));
+
+        // Unknown extra x- header on account path under Strip policy -> Ok(()) and stripped
+        let mut strip_account_headers = HeaderMap::new();
+        strip_account_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
+        let res_strip = sanitize_and_inject_headers(&mut strip_account_headers, "seed", None, None, "salt", Some("0.1.183"), 0, false, UnknownFieldPolicy::Strip);
+        assert!(res_strip.is_ok());
+        assert!(strip_account_headers.get("x-custom-leak").is_none());
 
         let mut inference_headers = HeaderMap::new();
         inference_headers.insert(HeaderName::from_static("authorization"), HeaderValue::from_static("Bearer token123"));
@@ -1018,7 +1166,7 @@ mod tests {
         inference_headers.insert(HeaderName::from_static("x-oai-attestation"), HeaderValue::from_static("attest_token"));
 
         // Inference path (e.g. /responses, /responses/compact):
-        sanitize_and_inject_headers(&mut inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true);
+        assert!(sanitize_and_inject_headers(&mut inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
 
         assert!(inference_headers.get("authorization").is_some());
         assert!(inference_headers.get("chatgpt-account-id").is_some());
@@ -1029,7 +1177,19 @@ mod tests {
         assert!(inference_headers.get("x-codex-turn-state").is_some());
         assert!(inference_headers.get("traceparent").is_none());
         assert!(inference_headers.get("x-oai-attestation").is_none());
-        assert!(inference_headers.get("x-custom-leak").is_none());
+
+        // Unknown extra x- header on inference path -> Err(ForbiddenHeader) (HTTP 403) under Forbidden policy
+        let mut bad_inference_headers = HeaderMap::new();
+        bad_inference_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
+        let err2 = sanitize_and_inject_headers(&mut bad_inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden);
+        assert_eq!(err2, Err(MimicError::ForbiddenHeader("x-custom-leak".to_string())));
+
+        // Unknown extra x- header on inference path under Strip policy -> Ok(()) and stripped
+        let mut strip_inference_headers = HeaderMap::new();
+        strip_inference_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
+        let res_strip2 = sanitize_and_inject_headers(&mut strip_inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Strip);
+        assert!(res_strip2.is_ok());
+        assert!(strip_inference_headers.get("x-custom-leak").is_none());
     }
 
     #[test]
@@ -1118,7 +1278,7 @@ mod tests {
             "Flat client_metadata keys mismatch with upstream snapshot! Must be EXACT: (allowed + explicitly stripped) == snapshot"
         );
 
-        // 4. Exact Set Match for Effective ALLOWED_FLAT_CLIENT_METADATA_KEYS
+        // 4. Exact Set Match for Effective ALLOWED_FLAT_CLIENT_METADATA_KEYS & ALLOWED_RESPONSES_X_HEADERS
         let expected_allowed_cm: BTreeSet<String> = UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS
             .iter()
             .chain(SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS.iter())
@@ -1132,6 +1292,21 @@ mod tests {
         assert_eq!(
             actual_allowed_cm, expected_allowed_cm,
             "ALLOWED_FLAT_CLIENT_METADATA_KEYS must match (UPSTREAM_ALLOWED + SUB2API_EXTENDED) exactly"
+        );
+
+        let expected_allowed_resp_x: BTreeSet<String> = UPSTREAM_ALLOWED_RESPONSES_X_HEADERS
+            .iter()
+            .chain(SUB2API_EXTENDED_RESPONSES_X_HEADERS.iter())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        let actual_allowed_resp_x: BTreeSet<String> = ALLOWED_RESPONSES_X_HEADERS
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            actual_allowed_resp_x, expected_allowed_resp_x,
+            "ALLOWED_RESPONSES_X_HEADERS must match (UPSTREAM_ALLOWED + SUB2API_EXTENDED) exactly"
         );
 
         // 5. Explicit strip enums must contain the exact names of stripped items
@@ -1150,11 +1325,14 @@ mod tests {
             );
         }
 
-        // 6. Fail-closed test on unrecognized header & metadata key
+        // 6. Direct Forbidden 403 test on unrecognized header & metadata key
         let mut test_headers = HeaderMap::new();
         test_headers.insert(HeaderName::from_static("x-future-upstream-unresolved-header"), HeaderValue::from_static("drop"));
-        sanitize_and_inject_headers(&mut test_headers, "seed", None, None, "salt", None, 0, true);
-        assert!(test_headers.get("x-future-upstream-unresolved-header").is_none());
+        let hdr_res = sanitize_and_inject_headers(&mut test_headers, "seed", None, None, "salt", None, 0, true, UnknownFieldPolicy::Forbidden);
+        assert_eq!(
+            hdr_res,
+            Err(MimicError::ForbiddenHeader("x-future-upstream-unresolved-header".to_string()))
+        );
 
         let mut test_cm = json!({
             "client_metadata": {
@@ -1163,8 +1341,10 @@ mod tests {
             }
         });
         let identity = ConvergedIdentity::new("seed", Some("sess_1"), None, "salt", None, 0);
-        sanitize_client_metadata(test_cm.get_mut("client_metadata").unwrap(), &identity);
-        assert!(test_cm.pointer("/client_metadata/session_id").is_some());
-        assert!(test_cm.pointer("/client_metadata/unrecognized_key_123").is_none());
+        let cm_res = sanitize_client_metadata(test_cm.get_mut("client_metadata").unwrap(), &identity, UnknownFieldPolicy::Forbidden);
+        assert_eq!(
+            cm_res,
+            Err(MimicError::ForbiddenMetadataKey("unrecognized_key_123".to_string()))
+        );
     }
 }

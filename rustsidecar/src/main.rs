@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as TsMessage;
 use tokio_tungstenite::tungstenite::handshake::client::Request as TsRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use base64::Engine;
 
 mod db;
 mod e2ee;
@@ -35,6 +36,7 @@ mod mimic;
 mod upstream;
 
 use db::{AccountProfile, DbProxyResolver};
+use mimic::{MimicError, UnknownFieldPolicy};
 use upstream::allowed_codex_upstream_url;
 
 const E2EE_HEADER: &str = "x-s2s-enc";
@@ -63,6 +65,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 struct AppState {
     token: String,
     deployment_salt: String,
+    unknown_field_policy: UnknownFieldPolicy,
     clients: Arc<RwLock<HashMap<String, HttpClient>>>,
     db: DbProxyResolver,
 }
@@ -109,7 +112,7 @@ async fn resolve_account_and_proxy(
                     match state.db.resolve_account_profile(account_id).await {
                         Ok(Some(profile)) => {
                             if let Some(ref p_url) = profile.proxy_url {
-                                resolved_proxy = normalize_proxy_url(p_url.clone())?;
+                                resolved_proxy = Some(normalize_proxy_url(p_url.clone())?);
                             }
                             resolved_profile = Some(profile);
                         }
@@ -149,38 +152,29 @@ fn decode_proxy(headers: &HeaderMap) -> Result<Option<String>, Response> {
     let Some(value) = headers.get(UPSTREAM_PROXY_HEADER) else {
         return Ok(None);
     };
-    let raw = value
+    let value_str = value
         .to_str()
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw)
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value_str)
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
-    let url = String::from_utf8(bytes).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
-    normalize_proxy_url(url)
+    let proxy_url = String::from_utf8(decoded)
+        .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    normalize_proxy_url(proxy_url).map(Some)
 }
 
-fn normalize_proxy_url(raw: String) -> Result<Option<String>, Response> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let mut parsed =
-        reqwest::Url::parse(trimmed).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+fn normalize_proxy_url(proxy_url: String) -> Result<String, Response> {
+    let parsed = reqwest::Url::parse(&proxy_url).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         _ => return Err(StatusCode::BAD_REQUEST.into_response()),
     }
-    if parsed.host_str().unwrap_or("").is_empty() {
-        return Err(StatusCode::BAD_REQUEST.into_response());
-    }
-    if parsed.scheme() == "socks5" {
-        if parsed.set_scheme("socks5h").is_err() {
+    if let Some(host) = parsed.host_str() {
+        if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
             return Err(StatusCode::BAD_REQUEST.into_response());
         }
     }
-    Ok(Some(parsed.to_string()))
+    Ok(parsed.to_string())
 }
 
 fn forwarded_headers(
@@ -188,7 +182,8 @@ fn forwarded_headers(
     profile: &AccountProfile,
     salt: &str,
     is_responses_path: bool,
-) -> (HeaderMap, Option<String>, u64) {
+    policy: UnknownFieldPolicy,
+) -> Result<(HeaderMap, Option<String>, u64), MimicError> {
     let mut out = HeaderMap::new();
     let mut client_session_id = None;
     let agent_version = mimic::extract_client_version_from_headers(headers);
@@ -225,9 +220,10 @@ fn forwarded_headers(
         agent_version.as_deref(),
         window_number,
         is_responses_path,
-    );
+        policy,
+    )?;
 
-    (out, agent_version, window_number)
+    Ok((out, agent_version, window_number))
 }
 
 fn strip_response_encoding(headers: &mut HeaderMap) {
@@ -261,7 +257,10 @@ async fn http_tunnel(
     };
     let is_responses_path = target.contains("/responses") || target.contains("/completions") || target.contains("/chat/");
     let (forwarded, agent_version, window_number) =
-        forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path);
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+            Ok(res) => res,
+            Err(err) => return err.into_response(),
+        };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -280,15 +279,19 @@ async fn http_tunnel(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let transformed_body = mimic::transform_request_body(
+    let transformed_body = match mimic::transform_request_body(
         &body_bytes,
         &profile.fingerprint_seed,
         profile.custom_installation_id.as_deref(),
         &state.deployment_salt,
         agent_version.as_deref(),
         Some(window_number),
-    )
-    .unwrap_or_else(|| body_bytes.to_vec());
+        state.unknown_field_policy,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => body_bytes.to_vec(),
+        Err(err) => return err.into_response(),
+    };
 
     builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
     builder = builder.body(transformed_body);
@@ -347,7 +350,10 @@ async fn http_tunnel_e2ee(
     };
     let is_responses_path = target.contains("/responses") || target.contains("/completions") || target.contains("/chat/");
     let (forwarded, agent_version, window_number) =
-        forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path);
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+            Ok(res) => res,
+            Err(err) => return err.into_response(),
+        };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -380,15 +386,19 @@ async fn http_tunnel_e2ee(
     };
 
     // Apply metadata sanitization & convergence on decrypted body with exact agent version & window_number
-    let transformed_body = mimic::transform_request_body(
+    let transformed_body = match mimic::transform_request_body(
         &plain_body,
         &profile.fingerprint_seed,
         profile.custom_installation_id.as_deref(),
         &state.deployment_salt,
         agent_version.as_deref(),
         Some(window_number),
-    )
-    .unwrap_or(plain_body);
+        state.unknown_field_policy,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => plain_body,
+        Err(err) => return err.into_response(),
+    };
 
     builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
     builder = builder.body(transformed_body);
@@ -459,6 +469,7 @@ async fn pump_ws(
     salt: String,
     agent_version: Option<String>,
     header_window_number: Option<u64>,
+    policy: UnknownFieldPolicy,
 ) {
     let seal_ts = |message: TsMessage| -> TsMessage {
         match (&e2ee_key, message) {
@@ -499,17 +510,24 @@ async fn pump_ws(
         // Apply metadata sanitization and convergence on client WS frame with exact agent version & window number
         match plain_msg {
             TsMessage::Text(text) => {
-                if let Some(transformed) = mimic::transform_ws_frame(
+                match mimic::transform_ws_frame(
                     &text,
                     &profile_for_upstream.fingerprint_seed,
                     profile_for_upstream.custom_installation_id.as_deref(),
                     &salt_for_upstream,
                     version_for_upstream.as_deref(),
                     header_window_number,
+                    policy,
                 ) {
-                    TsMessage::text(transformed)
-                } else {
-                    TsMessage::Text(text)
+                    Ok(Some(transformed)) => TsMessage::text(transformed),
+                    Ok(None) => TsMessage::Text(text),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "forbidden client WS frame payload");
+                        TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                            reason: err.to_string().into(),
+                        }))
+                    }
                 }
             }
             other => other,
@@ -577,7 +595,10 @@ async fn ws_tunnel(
     };
     let is_responses_path = true;
     let (forwarded, agent_version, window_number) =
-        forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path);
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+            Ok(res) => res,
+            Err(err) => return err.into_response(),
+        };
     let e2ee_key = match headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) {
         Some("1") => match e2ee::derive_key_from_token(state.token.as_bytes()) {
             Ok(key) => Some(key),
@@ -588,6 +609,7 @@ async fn ws_tunnel(
     let is_e2ee = e2ee_key.is_some();
     let profile_for_ws = profile.clone();
     let salt_for_ws = state.deployment_salt.clone();
+    let policy_for_ws = state.unknown_field_policy;
 
     let mut response = ws.on_upgrade(move |socket| async move {
         let connector = match WebSocketConnector::new_with_tls_mode(
@@ -630,7 +652,7 @@ async fn ws_tunnel(
                 return;
             }
         };
-        pump_ws(socket, connection, e2ee_key, profile_for_ws, salt_for_ws, agent_version, Some(window_number)).await;
+        pump_ws(socket, connection, e2ee_key, profile_for_ws, salt_for_ws, agent_version, Some(window_number), policy_for_ws).await;
     }).into_response();
 
     if is_e2ee {
@@ -683,6 +705,9 @@ async fn main() {
         d.as_ref().iter().map(|b| format!("{:02x}", b)).collect::<String>()
     });
 
+    let unknown_field_policy = UnknownFieldPolicy::from_env();
+    tracing::info!(?unknown_field_policy, "unknown wire field policy configured");
+
     let db_url = std::env::var("DATABASE_URL")
         .ok()
         .or_else(|| std::env::var("SUB2API_DATABASE_URL").ok());
@@ -694,6 +719,7 @@ async fn main() {
     let state = AppState {
         token,
         deployment_salt,
+        unknown_field_policy,
         clients: Arc::new(RwLock::new(HashMap::new())),
         db,
     };
