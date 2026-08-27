@@ -62,12 +62,16 @@ func TestCodexFingerprintSessionPreservesRootChildThreadTopology(t *testing.T) {
 	}
 	require.True(t, applyCodexFingerprintClientMetadata(body, childIDs))
 
-	clientMetadata := body["client_metadata"].(map[string]any)
+	clientMetadata, ok := body["client_metadata"].(map[string]any)
+	require.True(t, ok)
 	assert.Equal(t, childIDs.threadID, clientMetadata["thread_id"])
 	assert.Equal(t, rootIDs.threadID, clientMetadata["x-codex-parent-thread-id"])
 
+	rawTurnMeta, ok := clientMetadata["x-codex-turn-metadata"].(string)
+	require.True(t, ok)
 	var bodyMetadata map[string]any
-	require.NoError(t, json.Unmarshal([]byte(clientMetadata["x-codex-turn-metadata"].(string)), &bodyMetadata))
+	err := json.Unmarshal([]byte(rawTurnMeta), &bodyMetadata)
+	require.NoError(t, err)
 	assert.Equal(t, childIDs.threadID, bodyMetadata["thread_id"])
 	assert.Equal(t, rootIDs.threadID, bodyMetadata["parent_thread_id"])
 	assert.Equal(t, rootIDs.threadID, bodyMetadata["forked_from_thread_id"])

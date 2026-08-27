@@ -486,7 +486,7 @@ type e2eeOpenAIWSClientConn struct {
 }
 
 var (
-	_ openAIWSClientConn = (*e2eeOpenAIWSClientConn)(nil)
+	_ openAIWSClientConn   = (*e2eeOpenAIWSClientConn)(nil)
 	_ openaiwsv2.FrameConn = (*e2eeOpenAIWSClientConn)(nil)
 )
 

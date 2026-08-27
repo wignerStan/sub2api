@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	sidecarE2EEMagic   = 0xE2
-	sidecarE2EEVersion = 1
-	sidecarE2EENonce   = 12
-	sidecarE2EETag     = 16
+	sidecarE2EEMagic        = 0xE2
+	sidecarE2EEVersion      = 1
+	sidecarE2EENonce        = 12
+	sidecarE2EETag          = 16
 	sidecarE2EEHeader       = 2 + 4
 	sidecarE2EESalt         = "sub2api-e2ee-v1"
 	sidecarE2EEAAD          = "sub2api-e2ee"
@@ -37,12 +37,12 @@ const (
 )
 
 var (
-	errSidecarE2EEShort     = errors.New("e2ee record too short")
-	errSidecarE2EEHeader    = errors.New("unsupported e2ee record header")
-	errSidecarE2EETooLarge  = errors.New("e2ee record payload too large")
-	errSidecarE2EETrunc     = errors.New("e2ee record truncated")
-	errSidecarE2EEAuth      = errors.New("e2ee record authentication failed")
-	errSidecarE2EEKeyInfo   = errors.New("invalid e2ee key info")
+	errSidecarE2EEShort    = errors.New("e2ee record too short")
+	errSidecarE2EEHeader   = errors.New("unsupported e2ee record header")
+	errSidecarE2EETooLarge = errors.New("e2ee record payload too large")
+	errSidecarE2EETrunc    = errors.New("e2ee record truncated")
+	errSidecarE2EEAuth     = errors.New("e2ee record authentication failed")
+	errSidecarE2EEKeyInfo  = errors.New("invalid e2ee key info")
 )
 
 func sidecarE2EEDerive(ikm []byte, info string) ([32]byte, error) {
