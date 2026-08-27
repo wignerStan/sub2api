@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -42,9 +44,17 @@ func createOpenAICompactProbePayload(model string, isOAuth bool) map[string]any 
 		},
 		"stream": true,
 	}
-	// ChatGPT internal API 要求 store: false，与真实转发一致。
+	// ChatGPT internal API 要求 store: false 与基础 client_metadata，与真实转发一致。
 	if isOAuth {
 		payload["store"] = false
+		sessionID := uuid.NewString()
+		windowID := sessionID + ":0"
+		payload["client_metadata"] = map[string]any{
+			"session_id":    sessionID,
+			"thread_id":     sessionID,
+			"window_id":     windowID,
+			"window_number": float64(0),
+		}
 	}
 	return payload
 }

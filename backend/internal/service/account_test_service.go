@@ -778,15 +778,15 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		req.Header.Set("OpenAI-Beta", "responses=experimental")
 		canonical := resolveCodexOutboundIdentity("")
 		req.Header.Set("Originator", canonical.originator)
+		req.Header.Set("Version", canonical.version)
 		if customUA := strings.TrimSpace(credentialAccount.GetOpenAIUserAgent()); customUA != "" {
 			req.Header.Set("User-Agent", customUA)
 		} else {
 			req.Header.Set("User-Agent", canonical.userAgent)
 		}
-		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-		// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入，否则测试用的身份
-		// 与该账号真实出站的身份不是同一个（issue #3901 的配对不变式由收口保证）。
 		enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
+		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
+		applyCodexFingerprintToUsageProbeRequest(credentialAccount, req.Header)
 	}
 
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
@@ -2627,9 +2627,17 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 		"stream": true,
 	}
 
-	// OAuth accounts using ChatGPT internal API require store: false
+	// OAuth accounts using ChatGPT internal API require store: false and basic client_metadata
 	if isOAuth {
 		payload["store"] = false
+		sessionID := uuid.NewString()
+		windowID := sessionID + ":0"
+		payload["client_metadata"] = map[string]any{
+			"session_id":    sessionID,
+			"thread_id":     sessionID,
+			"window_id":     windowID,
+			"window_number": float64(0),
+		}
 	}
 
 	// All accounts require instructions for Responses API

@@ -309,6 +309,7 @@ impl UnknownFieldPolicy {
 pub enum MimicError {
     ForbiddenHeader(String),
     ForbiddenMetadataKey(String),
+    ForbiddenAcceptHeader(String),
     InvalidJson(String),
 }
 
@@ -317,6 +318,7 @@ impl std::fmt::Display for MimicError {
         match self {
             Self::ForbiddenHeader(hdr) => write!(f, "Forbidden: unrecognized wire x- header '{hdr}'"),
             Self::ForbiddenMetadataKey(key) => write!(f, "Forbidden: unrecognized wire client_metadata key '{key}'"),
+            Self::ForbiddenAcceptHeader(acc) => write!(f, "Forbidden: Accept header '{acc}' is blocked, only 'text/event-stream' is supported for OAuth accounts"),
             Self::InvalidJson(err) => write!(f, "Invalid JSON body: {err}"),
         }
     }
@@ -672,6 +674,17 @@ pub fn sanitize_and_inject_headers(
         agent_version,
         window_number,
     );
+
+    // 0. On Responses/Inference path: reject application/json Accept header (only text/event-stream is supported)
+    if is_responses_path {
+        if let Some(accept_val) = headers.get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()) {
+            let lower = accept_val.to_ascii_lowercase();
+            if lower.contains("application/json") && !lower.contains("text/event-stream") {
+                return Err(MimicError::ForbiddenAcceptHeader(accept_val.to_string()));
+            }
+        }
+        headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+    }
 
     let (allowed_x_headers, stripped_x_headers) = if is_responses_path {
         (ALLOWED_RESPONSES_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS)
@@ -1190,6 +1203,18 @@ mod tests {
         let res_strip2 = sanitize_and_inject_headers(&mut strip_inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Strip);
         assert!(res_strip2.is_ok());
         assert!(strip_inference_headers.get("x-custom-leak").is_none());
+
+        // Accept: application/json on inference path -> Err(ForbiddenAcceptHeader) (HTTP 403)
+        let mut json_accept_headers = HeaderMap::new();
+        json_accept_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("application/json"));
+        let json_err = sanitize_and_inject_headers(&mut json_accept_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden);
+        assert_eq!(json_err, Err(MimicError::ForbiddenAcceptHeader("application/json".to_string())));
+
+        // Accept: text/event-stream on inference path -> Ok(())
+        let mut sse_accept_headers = HeaderMap::new();
+        sse_accept_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+        assert!(sanitize_and_inject_headers(&mut sse_accept_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
+        assert_eq!(sse_accept_headers.get("accept").unwrap().to_str().unwrap(), "text/event-stream");
     }
 
     #[test]
