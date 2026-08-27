@@ -324,6 +324,8 @@ pub enum MimicError {
     ForbiddenHeader(String),
     ForbiddenMetadataKey(String),
     ForbiddenAcceptHeader(String),
+    ForbiddenMissingFingerprint(String),
+    ForbiddenDivergingFingerprint(String),
     InvalidJson(String),
 }
 
@@ -333,6 +335,8 @@ impl std::fmt::Display for MimicError {
             Self::ForbiddenHeader(hdr) => write!(f, "Forbidden: unrecognized wire x- header '{hdr}'"),
             Self::ForbiddenMetadataKey(key) => write!(f, "Forbidden: unrecognized wire client_metadata key '{key}'"),
             Self::ForbiddenAcceptHeader(acc) => write!(f, "Forbidden: Accept header '{acc}' is blocked, only 'text/event-stream' is supported for OAuth accounts"),
+            Self::ForbiddenMissingFingerprint(msg) => write!(f, "Forbidden: missing required fingerprint item: {msg}"),
+            Self::ForbiddenDivergingFingerprint(msg) => write!(f, "Forbidden: diverging fingerprint item: {msg}"),
             Self::InvalidJson(err) => write!(f, "Invalid JSON body: {err}"),
         }
     }
@@ -402,62 +406,113 @@ pub fn sanitize_client_metadata(
             map.remove(&key);
         }
 
-        // 4. Fingerprint double check & synchronize flat identity fields
-        if map.contains_key("session_id") {
-            map.insert("session_id".to_string(), json!(identity.session_id));
-        }
-        if map.contains_key("thread_id") {
-            map.insert("thread_id".to_string(), json!(identity.thread_id));
-        }
-        if map.contains_key("x-codex-installation-id") {
-            map.insert("x-codex-installation-id".to_string(), json!(identity.installation_id));
-        }
-        if map.contains_key("installation_id") {
-            map.insert("installation_id".to_string(), json!(identity.installation_id));
-        }
-        if map.contains_key("x-codex-window-id") {
-            map.insert("x-codex-window-id".to_string(), json!(identity.window_id));
-        }
-        if map.contains_key("window_id") {
-            map.insert("window_id".to_string(), json!(identity.window_id));
-        }
-        if map.contains_key("window_number") {
-            map.insert("window_number".to_string(), json!(identity.window_number));
-        }
-        if map.contains_key("turn_id") {
-            map.insert("turn_id".to_string(), json!(identity.turn_id));
-        }
-        if identity.window_number > 0 {
-            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
-            if map.contains_key("previous_window_id") {
-                map.insert("previous_window_id".to_string(), json!(prev_win));
-            }
-            if map.contains_key("context_window_id") {
-                map.insert("context_window_id".to_string(), json!(prev_win));
+        // 4. Validate fingerprint consistency across flat client_metadata fields (Do not align; reject divergence with 403)
+        let flat_session = map.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_thread = map.get("thread_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_win_id = map.get("window_id").or_else(|| map.get("x-codex-window-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_win_num = map.get("window_number").and_then(|v| v.as_u64());
+        let flat_prev_win = map.get("previous_window_id").or_else(|| map.get("context_window_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        if let Some(ref win_id) = flat_win_id {
+            if let Some(pos) = win_id.rfind(':') {
+                let win_tid = &win_id[..pos];
+                let win_num_str = &win_id[pos + 1..];
+                if let Ok(parsed_num) = win_num_str.trim().parse::<u64>() {
+                    if let Some(ref th) = flat_thread {
+                        if th != win_tid {
+                            return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                "flat thread_id '{th}' diverges from window_id prefix '{win_tid}'"
+                            )));
+                        }
+                    }
+                    if let Some(wnum) = flat_win_num {
+                        if wnum != parsed_num {
+                            return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                "flat window_number '{wnum}' diverges from window_id suffix '{parsed_num}'"
+                            )));
+                        }
+                    }
+                    if let Some(ref prev) = flat_prev_win {
+                        if parsed_num == 0 {
+                            return Err(MimicError::ForbiddenDivergingFingerprint(
+                                "previous_window_id cannot exist when window_number is 0".to_string(),
+                            ));
+                        }
+                        let exp_prev = format!("{}:{}", win_tid, parsed_num - 1);
+                        if prev != &exp_prev {
+                            return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                "flat previous_window_id '{prev}' diverges from expected '{exp_prev}'"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(
+                        "window_id does not have a valid numeric suffix".to_string(),
+                    ));
+                }
+            } else {
+                return Err(MimicError::ForbiddenDivergingFingerprint(
+                    "window_id does not follow <thread_id>:<window_number> format".to_string(),
+                ));
             }
         }
 
-        // 5. Open Schema on nested x-codex-turn-metadata: sanitize workspaces, synchronize identity & window fields
+        // 5. Open Schema on nested x-codex-turn-metadata: sanitize workspaces, validate divergence
         if let Some(turn_meta_val) = map.get_mut("x-codex-turn-metadata") {
             if let Some(turn_meta_str) = turn_meta_val.as_str() {
                 if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
                     if let Some(tm_map) = tm.as_object_mut() {
-                        tm_map.insert("installation_id".to_string(), json!(identity.installation_id));
-                        tm_map.insert("session_id".to_string(), json!(identity.session_id));
-                        tm_map.insert("thread_id".to_string(), json!(identity.thread_id));
-                        tm_map.insert("turn_id".to_string(), json!(identity.turn_id));
-                        tm_map.insert("window_id".to_string(), json!(identity.window_id));
-                        tm_map.insert("window_number".to_string(), json!(identity.window_number));
-
-                        if identity.window_number > 0 {
-                            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
-                            tm_map.insert("previous_window_id".to_string(), json!(prev_win));
+                        if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
+                            if let Some(ref fsess) = flat_session {
+                                if tm_sess != fsess {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata session_id '{tm_sess}' diverges from flat session_id '{fsess}'"
+                                    )));
+                                }
+                            }
                         }
-
-                        if !tm_map.contains_key("turn_started_at_unix_ms")
-                            || tm_map.get("turn_started_at_unix_ms").and_then(|v| v.as_i64()).unwrap_or(0) <= 0
-                        {
-                            tm_map.insert("turn_started_at_unix_ms".to_string(), json!(identity.turn_started_at_unix_ms));
+                        if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
+                            if let Some(ref fth) = flat_thread {
+                                if tm_th != fth {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata thread_id '{tm_th}' diverges from flat thread_id '{fth}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
+                            if let Some(ref fwin) = flat_win_id {
+                                if tm_win != fwin {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata window_id '{tm_win}' diverges from flat window_id '{fwin}'"
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(tm_wnum) = tm_map.get("window_number").and_then(|v| v.as_u64()) {
+                            if let Some(fwnum) = flat_win_num {
+                                if tm_wnum != fwnum {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                        "turn_metadata window_number '{tm_wnum}' diverges from flat window_number '{fwnum}'"
+                                    )));
+                                }
+                            }
+                            if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
+                                if tm_wnum == 0 {
+                                    return Err(MimicError::ForbiddenDivergingFingerprint(
+                                        "turn_metadata previous_window_id cannot exist when window_number is 0".to_string(),
+                                    ));
+                                }
+                                let tm_th = tm_map.get("thread_id").and_then(|v| v.as_str()).unwrap_or("");
+                                if !tm_th.is_empty() {
+                                    let exp_prev = format!("{}:{}", tm_th, tm_wnum - 1);
+                                    if tm_prev != exp_prev {
+                                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                            "turn_metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
+                                        )));
+                                    }
+                                }
+                            }
                         }
 
                         if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
@@ -851,22 +906,86 @@ pub fn sanitize_and_inject_headers(
         }
     }
 
-    // 3. For Inference / Responses paths only: inject and synchronize deterministic headers
+    // 3. For Inference / Responses paths only: validate required headers and reject divergence with 403
     if is_responses_path {
-        // Enforce consistent session-id
+        // Enforce required session-id header
+        let session_val = match headers
+            .get("session-id")
+            .or_else(|| headers.get("session_id"))
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                return Err(MimicError::ForbiddenMissingFingerprint(
+                    "session-id header is required on responses path".to_string(),
+                ));
+            }
+        };
+
+        if let (Some(s1), Some(s2)) = (
+            headers.get("session-id").and_then(|v| v.to_str().ok()),
+            headers.get("session_id").and_then(|v| v.to_str().ok()),
+        ) {
+            if s1.trim() != s2.trim() {
+                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                    "session-id '{s1}' and session_id '{s2}' headers diverge"
+                )));
+            }
+        }
+
+        // Enforce required x-codex-window-id header
+        let win_val = match headers
+            .get("x-codex-window-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                return Err(MimicError::ForbiddenMissingFingerprint(
+                    "x-codex-window-id header is required on responses path".to_string(),
+                ));
+            }
+        };
+
+        let (win_tid, win_num) = if let Some(pos) = win_val.rfind(':') {
+            let tid = &win_val[..pos];
+            let num_str = &win_val[pos + 1..];
+            match num_str.trim().parse::<u64>() {
+                Ok(n) => (tid.to_string(), n),
+                Err(_) => {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-window-id header '{win_val}' has non-numeric window suffix"
+                    )));
+                }
+            }
+        } else {
+            return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                "x-codex-window-id header '{win_val}' does not follow <thread_id>:<window_number> format"
+            )));
+        };
+
+        // Check thread-id header divergence if present
+        if let Some(th_hdr) = headers
+            .get("thread-id")
+            .or_else(|| headers.get("thread_id"))
+            .and_then(|v| v.to_str().ok())
+        {
+            if th_hdr.trim() != win_tid {
+                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                    "thread-id header '{th_hdr}' diverges from x-codex-window-id thread prefix '{win_tid}'"
+                )));
+            }
+        }
+
+        // Normalize canonical header casing
         headers.remove("session_id");
-        if let Ok(v) = HeaderValue::from_str(&identity.session_id) {
+        if let Ok(v) = HeaderValue::from_str(&session_val) {
             headers.insert(HeaderName::from_static("session-id"), v);
         }
-
-        // Enforce consistent thread-id
         headers.remove("thread_id");
-        if let Ok(v) = HeaderValue::from_str(&identity.thread_id) {
+        if let Ok(v) = HeaderValue::from_str(&win_tid) {
             headers.insert(HeaderName::from_static("thread-id"), v);
         }
-
-        // Enforce consistent x-codex-window-id (<thread_id>:<window_number>)
-        if let Ok(v) = HeaderValue::from_str(&identity.window_id) {
+        if let Ok(v) = HeaderValue::from_str(&win_val) {
             headers.insert(HeaderName::from_static("x-codex-window-id"), v);
         }
 
@@ -876,7 +995,7 @@ pub fn sanitize_and_inject_headers(
             headers.insert(HeaderName::from_static("version"), v);
         }
 
-        // Ensure valid UUID for x-client-request-id
+        // Validate or generate valid UUID for x-client-request-id
         let needs_client_req_id = match headers.get("x-client-request-id").and_then(|v| v.to_str().ok()) {
             Some(s) => uuid::Uuid::parse_str(s).is_err(),
             None => true,
@@ -888,26 +1007,51 @@ pub fn sanitize_and_inject_headers(
             }
         }
 
+        // Check divergence in x-codex-turn-metadata if present
         if let Some(turn_meta_val) = headers.get_mut("x-codex-turn-metadata") {
             if let Ok(turn_meta_str) = turn_meta_val.to_str() {
                 if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
                     if let Some(tm_map) = tm.as_object_mut() {
-                        tm_map.insert("installation_id".to_string(), json!(identity.installation_id));
-                        tm_map.insert("session_id".to_string(), json!(identity.session_id));
-                        tm_map.insert("thread_id".to_string(), json!(identity.thread_id));
-                        tm_map.insert("turn_id".to_string(), json!(identity.turn_id));
-                        tm_map.insert("window_id".to_string(), json!(identity.window_id));
-                        tm_map.insert("window_number".to_string(), json!(identity.window_number));
-
-                        if identity.window_number > 0 {
-                            let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
-                            tm_map.insert("previous_window_id".to_string(), json!(prev_win));
+                        if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
+                            if tm_sess != session_val {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                    "x-codex-turn-metadata session_id '{tm_sess}' diverges from session-id header '{session_val}'"
+                                )));
+                            }
                         }
-
-                        if !tm_map.contains_key("turn_started_at_unix_ms")
-                            || tm_map.get("turn_started_at_unix_ms").and_then(|v| v.as_i64()).unwrap_or(0) <= 0
-                        {
-                            tm_map.insert("turn_started_at_unix_ms".to_string(), json!(identity.turn_started_at_unix_ms));
+                        if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
+                            if tm_th != win_tid {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                    "x-codex-turn-metadata thread_id '{tm_th}' diverges from x-codex-window-id prefix '{win_tid}'"
+                                )));
+                            }
+                        }
+                        if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
+                            if tm_win != win_val {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                    "x-codex-turn-metadata window_id '{tm_win}' diverges from x-codex-window-id header '{win_val}'"
+                                )));
+                            }
+                        }
+                        if let Some(tm_wnum) = tm_map.get("window_number").and_then(|v| v.as_u64()) {
+                            if tm_wnum != win_num {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                    "x-codex-turn-metadata window_number '{tm_wnum}' diverges from x-codex-window-id suffix '{win_num}'"
+                                )));
+                            }
+                        }
+                        if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
+                            if win_num == 0 {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(
+                                    "x-codex-turn-metadata previous_window_id cannot exist when window_number is 0".to_string(),
+                                ));
+                            }
+                            let exp_prev = format!("{}:{}", win_tid, win_num - 1);
+                            if tm_prev != exp_prev {
+                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                    "x-codex-turn-metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
+                                )));
+                            }
                         }
 
                         if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
@@ -927,25 +1071,6 @@ pub fn sanitize_and_inject_headers(
                             *turn_meta_val = v;
                         }
                     }
-                }
-            }
-        } else {
-            let mut turn_metadata = json!({
-                "installation_id": identity.installation_id,
-                "session_id": identity.session_id,
-                "thread_id": identity.thread_id,
-                "turn_id": identity.turn_id,
-                "window_id": identity.window_id,
-                "window_number": identity.window_number,
-                "turn_started_at_unix_ms": identity.turn_started_at_unix_ms,
-            });
-            if identity.window_number > 0 {
-                let prev_win = format!("{}:{}", identity.thread_id, identity.window_number - 1);
-                turn_metadata["previous_window_id"] = json!(prev_win);
-            }
-            if let Ok(json_str) = serde_json::to_string(&turn_metadata) {
-                if let Ok(v) = HeaderValue::from_str(&json_str) {
-                    headers.insert(HeaderName::from_static("x-codex-turn-metadata"), v);
                 }
             }
         }
@@ -1059,8 +1184,8 @@ mod tests {
         assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
         assert!(meta.get("ws_request_header_traceparent").is_none());
         assert!(meta.get("ws_request_header_tracestate").is_none());
-        assert_eq!(meta.get("session_id").unwrap(), &identity.session_id);
-        assert_eq!(meta.get("thread_id").unwrap(), &identity.thread_id);
+        assert_eq!(meta.get("session_id").unwrap(), "client_original_session");
+        assert_eq!(meta.get("thread_id").unwrap(), "client_original_thread");
         assert_eq!(meta.get("window_number").unwrap(), 1);
 
         // Unknown extra field in flat client_metadata -> Err(ForbiddenMetadataKey) (HTTP 403) under Forbidden policy
@@ -1082,29 +1207,27 @@ mod tests {
         let res_strip = sanitize_client_metadata(&mut strip_meta, &identity, UnknownFieldPolicy::Strip);
         assert!(res_strip.is_ok());
         assert!(strip_meta.get("unknown_extra_telemetry").is_none());
-        assert_eq!(strip_meta.get("session_id").unwrap(), &identity.session_id);
+        assert_eq!(strip_meta.get("session_id").unwrap(), "sess_123");
     }
 
     #[test]
     fn fingerprint_double_check_and_window_consistency() {
         let identity = ConvergedIdentity::new("test_group_seed", Some("raw_client_session"), None, "salt_1", Some("0.1.183"), 2);
         assert_eq!(identity.window_number, 2);
-        assert_eq!(identity.window_id, format!("{}:2", identity.thread_id));
 
-        // 1. Flat metadata and nested turn metadata consistency check
-        let mut meta = json!({
-            "session_id": "raw_client_session",
-            "thread_id": "raw_client_thread",
-            "window_id": "raw_client_thread:2",
+        // 1. Consistent flat metadata and nested turn metadata passes with Ok(())
+        let mut consistent_meta = json!({
+            "session_id": "sess_123",
+            "thread_id": "thread_abc",
+            "window_id": "thread_abc:2",
             "window_number": 2,
-            "previous_window_id": "wrong_prev_thread:1",
+            "previous_window_id": "thread_abc:1",
             "x-codex-turn-metadata": json!({
-                "installation_id": "wrong_install",
-                "session_id": "wrong_session",
-                "thread_id": "wrong_thread",
-                "window_id": "wrong_thread:2",
+                "session_id": "sess_123",
+                "thread_id": "thread_abc",
+                "window_id": "thread_abc:2",
                 "window_number": 2,
-                "previous_window_id": "wrong_prev:1",
+                "previous_window_id": "thread_abc:1",
                 "workspaces": {
                     "/develop/sub2api": {
                         "associated_remote_urls": ["https://github.com/leaked/secret.git"]
@@ -1113,73 +1236,79 @@ mod tests {
             }).to_string()
         });
 
-        assert!(sanitize_client_metadata(&mut meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
-
-        // Flat metadata synchronized
-        assert_eq!(meta.get("session_id").unwrap(), &identity.session_id);
-        assert_eq!(meta.get("thread_id").unwrap(), &identity.thread_id);
-        assert_eq!(meta.get("window_id").unwrap(), &identity.window_id);
-        assert_eq!(meta.get("window_number").unwrap(), 2);
-        let expected_prev_win = format!("{}:1", identity.thread_id);
-        assert_eq!(meta.get("previous_window_id").unwrap(), &expected_prev_win);
-
-        // Nested turn metadata synchronized
-        let tm_str = meta.get("x-codex-turn-metadata").unwrap().as_str().unwrap();
-        let tm: Value = serde_json::from_str(tm_str).unwrap();
-        assert_eq!(tm.get("installation_id").unwrap(), &identity.installation_id);
-        assert_eq!(tm.get("session_id").unwrap(), &identity.session_id);
-        assert_eq!(tm.get("thread_id").unwrap(), &identity.thread_id);
-        assert_eq!(tm.get("window_id").unwrap(), &identity.window_id);
-        assert_eq!(tm.get("window_number").unwrap(), 2);
-        assert_eq!(tm.get("previous_window_id").unwrap(), &expected_prev_win);
-        assert!(tm.get("turn_started_at_unix_ms").unwrap().as_i64().unwrap() > 0);
-
-        // Workspaces remote stripped
-        assert!(tm_str.contains("/home/") || tm_str.contains("/Users/"));
+        assert!(sanitize_client_metadata(&mut consistent_meta, &identity, UnknownFieldPolicy::Forbidden).is_ok());
+        let tm_str = consistent_meta.get("x-codex-turn-metadata").unwrap().as_str().unwrap();
         assert!(!tm_str.contains("secret.git"));
 
-        // 2. Request body transform rewrites prompt_cache_key matching client session
-        let body_json = json!({
-            "prompt_cache_key": "raw_client_session",
-            "session_id": "raw_client_session",
-            "client_metadata": {
-                "session_id": "raw_client_session",
-                "thread_id": "raw_client_thread"
-            }
+        // 2. Diverging thread_id vs window_id prefix -> Err(ForbiddenDivergingFingerprint) (HTTP 403)
+        let mut diverging_thread_meta = json!({
+            "thread_id": "thread_diverged",
+            "window_id": "thread_abc:2",
+            "window_number": 2,
         });
-        let body_bytes = serde_json::to_vec(&body_json).unwrap();
-        let transformed = transform_request_body(
-            &body_bytes,
-            "test_group_seed",
-            None,
-            "salt_1",
-            Some("0.1.183"),
-            Some(2),
-            UnknownFieldPolicy::Forbidden,
-        ).unwrap().expect("transformed body");
+        let err_th = sanitize_client_metadata(&mut diverging_thread_meta, &identity, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_th, Err(MimicError::ForbiddenDivergingFingerprint(_))));
 
-        let res_json: Value = serde_json::from_slice(&transformed).unwrap();
-        assert_eq!(res_json.get("prompt_cache_key").unwrap(), &identity.session_id);
-        assert_eq!(res_json.pointer("/client_metadata/session_id").unwrap(), &identity.session_id);
-        assert_eq!(res_json.pointer("/client_metadata/thread_id").unwrap(), &identity.thread_id);
+        // 3. Diverging window_number vs window_id suffix -> Err(ForbiddenDivergingFingerprint) (HTTP 403)
+        let mut diverging_win_meta = json!({
+            "thread_id": "thread_abc",
+            "window_id": "thread_abc:2",
+            "window_number": 3,
+        });
+        let err_win = sanitize_client_metadata(&mut diverging_win_meta, &identity, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_win, Err(MimicError::ForbiddenDivergingFingerprint(_))));
 
-        // 3. HTTP Header injection and synchronization
-        let mut headers = HeaderMap::new();
-        headers.insert(HeaderName::from_static("session_id"), HeaderValue::from_static("old_raw_session"));
-        headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("mismatched_thread:2"));
-        assert!(sanitize_and_inject_headers(&mut headers, "test_group_seed", Some("raw_client_session"), None, "salt_1", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+        // 4. Diverging previous_window_id -> Err(ForbiddenDivergingFingerprint) (HTTP 403)
+        let mut diverging_prev_meta = json!({
+            "thread_id": "thread_abc",
+            "window_id": "thread_abc:2",
+            "window_number": 2,
+            "previous_window_id": "thread_abc:0", // should be thread_abc:1
+        });
+        let err_prev = sanitize_client_metadata(&mut diverging_prev_meta, &identity, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_prev, Err(MimicError::ForbiddenDivergingFingerprint(_))));
 
-        assert_eq!(headers.get("session-id").unwrap().to_str().unwrap(), &identity.session_id);
-        assert_eq!(headers.get("thread-id").unwrap().to_str().unwrap(), &identity.thread_id);
-        assert_eq!(headers.get("x-codex-window-id").unwrap().to_str().unwrap(), &identity.window_id);
-        assert_eq!(headers.get("originator").unwrap().to_str().unwrap(), "codex_cli_rs");
-        assert_eq!(headers.get("version").unwrap().to_str().unwrap(), "0.1.183");
-        assert!(headers.get("x-client-request-id").is_some());
+        // 5. Diverging nested turn metadata -> Err(ForbiddenDivergingFingerprint) (HTTP 403)
+        let mut diverging_nested_meta = json!({
+            "session_id": "sess_123",
+            "thread_id": "thread_abc",
+            "window_id": "thread_abc:2",
+            "window_number": 2,
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_DIFFERENT",
+                "thread_id": "thread_abc",
+            }).to_string()
+        });
+        let err_nested = sanitize_client_metadata(&mut diverging_nested_meta, &identity, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_nested, Err(MimicError::ForbiddenDivergingFingerprint(_))));
+
+        // 6. Headers: missing required session-id or x-codex-window-id -> Err(ForbiddenMissingFingerprint) (HTTP 403)
+        let mut missing_headers = HeaderMap::new();
+        let err_missing = sanitize_and_inject_headers(&mut missing_headers, "test_group_seed", Some("sess"), None, "salt_1", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_missing, Err(MimicError::ForbiddenMissingFingerprint(_))));
+
+        // 7. Headers: diverging thread-id vs x-codex-window-id prefix -> Err(ForbiddenDivergingFingerprint) (HTTP 403)
+        let mut div_headers = HeaderMap::new();
+        div_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
+        div_headers.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("wrong_thread"));
+        div_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("actual_thread:2"));
+        let err_hdr_div = sanitize_and_inject_headers(&mut div_headers, "test_group_seed", Some("sess_123"), None, "salt_1", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_hdr_div, Err(MimicError::ForbiddenDivergingFingerprint(_))));
+
+        // 8. Headers: consistent headers pass
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
+        valid_headers.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("actual_thread"));
+        valid_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("actual_thread:2"));
+        assert!(sanitize_and_inject_headers(&mut valid_headers, "test_group_seed", Some("sess_123"), None, "salt_1", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+        assert_eq!(valid_headers.get("originator").unwrap().to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(valid_headers.get("version").unwrap().to_str().unwrap(), "0.1.183");
     }
 
     #[test]
     fn headers_sanitization_preserves_turn_state_and_strips_tracking() {
         let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
         headers.insert(HeaderName::from_static("traceparent"), HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
         headers.insert(HeaderName::from_static("cookie"), HeaderValue::from_static("oai_session=leaked_cookie"));
         headers.insert(HeaderName::from_static("x-oai-attestation"), HeaderValue::from_static("attest_token"));
@@ -1187,15 +1316,14 @@ mod tests {
         headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("client_th:2"));
         headers.insert(axum::http::header::USER_AGENT, HeaderValue::from_static("OpenAI/Codex/0.1.183 (Unknown 1.0)"));
 
-        assert!(sanitize_and_inject_headers(&mut headers, "seed", Some("sess"), None, "salt", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+        assert!(sanitize_and_inject_headers(&mut headers, "seed", Some("sess_123"), None, "salt", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
 
         assert!(headers.get("traceparent").is_none());
         assert!(headers.get("cookie").is_none());
         assert!(headers.get("x-oai-attestation").is_none());
         // x-codex-turn-state MUST be preserved for server routing!
         assert_eq!(headers.get("x-codex-turn-state").unwrap().to_str().unwrap(), "server_turn_state_token_123");
-        assert!(headers.get("session-id").is_some());
-        assert!(headers.get("x-codex-turn-metadata").is_some());
+        assert_eq!(headers.get("session-id").unwrap().to_str().unwrap(), "sess_123");
         assert!(headers.get("x-codex-window-id").unwrap().to_str().unwrap().ends_with(":2"));
 
         // User-Agent normalized to reflect simulated OS and arch
@@ -1219,17 +1347,16 @@ mod tests {
         let transformed = transform_request_body(&raw, "seed_42", None, "salt_1", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_slice(&transformed).unwrap();
 
-        let expected_identity = ConvergedIdentity::new("seed_42", Some("client_session_abc"), None, "salt_1", Some("0.1.183"), 2);
         assert_eq!(parsed.get("model").unwrap(), "gpt-4o");
         let meta = parsed.get("client_metadata").unwrap();
 
         // Explicitly stripped tracking keys stripped
         assert!(meta.get("ws_request_header_traceparent").is_none());
 
-        // Allowed fields converged and synchronized
-        assert_eq!(meta.get("session_id").unwrap(), &expected_identity.session_id);
+        // Allowed fields kept without mutation
+        assert_eq!(meta.get("session_id").unwrap(), "client_session_abc");
         assert_eq!(meta.get("window_number").unwrap(), 2);
-        assert_eq!(parsed.get("prompt_cache_key").unwrap(), &expected_identity.session_id);
+        assert_eq!(parsed.get("prompt_cache_key").unwrap(), "21e2cc47-2268-472e-99f2-cc27b26b86a9");
 
         // Unknown extra field returns Forbidden error under Forbidden policy
         let bad_input = json!({
@@ -1261,10 +1388,9 @@ mod tests {
         let transformed = transform_ws_frame(&raw_str, "seed_ws", None, "salt_ws", Some("0.1.183"), None, UnknownFieldPolicy::Forbidden).unwrap().unwrap();
         let parsed: Value = serde_json::from_str(&transformed).unwrap();
 
-        let expected_identity = ConvergedIdentity::new("seed_ws", Some("ws_client_sess"), None, "salt_ws", Some("0.1.183"), 1);
         let meta = parsed.get("client_metadata").unwrap();
         assert!(meta.get("ws_request_header_tracestate").is_none());
-        assert_eq!(meta.get("session_id").unwrap(), &expected_identity.session_id);
+        assert_eq!(meta.get("session_id").unwrap(), "ws_client_sess");
         assert_eq!(meta.get("window_number").unwrap(), 1);
 
         // Unknown extra field returns Forbidden error under Forbidden policy
@@ -1353,6 +1479,8 @@ mod tests {
 
             // User-Agent
             let mut headers = HeaderMap::new();
+            headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+            headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_1:0"));
             headers.insert(axum::http::header::USER_AGENT, HeaderValue::from_static("OpenAI/Codex/0.1.183 (Unknown)"));
             assert!(sanitize_and_inject_headers(&mut headers, &seed, None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
 
@@ -1429,6 +1557,8 @@ mod tests {
 
         // Unknown extra x- header on inference path under Strip policy -> Ok(()) and stripped
         let mut strip_inference_headers = HeaderMap::new();
+        strip_inference_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
+        strip_inference_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_123:0"));
         strip_inference_headers.insert(HeaderName::from_static("x-custom-leak"), HeaderValue::from_static("drop_me"));
         let res_strip2 = sanitize_and_inject_headers(&mut strip_inference_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Strip);
         assert!(res_strip2.is_ok());
@@ -1436,12 +1566,16 @@ mod tests {
 
         // Accept: application/json on inference path -> Err(ForbiddenAcceptHeader) (HTTP 403)
         let mut json_accept_headers = HeaderMap::new();
+        json_accept_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
+        json_accept_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_123:0"));
         json_accept_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("application/json"));
         let json_err = sanitize_and_inject_headers(&mut json_accept_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden);
         assert_eq!(json_err, Err(MimicError::ForbiddenAcceptHeader("application/json".to_string())));
 
         // Accept: text/event-stream on inference path -> Ok(())
         let mut sse_accept_headers = HeaderMap::new();
+        sse_accept_headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
+        sse_accept_headers.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_123:0"));
         sse_accept_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
         assert!(sanitize_and_inject_headers(&mut sse_accept_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
         assert_eq!(sse_accept_headers.get("accept").unwrap().to_str().unwrap(), "text/event-stream");
@@ -1583,7 +1717,7 @@ mod tests {
         // 6. Direct Forbidden 403 test on unrecognized header & metadata key
         let mut test_headers = HeaderMap::new();
         test_headers.insert(HeaderName::from_static("x-future-upstream-unresolved-header"), HeaderValue::from_static("drop"));
-        let hdr_res = sanitize_and_inject_headers(&mut test_headers, "seed", None, None, "salt", None, 0, true, UnknownFieldPolicy::Forbidden);
+        let hdr_res = sanitize_and_inject_headers(&mut test_headers, "seed", None, None, "salt", None, 0, false, UnknownFieldPolicy::Forbidden);
         assert_eq!(
             hdr_res,
             Err(MimicError::ForbiddenHeader("x-future-upstream-unresolved-header".to_string()))
