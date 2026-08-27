@@ -3,9 +3,8 @@ name: build-fork
 on:
   push:
     branches:
-      - sync-upstream-v0.1.177
-      - sync-upstream-v0.1.179
-      - sync-upstream-v0.1.180
+      - 'sync-upstream-*'
+      - 'fix/*'
   workflow_dispatch:
 
 jobs:
@@ -34,13 +33,17 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
+      - name: Test backend
+        working-directory: backend
+        run: |
+          go test ./internal/service/... ./internal/repository/... -count=1
       - name: Build binary
         working-directory: backend
         env:
           COMMIT: ${{ github.sha }}
           DATE: ${{ github.event.repository.updated_at }}
         run: |
-          # Track the merged upstream base automatically (e.g. 0.1.179 -> 0.1.179-fork)
+          # Track the merged upstream base automatically (e.g. 0.1.183 -> 0.1.183-fork)
           VERSION="$(tr -d '[:space:]' < cmd/server/VERSION)-fork"
           echo "Building version: $VERSION"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
@@ -51,6 +54,17 @@ jobs:
             ./cmd/server
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify wire audit script
+        run: |
+          python3 scripts/codex_wire_audit.py --self-test
+
+      - name: Test sidecar and wire snapshot fidelity
+        working-directory: rustsidecar
+        run: |
+          cargo test
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
       - name: Build sidecar
         working-directory: rustsidecar

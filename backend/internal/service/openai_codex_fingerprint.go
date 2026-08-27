@@ -699,21 +699,23 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 
 func isAllowedCodexClientMetadataKey(key string) bool {
 	switch key {
-	case "x-codex-installation-id",
+	case "context_window_id",
+		"parent_turn_id",
+		"previous_window_id",
+		"root_turn_id",
 		"session_id",
 		"thread_id",
 		"turn_id",
-		"x-codex-window-id",
 		"window_id",
 		"window_number",
-		"x-openai-subagent",
-		"x-codex-parent-thread-id",
-		"parent_turn_id",
-		"root_turn_id",
-		"x-codex-turn-metadata",
 		"ws_request_header_x_openai_internal_codex_responses_lite",
+		"x-codex-installation-id",
+		"x-codex-parent-thread-id",
+		"x-codex-turn-metadata",
 		"x-codex-turn-state",
-		"x-codex-ws-stream-request-start-ms":
+		"x-codex-window-id",
+		"x-codex-ws-stream-request-start-ms",
+		"x-openai-subagent":
 		return true
 	default:
 		return false

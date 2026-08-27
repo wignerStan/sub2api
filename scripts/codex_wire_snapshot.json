@@ -1,0 +1,1382 @@
+{
+  "generated_at": "2026-08-27T14:56:25.441183+00:00",
+  "source": {
+    "repo": "openai/codex",
+    "ref": "main",
+    "commit": {
+      "sha": "bce96bcb43c1aeea69fa0aa230809fa9e4eba80e",
+      "date": "2026-08-27T14:54:13Z",
+      "message": "Reject oversized reviewed terminal input (#41159)",
+      "html_url": "https://github.com/openai/codex/commit/bce96bcb43c1aeea69fa0aa230809fa9e4eba80e"
+    },
+    "files": [
+      "codex-rs/backend-client/src/client.rs",
+      "codex-rs/login/src/auth/default_client.rs",
+      "codex-rs/model-provider/src/bearer_auth_provider.rs",
+      "codex-rs/core/src/client.rs",
+      "codex-rs/core/src/responses_metadata.rs",
+      "codex-rs/codex-api/src/common.rs",
+      "codex-rs/codex-api/src/requests/headers.rs",
+      "codex-rs/codex-api/src/endpoint/responses.rs",
+      "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "codex-rs/codex-api/src/provider.rs",
+      "codex-rs/http-client/src/request.rs",
+      "codex-rs/core/src/attestation.rs"
+    ]
+  },
+  "scope": {
+    "http_headers": "Codex-explicit + auth/provider/request-preparation headers. Runtime transport-generated values are not guessed.",
+    "runtime_transport_headers": [
+      "Host",
+      "Content-Length/Transfer-Encoding",
+      "Accept-Encoding",
+      "Connection/Upgrade",
+      "Sec-WebSocket-*",
+      "proxy-added headers",
+      "runtime Cloudflare Cookie values"
+    ],
+    "all_discovered_header_candidates": [
+      "Accept",
+      "Authorization",
+      "ChatGPT-Account-ID",
+      "Content-Encoding",
+      "Content-Type",
+      "OpenAI-Beta",
+      "originator",
+      "parent_turn_id",
+      "root_turn_id",
+      "session-id",
+      "thread-id",
+      "turn_id",
+      "User-Agent",
+      "ws_request_header_traceparent",
+      "ws_request_header_tracestate",
+      "ws_request_header_x_openai_internal_codex_responses_lite",
+      "x-client-request-id",
+      "x-codex-beta-features",
+      "x-codex-installation-id",
+      "x-codex-parent-thread-id",
+      "x-codex-routing-hint",
+      "x-codex-turn-metadata",
+      "x-codex-turn-state",
+      "x-codex-ws-stream-request-start-ms",
+      "x-default-only",
+      "x-oai-attestation",
+      "X-OpenAI-Fedramp",
+      "x-openai-internal-codex-residency",
+      "x-openai-internal-codex-responses-lite",
+      "x-openai-memgen-request",
+      "x-openai-subagent",
+      "x-priority",
+      "x-responsesapi-include-timing-metrics"
+    ]
+  },
+  "account_status_check": {
+    "request": "GET accounts/check",
+    "endpoints": [
+      "/api/codex/accounts/check",
+      "/wham/accounts/check"
+    ],
+    "http_headers": [
+      {
+        "name": "User-Agent",
+        "condition": "always",
+        "value_shape": "get_codex_user_agent() or codex-cli",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/backend-client/src/client.rs",
+          "line": 32,
+          "symbol": "User-Agent"
+        }
+      },
+      {
+        "name": "Authorization",
+        "condition": "bearer auth when token exists",
+        "value_shape": "Bearer <token>",
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 36,
+          "symbol": "Authorization"
+        }
+      },
+      {
+        "name": "ChatGPT-Account-ID",
+        "condition": "when account/workspace id exists",
+        "value_shape": "<account-id>",
+        "layer": "auth/account",
+        "source": {
+          "path": "codex-rs/backend-client/src/client.rs",
+          "line": 235,
+          "symbol": "ChatGPT-Account-ID"
+        }
+      },
+      {
+        "name": "X-OpenAI-Fedramp",
+        "condition": "FedRAMP only",
+        "value_shape": "true",
+        "layer": "auth/account",
+        "source": {
+          "path": "codex-rs/backend-client/src/client.rs",
+          "line": 241,
+          "symbol": "X-OpenAI-Fedramp"
+        }
+      }
+    ],
+    "client_metadata": [],
+    "turn_metadata": null,
+    "notes": [
+      "The backend status client builds its own HeaderMap; originator is not part of that builder.",
+      "ChatGPT Cloudflare cookies can be attached by the transport at runtime."
+    ]
+  },
+  "responses_http": {
+    "request": "POST /responses (and Responses-compatible Guardian routes)",
+    "http_headers": [
+      {
+        "name": "originator",
+        "condition": "default process originator; may be thread-overridden",
+        "value_shape": "codex_cli_rs or host originator",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 145,
+          "symbol": "originator"
+        }
+      },
+      {
+        "name": "User-Agent",
+        "condition": "default Codex client",
+        "value_shape": "<originator>/<version> (<OS> <version>; <arch>) <terminal>",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 17,
+          "symbol": "User-Agent"
+        }
+      },
+      {
+        "name": "x-openai-internal-codex-residency",
+        "condition": "configured residency only",
+        "value_shape": "us",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 42,
+          "symbol": "x-openai-internal-codex-residency"
+        }
+      },
+      {
+        "name": "Authorization",
+        "condition": "bearer auth when active",
+        "value_shape": "Bearer <token>",
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 36,
+          "symbol": "Authorization"
+        }
+      },
+      {
+        "name": "ChatGPT-Account-ID",
+        "condition": "when auth carries account id",
+        "value_shape": null,
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 41,
+          "symbol": "ChatGPT-Account-ID"
+        }
+      },
+      {
+        "name": "X-OpenAI-Fedramp",
+        "condition": "FedRAMP auth only",
+        "value_shape": "true",
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 44,
+          "symbol": "X-OpenAI-Fedramp"
+        }
+      },
+      {
+        "name": "session-id",
+        "condition": "normal Responses session identity",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/requests/headers.rs",
+          "line": 8,
+          "symbol": "session-id"
+        }
+      },
+      {
+        "name": "thread-id",
+        "condition": "normal Responses thread identity",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/requests/headers.rs",
+          "line": 11,
+          "symbol": "thread-id"
+        }
+      },
+      {
+        "name": "x-client-request-id",
+        "condition": "set to thread_id",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/endpoint/responses.rs",
+          "line": 121,
+          "symbol": "x-client-request-id"
+        }
+      },
+      {
+        "name": "x-codex-window-id",
+        "condition": "window compatibility projection",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 24,
+          "symbol": "x-codex-window-id"
+        }
+      },
+      {
+        "name": "x-codex-turn-metadata",
+        "condition": "request_kind present; compatibility projection omits tool_namespaces_info",
+        "value_shape": "ASCII JSON",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 23,
+          "symbol": "x-codex-turn-metadata"
+        }
+      },
+      {
+        "name": "x-codex-parent-thread-id",
+        "condition": "when parent thread exists",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 22,
+          "symbol": "x-codex-parent-thread-id"
+        }
+      },
+      {
+        "name": "x-openai-subagent",
+        "condition": "subagent requests",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 25,
+          "symbol": "x-openai-subagent"
+        }
+      },
+      {
+        "name": "x-codex-beta-features",
+        "condition": "enabled beta feature keys",
+        "value_shape": "comma-separated",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 2078,
+          "symbol": "x-codex-beta-features"
+        }
+      },
+      {
+        "name": "x-codex-routing-hint",
+        "condition": "Codex backend routing hint when available",
+        "value_shape": "model=<model>[;tier=<tier>]",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 150,
+          "symbol": "x-codex-routing-hint"
+        }
+      },
+      {
+        "name": "x-oai-attestation",
+        "condition": "when attestation is enabled/provider returns value",
+        "value_shape": null,
+        "layer": "attestation",
+        "source": {
+          "path": "codex-rs/core/src/attestation.rs",
+          "line": 7,
+          "symbol": "x-oai-attestation"
+        }
+      },
+      {
+        "name": "x-openai-memgen-request",
+        "condition": "memory-consolidation session only",
+        "value_shape": "true",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 155,
+          "symbol": "x-openai-memgen-request"
+        }
+      },
+      {
+        "name": "x-openai-internal-codex-responses-lite",
+        "condition": "Responses Lite only",
+        "value_shape": "true",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 164,
+          "symbol": "x-openai-internal-codex-responses-lite"
+        }
+      },
+      {
+        "name": "x-codex-turn-state",
+        "condition": "replayed within the same turn after server supplies it",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 151,
+          "symbol": "x-codex-turn-state"
+        }
+      },
+      {
+        "name": "Accept",
+        "condition": "HTTP streaming Responses",
+        "value_shape": "text/event-stream",
+        "layer": "http",
+        "source": {
+          "path": "codex-rs/codex-api/src/endpoint/responses.rs",
+          "line": 177,
+          "symbol": "Accept"
+        }
+      },
+      {
+        "name": "Content-Type",
+        "condition": "JSON body",
+        "value_shape": "application/json",
+        "layer": "http",
+        "source": {
+          "path": "codex-rs/http-client/src/request.rs",
+          "line": 227,
+          "symbol": "Content-Type"
+        }
+      },
+      {
+        "name": "Content-Encoding",
+        "condition": "request compression enabled",
+        "value_shape": "zstd",
+        "layer": "http",
+        "source": {
+          "path": "codex-rs/http-client/src/request.rs",
+          "line": 193,
+          "symbol": "Content-Encoding"
+        }
+      }
+    ],
+    "dynamic_header_sources": [
+      {
+        "name": "provider.headers",
+        "source": {
+          "path": "codex-rs/codex-api/src/provider.rs",
+          "line": 47,
+          "symbol": "Provider.headers"
+        }
+      }
+    ],
+    "client_metadata_wire_type": "Option<HashMap<String, String>>",
+    "client_metadata": [
+      {
+        "name": "parent_turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 45,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "root_turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 46,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "session_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 28,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "thread_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 29,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 31,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-installation-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 21,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-parent-thread-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 22,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-turn-metadata",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 213,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-window-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 24,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-openai-subagent",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 25,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      }
+    ],
+    "turn_metadata": {
+      "canonical": "client_metadata[\"x-codex-turn-metadata\"] JSON string",
+      "compatibility_header": "x-codex-turn-metadata; tool_namespaces_info removed from bounded header projection"
+    }
+  },
+  "responses_websocket": {
+    "request": "HTTP Upgrade + response.create",
+    "handshake_http_headers": [
+      {
+        "name": "originator",
+        "condition": "default process originator; may be thread-overridden",
+        "value_shape": "codex_cli_rs or host originator",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 145,
+          "symbol": "originator"
+        }
+      },
+      {
+        "name": "User-Agent",
+        "condition": "default Codex client",
+        "value_shape": "<originator>/<version> (<OS> <version>; <arch>) <terminal>",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 17,
+          "symbol": "User-Agent"
+        }
+      },
+      {
+        "name": "x-openai-internal-codex-residency",
+        "condition": "configured residency only",
+        "value_shape": "us",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/login/src/auth/default_client.rs",
+          "line": 42,
+          "symbol": "x-openai-internal-codex-residency"
+        }
+      },
+      {
+        "name": "Authorization",
+        "condition": "bearer auth when active",
+        "value_shape": "Bearer <token>",
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 36,
+          "symbol": "Authorization"
+        }
+      },
+      {
+        "name": "ChatGPT-Account-ID",
+        "condition": "when auth carries account id",
+        "value_shape": null,
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 41,
+          "symbol": "ChatGPT-Account-ID"
+        }
+      },
+      {
+        "name": "X-OpenAI-Fedramp",
+        "condition": "FedRAMP auth only",
+        "value_shape": "true",
+        "layer": "auth",
+        "source": {
+          "path": "codex-rs/model-provider/src/bearer_auth_provider.rs",
+          "line": 44,
+          "symbol": "X-OpenAI-Fedramp"
+        }
+      },
+      {
+        "name": "session-id",
+        "condition": "normal Responses session identity",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/requests/headers.rs",
+          "line": 8,
+          "symbol": "session-id"
+        }
+      },
+      {
+        "name": "thread-id",
+        "condition": "normal Responses thread identity",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/requests/headers.rs",
+          "line": 11,
+          "symbol": "thread-id"
+        }
+      },
+      {
+        "name": "x-client-request-id",
+        "condition": "set to thread_id",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/codex-api/src/endpoint/responses.rs",
+          "line": 121,
+          "symbol": "x-client-request-id"
+        }
+      },
+      {
+        "name": "x-codex-window-id",
+        "condition": "window compatibility projection",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 24,
+          "symbol": "x-codex-window-id"
+        }
+      },
+      {
+        "name": "x-codex-turn-metadata",
+        "condition": "request_kind present; compatibility projection omits tool_namespaces_info",
+        "value_shape": "ASCII JSON",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 23,
+          "symbol": "x-codex-turn-metadata"
+        }
+      },
+      {
+        "name": "x-codex-parent-thread-id",
+        "condition": "when parent thread exists",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 22,
+          "symbol": "x-codex-parent-thread-id"
+        }
+      },
+      {
+        "name": "x-openai-subagent",
+        "condition": "subagent requests",
+        "value_shape": null,
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 25,
+          "symbol": "x-openai-subagent"
+        }
+      },
+      {
+        "name": "x-codex-beta-features",
+        "condition": "enabled beta feature keys",
+        "value_shape": "comma-separated",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 2078,
+          "symbol": "x-codex-beta-features"
+        }
+      },
+      {
+        "name": "x-codex-routing-hint",
+        "condition": "Codex backend routing hint when available",
+        "value_shape": "model=<model>[;tier=<tier>]",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 150,
+          "symbol": "x-codex-routing-hint"
+        }
+      },
+      {
+        "name": "x-oai-attestation",
+        "condition": "when attestation is enabled/provider returns value",
+        "value_shape": null,
+        "layer": "attestation",
+        "source": {
+          "path": "codex-rs/core/src/attestation.rs",
+          "line": 7,
+          "symbol": "x-oai-attestation"
+        }
+      },
+      {
+        "name": "x-openai-memgen-request",
+        "condition": "memory-consolidation session only",
+        "value_shape": "true",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 155,
+          "symbol": "x-openai-memgen-request"
+        }
+      },
+      {
+        "name": "x-openai-internal-codex-responses-lite",
+        "condition": "Responses Lite only",
+        "value_shape": "true",
+        "layer": "codex",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 164,
+          "symbol": "x-openai-internal-codex-responses-lite"
+        }
+      },
+      {
+        "name": "OpenAI-Beta",
+        "condition": "Responses WebSocket upgrade",
+        "value_shape": "responses_websockets=2026-02-06",
+        "layer": "ws-handshake",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 148,
+          "symbol": "OpenAI-Beta"
+        }
+      },
+      {
+        "name": "x-responsesapi-include-timing-metrics",
+        "condition": "timing metrics enabled",
+        "value_shape": "true",
+        "layer": "ws-handshake",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 157,
+          "symbol": "x-responsesapi-include-timing-metrics"
+        }
+      }
+    ],
+    "client_metadata_wire_type": "Option<HashMap<String, String>> in response.create",
+    "client_metadata_base": [
+      {
+        "name": "parent_turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 45,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "root_turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 46,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "session_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 28,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "thread_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 29,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "turn_id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 31,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-installation-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 21,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-parent-thread-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 22,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-turn-metadata",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 213,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-window-id",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 24,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      },
+      {
+        "name": "x-openai-subagent",
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 25,
+          "symbol": "CodexResponsesMetadata::client_metadata"
+        }
+      }
+    ],
+    "client_metadata_ws_additions": [
+      {
+        "name": "ws_request_header_traceparent",
+        "source": {
+          "path": "codex-rs/codex-api/src/common.rs",
+          "line": 25,
+          "symbol": "WS client_metadata"
+        }
+      },
+      {
+        "name": "ws_request_header_tracestate",
+        "source": {
+          "path": "codex-rs/codex-api/src/common.rs",
+          "line": 26,
+          "symbol": "WS client_metadata"
+        }
+      },
+      {
+        "name": "ws_request_header_x_openai_internal_codex_responses_lite",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 162,
+          "symbol": "WS client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-turn-state",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 13,
+          "symbol": "WS client_metadata"
+        }
+      },
+      {
+        "name": "x-codex-ws-stream-request-start-ms",
+        "source": {
+          "path": "codex-rs/core/src/client.rs",
+          "line": 160,
+          "symbol": "WS client_metadata"
+        }
+      }
+    ],
+    "turn_metadata": {
+      "canonical": "response.create.client_metadata[\"x-codex-turn-metadata\"] JSON string",
+      "compatibility_handshake_header": "x-codex-turn-metadata can be in upgrade compatibility headers; tool_namespaces_info omitted there"
+    },
+    "notes": [
+      "x-codex-turn-state is carried in response.create client_metadata for per-message WS continuation state.",
+      "Connection/Upgrade/Sec-WebSocket-* are generated by the WebSocket stack, not hard-coded protocol identity fields."
+    ]
+  },
+  "turn_metadata_schema": {
+    "fixed_fields": [
+      {
+        "name": "installation_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 505,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "session_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 507,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "thread_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 509,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "agent_name",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 511,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "turn_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 513,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "window_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 515,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "window_number",
+        "type": "Option<u64>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 517,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "context_window_id",
+        "type": "Option<Uuid>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 519,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "request_kind",
+        "type": "Option<&'static str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 521,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "forked_from_thread_id",
+        "type": "Option<ThreadId>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 523,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "forked_from_ordinal_exclusive",
+        "type": "Option<u64>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 525,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "parent_thread_id",
+        "type": "Option<ThreadId>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 527,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "parent_turn_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 529,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "root_turn_id",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 531,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "subagent_kind",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 533,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "thread_source",
+        "type": "Option<&'a ThreadSource>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 535,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "turn_trigger",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 537,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "sandbox",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 539,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "sandbox_mode",
+        "type": "Option<&'a str>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 541,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "auto_review_enabled",
+        "type": "Option<bool>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 543,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "node_repl_auto_review_required",
+        "type": "Option<bool>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 545,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "node_repl_disabled",
+        "type": "Option<bool>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 547,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "workspaces",
+        "type": "Option<&'a BTreeMap<String, TurnMetadataWorkspace>>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 549,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "tool_namespaces_info",
+        "type": "Option<&'a TurnToolNamespacesInfo>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 551,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "turn_started_at_unix_ms",
+        "type": "Option<i64>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 553,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "compaction",
+        "type": "Option<CompactionTurnMetadata>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 555,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      }
+    ],
+    "flattened_extra": {
+      "name": "extra",
+      "type": "&'a BTreeMap<String, String>",
+      "serde": [
+        "#[serde(flatten)]"
+      ],
+      "flattened": true,
+      "source": {
+        "path": "codex-rs/core/src/responses_metadata.rs",
+        "line": 557,
+        "symbol": "CodexTurnMetadataPayload"
+      }
+    },
+    "request_kind_values": [
+      "turn",
+      "prewarm",
+      "compaction",
+      "memory"
+    ],
+    "nested": {
+      "workspace": [
+        {
+          "name": "associated_remote_urls",
+          "type": "Option<BTreeMap<String, SanitizedGitUrl>>",
+          "serde": [
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+          ],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 175,
+            "symbol": "TurnMetadataWorkspace"
+          }
+        },
+        {
+          "name": "latest_git_commit_hash",
+          "type": "Option<String>",
+          "serde": [
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+          ],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 177,
+            "symbol": "TurnMetadataWorkspace"
+          }
+        },
+        {
+          "name": "has_changes",
+          "type": "Option<bool>",
+          "serde": [
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+          ],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 179,
+            "symbol": "TurnMetadataWorkspace"
+          }
+        }
+      ],
+      "tool_namespace": [
+        {
+          "name": "name",
+          "type": "String",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 187,
+            "symbol": "TurnToolNamespaceInfo"
+          }
+        },
+        {
+          "name": "functions",
+          "type": "BTreeMap<String, TurnToolFunctionInfo>",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 189,
+            "symbol": "TurnToolNamespaceInfo"
+          }
+        }
+      ],
+      "tool_function": [
+        {
+          "name": "name",
+          "type": "String",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 194,
+            "symbol": "TurnToolFunctionInfo"
+          }
+        },
+        {
+          "name": "direct",
+          "type": "bool",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 196,
+            "symbol": "TurnToolFunctionInfo"
+          }
+        },
+        {
+          "name": "code_mode_name",
+          "type": "Option<String>",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 197,
+            "symbol": "TurnToolFunctionInfo"
+          }
+        },
+        {
+          "name": "deferred",
+          "type": "bool",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 198,
+            "symbol": "TurnToolFunctionInfo"
+          }
+        },
+        {
+          "name": "source",
+          "type": "TurnToolSource",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 199,
+            "symbol": "TurnToolFunctionInfo"
+          }
+        }
+      ],
+      "compaction": [
+        {
+          "name": "trigger",
+          "type": "CompactionTrigger",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 108,
+            "symbol": "CompactionTurnMetadata"
+          }
+        },
+        {
+          "name": "reason",
+          "type": "CompactionReason",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 110,
+            "symbol": "CompactionTurnMetadata"
+          }
+        },
+        {
+          "name": "implementation",
+          "type": "CompactionImplementation",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 111,
+            "symbol": "CompactionTurnMetadata"
+          }
+        },
+        {
+          "name": "phase",
+          "type": "CompactionPhase",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 112,
+            "symbol": "CompactionTurnMetadata"
+          }
+        },
+        {
+          "name": "strategy",
+          "type": "CompactionStrategy",
+          "serde": [],
+          "flattened": false,
+          "source": {
+            "path": "codex-rs/core/src/responses_metadata.rs",
+            "line": 113,
+            "symbol": "CompactionTurnMetadata"
+          }
+        }
+      ]
+    },
+    "notes": [
+      "Fields are conditional/optional according to request kind and available context.",
+      "serde(flatten) extra fields serialize at the same JSON object level; there is no wire-level extra wrapper.",
+      "Memory request_kind suppresses normal turn/request identity according to has_turn_identity()."
+    ]
+  }
+}

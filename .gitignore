@@ -120,8 +120,11 @@ tests
 !deploy/tests/
 !deploy/tests/**
 CLAUDE.md
-.claude
 scripts
+!scripts/
+!scripts/CODEX_WIRE_AUDIT.md
+!scripts/codex_wire_audit.py
+!scripts/codex_wire_snapshot.json
 !backend/scripts/
 !backend/scripts/resolve-version.sh
 .code-review-state
@@ -159,6 +162,11 @@ output/
 # Fork: keep vendored codex crates + ignore bazel outputs
 !rustsidecar/vendor/
 !rustsidecar/vendor/**
+!rustsidecar/tests/
+!rustsidecar/tests/**
+!scripts/CODEX_WIRE_AUDIT.md
+!scripts/codex_wire_audit.py
+!scripts/codex_wire_snapshot.json
 
 # Bazel local outputs / convenience symlinks
 /bazel-bin

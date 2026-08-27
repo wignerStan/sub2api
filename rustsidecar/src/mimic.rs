@@ -223,26 +223,60 @@ impl ConvergedIdentity {
     }
 }
 
+/// Upstream-audited allowed flat client_metadata keys.
+#[allow(dead_code)]
+pub const UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
+    "parent_turn_id",
+    "root_turn_id",
+    "session_id",
+    "thread_id",
+    "turn_id",
+    "ws_request_header_x_openai_internal_codex_responses_lite",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+    "x-codex-ws-stream-request-start-ms",
+    "x-openai-subagent",
+];
+
+/// Upstream-audited explicitly stripped flat client_metadata keys (APM / tracing channels).
+#[allow(dead_code)]
+pub const UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
+    "ws_request_header_traceparent",
+    "ws_request_header_tracestate",
+];
+
+/// sub2api-specific extensions to flat client_metadata keys (normalized from TurnMetadata).
+#[allow(dead_code)]
+pub const SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
+    "context_window_id",
+    "previous_window_id",
+    "window_id",
+    "window_number",
+];
+
 /// Allowed keys in flat `client_metadata` (Strict Fail-Closed Whitelist).
 /// Codex Core wire schema is Option<HashMap<String, String>>.
 pub const ALLOWED_FLAT_CLIENT_METADATA_KEYS: &[&str] = &[
-    "x-codex-installation-id",
+    "context_window_id",
+    "parent_turn_id",
+    "previous_window_id",
+    "root_turn_id",
     "session_id",
     "thread_id",
-    "x-codex-window-id",
+    "turn_id",
     "window_id",
     "window_number",
-    "context_window_id",
-    "previous_window_id",
-    "turn_id",
-    "x-openai-subagent",
-    "x-codex-parent-thread-id",
-    "parent_turn_id",
-    "root_turn_id",
-    "x-codex-turn-metadata",
     "ws_request_header_x_openai_internal_codex_responses_lite",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-turn-metadata",
     "x-codex-turn-state",
+    "x-codex-window-id",
     "x-codex-ws-stream-request-start-ms",
+    "x-openai-subagent",
 ];
 
 /// Sanitize workspace root path to ensure consistency with simulated workstation OS
@@ -431,41 +465,100 @@ pub fn transform_ws_frame(
     }
 }
 
+/// Upstream-audited allowed x- headers for Account endpoints (/accounts/check, /usage, etc.).
+#[allow(dead_code)]
+pub const UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &[
+    "x-openai-fedramp",
+];
+
+/// Upstream-audited explicitly stripped x- headers for Account endpoints.
+#[allow(dead_code)]
+pub const UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS: &[&str] = &[];
+
 /// Allowed x- headers on Account/Status requests (/api/codex/..., /wham/..., /usage, /status).
 /// Strict Fail-Closed for x- beginning headers.
-pub const ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &[
+pub const ALLOWED_ACCOUNT_X_HEADERS: &[&str] = UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS;
+
+/// Upstream-audited allowed x- headers for Responses (Inference HTTP & WebSocket).
+#[allow(dead_code)]
+pub const UPSTREAM_ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
+    "x-client-request-id",
+    "x-codex-beta-features",
+    "x-codex-parent-thread-id",
+    "x-codex-routing-hint",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
     "x-openai-fedramp",
+    "x-openai-internal-codex-residency",
+    "x-openai-internal-codex-responses-lite",
+    "x-openai-memgen-request",
+    "x-openai-subagent",
+    "x-responsesapi-include-timing-metrics",
+];
+
+/// Upstream-audited explicitly stripped x- headers for Responses (e.g. attestation).
+#[allow(dead_code)]
+pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
+    "x-oai-attestation",
+];
+
+/// sub2api-specific extensions to responses x- headers (e.g. installation ID header bridge).
+#[allow(dead_code)]
+pub const SUB2API_EXTENDED_RESPONSES_X_HEADERS: &[&str] = &[
+    "x-codex-installation-id",
+    "x-codex-ws-stream-request-start-ms",
 ];
 
 /// Allowed x- headers on Inference/Responses requests (/responses, /responses/compact, WebSocket).
 /// Strict Fail-Closed for x- beginning headers.
 pub const ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-client-request-id",
-    "x-codex-installation-id",
-    "x-codex-window-id",
-    "x-codex-turn-metadata",
-    "x-codex-parent-thread-id",
-    "x-openai-subagent",
-    "x-codex-turn-state",
-    "x-codex-routing-hint",
     "x-codex-beta-features",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-routing-hint",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+    "x-codex-ws-stream-request-start-ms",
+    "x-openai-fedramp",
+    "x-openai-internal-codex-residency",
     "x-openai-internal-codex-responses-lite",
     "x-openai-memgen-request",
-    "x-openai-internal-codex-residency",
-    "x-openai-fedramp",
+    "x-openai-subagent",
+    "x-responsesapi-include-timing-metrics",
 ];
 
-/// Non-x- headers that are leaks or tracking channels.
+/// Explicitly stripped attestation header / field names.
+pub const EXPLICITLY_STRIPPED_ATTESTATION_NAMES: &[&str] = &[
+    "x-oai-attestation",
+    "x-openai-attestation",
+    "x-codex-attestation",
+    "attestation",
+    "x-attestation",
+];
+
+/// Explicitly stripped APM tracing / tracking / cookie header & field names.
+pub const EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES: &[&str] = &[
+    "ws_request_header_traceparent",
+    "ws_request_header_tracestate",
+    "traceparent",
+    "tracestate",
+    "baggage",
+    "cookie",
+    "set-cookie",
+];
+
+/// Check if a non-x- header matches explicit leak / tracking channel enums.
 pub fn is_leaked_non_x_header(key: &str) -> bool {
-    matches!(
-        key,
-        "traceparent" | "tracestate" | "baggage" | "cookie" | "set-cookie" | "attestation"
-    )
+    EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key)
+        || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)
 }
 
 /// Sanitize and normalize outbound HTTP request headers.
 /// Strict Fail-Closed is applied ONLY to headers beginning with `x-`.
-/// Non-x headers pass through naturally, only stripping APM tracing and cookies.
+/// Non-x headers pass through naturally, only stripping APM tracing, cookies, and attestation.
 pub fn sanitize_and_inject_headers(
     headers: &mut HeaderMap,
     seed: &str,
@@ -934,9 +1027,144 @@ mod tests {
         assert!(inference_headers.get("thread-id").is_some());
         assert!(inference_headers.get("x-codex-window-id").is_some());
         assert!(inference_headers.get("x-codex-turn-state").is_some());
-        assert!(inference_headers.get("x-codex-turn-metadata").is_some());
-        // Tracking & attestation stripped
         assert!(inference_headers.get("traceparent").is_none());
         assert!(inference_headers.get("x-oai-attestation").is_none());
+        assert!(inference_headers.get("x-custom-leak").is_none());
+    }
+
+    #[test]
+    fn upstream_codex_wire_snapshot_exact_fidelity() {
+        use std::collections::BTreeSet;
+
+        let snapshot_raw = include_str!("../tests/fixtures/codex_wire_snapshot.json");
+        let snapshot: Value = serde_json::from_str(snapshot_raw).expect("valid codex_wire_snapshot.json");
+
+        // 1. Exact Set Match for Account x- headers (allow + explicit_strip == upstream snapshot)
+        let snapshot_account_x: BTreeSet<String> = snapshot
+            .pointer("/account_status_check/http_headers")
+            .and_then(|v| v.as_array())
+            .expect("account http_headers list")
+            .iter()
+            .map(|h| h.get("name").and_then(|v| v.as_str()).unwrap().to_ascii_lowercase())
+            .filter(|n| n.starts_with("x-"))
+            .collect();
+
+        let code_account_x: BTreeSet<String> = UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS
+            .iter()
+            .chain(UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS.iter())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        assert_eq!(
+            code_account_x, snapshot_account_x,
+            "Account x- headers mismatch with upstream snapshot! Must be EXACT: (allowed + explicitly stripped) == snapshot"
+        );
+
+        // 2. Exact Set Match for Responses x- headers (allow + explicit_strip == upstream snapshot)
+        let http_resp_x = snapshot
+            .pointer("/responses_http/http_headers")
+            .and_then(|v| v.as_array())
+            .expect("responses_http http_headers list")
+            .iter()
+            .map(|h| h.get("name").and_then(|v| v.as_str()).unwrap().to_ascii_lowercase())
+            .filter(|n| n.starts_with("x-"));
+
+        let ws_resp_x = snapshot
+            .pointer("/responses_websocket/handshake_http_headers")
+            .and_then(|v| v.as_array())
+            .expect("responses_websocket handshake_http_headers list")
+            .iter()
+            .map(|h| h.get("name").and_then(|v| v.as_str()).unwrap().to_ascii_lowercase())
+            .filter(|n| n.starts_with("x-"));
+
+        let snapshot_responses_x: BTreeSet<String> = http_resp_x.chain(ws_resp_x).collect();
+
+        let code_responses_x: BTreeSet<String> = UPSTREAM_ALLOWED_RESPONSES_X_HEADERS
+            .iter()
+            .chain(UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS.iter())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        assert_eq!(
+            code_responses_x, snapshot_responses_x,
+            "Responses x- headers mismatch with upstream snapshot! Must be EXACT: (allowed + explicitly stripped) == snapshot"
+        );
+
+        // 3. Exact Set Match for Flat client_metadata (allow + explicit_strip == upstream snapshot)
+        let http_cm = snapshot
+            .pointer("/responses_http/client_metadata")
+            .and_then(|v| v.as_array())
+            .expect("responses_http client_metadata list")
+            .iter()
+            .map(|item| item.get("name").and_then(|v| v.as_str()).unwrap().to_string());
+
+        let ws_cm = snapshot
+            .pointer("/responses_websocket/client_metadata_ws_additions")
+            .and_then(|v| v.as_array())
+            .expect("responses_websocket client_metadata_ws_additions list")
+            .iter()
+            .map(|item| item.get("name").and_then(|v| v.as_str()).unwrap().to_string());
+
+        let snapshot_cm: BTreeSet<String> = http_cm.chain(ws_cm).collect();
+
+        let code_cm: BTreeSet<String> = UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS
+            .iter()
+            .chain(UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS.iter())
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            code_cm, snapshot_cm,
+            "Flat client_metadata keys mismatch with upstream snapshot! Must be EXACT: (allowed + explicitly stripped) == snapshot"
+        );
+
+        // 4. Exact Set Match for Effective ALLOWED_FLAT_CLIENT_METADATA_KEYS
+        let expected_allowed_cm: BTreeSet<String> = UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS
+            .iter()
+            .chain(SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS.iter())
+            .map(|s| s.to_string())
+            .collect();
+
+        let actual_allowed_cm: BTreeSet<String> = ALLOWED_FLAT_CLIENT_METADATA_KEYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            actual_allowed_cm, expected_allowed_cm,
+            "ALLOWED_FLAT_CLIENT_METADATA_KEYS must match (UPSTREAM_ALLOWED + SUB2API_EXTENDED) exactly"
+        );
+
+        // 5. Explicit strip enums must contain the exact names of stripped items
+        for stripped in UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS {
+            assert!(
+                EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(stripped)
+                    || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(stripped),
+                "Stripped response header '{stripped}' must be registered in explicit strip enums!"
+            );
+        }
+        for stripped in UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS {
+            assert!(
+                EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(stripped)
+                    || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(stripped),
+                "Stripped metadata key '{stripped}' must be registered in explicit strip enums!"
+            );
+        }
+
+        // 6. Fail-closed test on unrecognized header & metadata key
+        let mut test_headers = HeaderMap::new();
+        test_headers.insert(HeaderName::from_static("x-future-upstream-unresolved-header"), HeaderValue::from_static("drop"));
+        sanitize_and_inject_headers(&mut test_headers, "seed", None, None, "salt", None, 0, true);
+        assert!(test_headers.get("x-future-upstream-unresolved-header").is_none());
+
+        let mut test_cm = json!({
+            "client_metadata": {
+                "session_id": "sess_1",
+                "unrecognized_key_123": "drop_me"
+            }
+        });
+        let identity = ConvergedIdentity::new("seed", Some("sess_1"), None, "salt", None, 0);
+        sanitize_client_metadata(test_cm.get_mut("client_metadata").unwrap(), &identity);
+        assert!(test_cm.pointer("/client_metadata/session_id").is_some());
+        assert!(test_cm.pointer("/client_metadata/unrecognized_key_123").is_none());
     }
 }
