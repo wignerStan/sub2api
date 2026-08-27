@@ -1306,6 +1306,167 @@ mod tests {
     }
 
     #[test]
+    fn window_id_bug_fix_and_compaction_lifecycle() {
+        let identity_w0 = ConvergedIdentity::new("group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0);
+        let identity_w1 = ConvergedIdentity::new("group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 1);
+        let identity_w2 = ConvergedIdentity::new("group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 2);
+        let identity_w3 = ConvergedIdentity::new("group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 3);
+
+        // 1. Initial Window 0: previous_window_id MUST NOT exist
+        let mut valid_w0 = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:0",
+            "window_number": 0,
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_abc",
+                "window_id": "th_abc:0",
+                "window_number": 0
+            }).to_string()
+        });
+        assert!(sanitize_client_metadata(&mut valid_w0, &identity_w0, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // Window 0 with illegal previous_window_id in flat metadata -> 403 Forbidden
+        let mut bug_w0_flat = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:0",
+            "window_number": 0,
+            "previous_window_id": "th_abc:0", // Invalid! Window 0 cannot have previous window
+        });
+        let err_w0_flat = sanitize_client_metadata(&mut bug_w0_flat, &identity_w0, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_w0_flat, Err(MimicError::ForbiddenDivergingFingerprint(_))));
+
+        // Window 0 with illegal previous_window_id in turn_metadata -> 403 Forbidden
+        let mut bug_w0_nested = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:0",
+            "window_number": 0,
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_abc",
+                "window_id": "th_abc:0",
+                "window_number": 0,
+                "previous_window_id": "th_abc:0" // Invalid on Window 0!
+            }).to_string()
+        });
+        let err_w0_nested = sanitize_client_metadata(&mut bug_w0_nested, &identity_w0, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_w0_nested, Err(MimicError::ForbiddenDivergingFingerprint(_))));
+
+        // 2. Compaction Progression (Window 1 -> 2 -> 3)
+        // Window 1: previous is th_abc:0
+        let mut valid_w1 = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:1",
+            "window_number": 1,
+            "previous_window_id": "th_abc:0",
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_abc",
+                "window_id": "th_abc:1",
+                "window_number": 1,
+                "previous_window_id": "th_abc:0"
+            }).to_string()
+        });
+        assert!(sanitize_client_metadata(&mut valid_w1, &identity_w1, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // Window 2: previous is th_abc:1
+        let mut valid_w2 = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:2",
+            "window_number": 2,
+            "previous_window_id": "th_abc:1",
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_abc",
+                "window_id": "th_abc:2",
+                "window_number": 2,
+                "previous_window_id": "th_abc:1"
+            }).to_string()
+        });
+        assert!(sanitize_client_metadata(&mut valid_w2, &identity_w2, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // Window 3: previous is th_abc:2
+        let mut valid_w3 = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:3",
+            "window_number": 3,
+            "previous_window_id": "th_abc:2",
+            "x-codex-turn-metadata": json!({
+                "session_id": "sess_1",
+                "thread_id": "th_abc",
+                "window_id": "th_abc:3",
+                "window_number": 3,
+                "previous_window_id": "th_abc:2"
+            }).to_string()
+        });
+        assert!(sanitize_client_metadata(&mut valid_w3, &identity_w3, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // 3. Mismatched / Diverging Previous Window Detection (403 Forbidden)
+        // Window 2 with wrong previous window number (th_abc:0 instead of th_abc:1)
+        let mut bad_prev_num = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:2",
+            "window_number": 2,
+            "previous_window_id": "th_abc:0" // Should be th_abc:1
+        });
+        assert!(matches!(
+            sanitize_client_metadata(&mut bad_prev_num, &identity_w2, UnknownFieldPolicy::Forbidden),
+            Err(MimicError::ForbiddenDivergingFingerprint(_))
+        ));
+
+        // Window 2 with wrong previous window thread (th_other:1 instead of th_abc:1)
+        let mut bad_prev_thread = json!({
+            "session_id": "sess_1",
+            "thread_id": "th_abc",
+            "window_id": "th_abc:2",
+            "window_number": 2,
+            "previous_window_id": "th_other:1"
+        });
+        assert!(matches!(
+            sanitize_client_metadata(&mut bad_prev_thread, &identity_w2, UnknownFieldPolicy::Forbidden),
+            Err(MimicError::ForbiddenDivergingFingerprint(_))
+        ));
+
+        // 4. Header Validation for Window Progression & Bug Fixes
+        // Window 0 headers: valid
+        let mut hdr_w0 = HeaderMap::new();
+        hdr_w0.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+        hdr_w0.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("th_abc"));
+        hdr_w0.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_abc:0"));
+        assert!(sanitize_and_inject_headers(&mut hdr_w0, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
+
+        // Window 0 headers with illegal previous_window_id in turn_metadata header -> 403 Forbidden
+        let mut hdr_w0_bad = HeaderMap::new();
+        hdr_w0_bad.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+        hdr_w0_bad.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("th_abc"));
+        hdr_w0_bad.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_abc:0"));
+        hdr_w0_bad.insert(
+            HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static("{\"session_id\":\"sess_1\",\"thread_id\":\"th_abc\",\"window_id\":\"th_abc:0\",\"window_number\":0,\"previous_window_id\":\"th_abc:0\"}"),
+        );
+        let err_hdr_w0 = sanitize_and_inject_headers(&mut hdr_w0_bad, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden);
+        assert!(matches!(err_hdr_w0, Err(MimicError::ForbiddenDivergingFingerprint(_))));
+
+        // Window 2 headers with matching previous_window_id in turn_metadata header -> Ok(())
+        let mut hdr_w2 = HeaderMap::new();
+        hdr_w2.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_1"));
+        hdr_w2.insert(HeaderName::from_static("thread-id"), HeaderValue::from_static("th_abc"));
+        hdr_w2.insert(HeaderName::from_static("x-codex-window-id"), HeaderValue::from_static("th_abc:2"));
+        hdr_w2.insert(
+            HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_static("{\"session_id\":\"sess_1\",\"thread_id\":\"th_abc\",\"window_id\":\"th_abc:2\",\"window_number\":2,\"previous_window_id\":\"th_abc:1\"}"),
+        );
+        assert!(sanitize_and_inject_headers(&mut hdr_w2, "group_seed", Some("sess_1"), None, "salt", Some("0.1.183"), 2, true, UnknownFieldPolicy::Forbidden).is_ok());
+    }
+
+    #[test]
     fn headers_sanitization_preserves_turn_state_and_strips_tracking() {
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static("session-id"), HeaderValue::from_static("sess_123"));
