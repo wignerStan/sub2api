@@ -851,6 +851,21 @@ database:
   conn_max_idle_time_minutes: 5
 
 # =============================================================================
+# Database Backup Configuration
+# 数据库备份配置
+# =============================================================================
+backup:
+  # Optional proxy for backup S3 egress (upload/restore against R2/OSS/S3).
+  # 备份上传与恢复下载（R2/OSS/S3 兼容存储）的可选出站代理；留空直连。
+  # Schemes: http / https / socks5 (normalized to socks5h, DNS via proxy).
+  # 协议：http / https / socks5（自动归一化为 socks5h，DNS 走代理）。
+  # Invalid values fail startup; environment variable BACKUP_PROXY_URL also works.
+  # 配置非法时启动失败（不回退直连）；也可用环境变量 BACKUP_PROXY_URL 设置。
+  # Example: "socks5://127.0.0.1:1083"
+  # 示例："socks5://127.0.0.1:1083"
+  proxy_url: ""
+
+# =============================================================================
 # Redis Configuration
 # Redis 配置
 # =============================================================================
@@ -1044,7 +1059,10 @@ plugins:
   # OpenAI Transport's public key is built in; this map only adds third-party publishers.
   # 以 signature.json 中 key_id 为索引的额外 Ed25519 公钥。
   # OpenAI Transport 公钥已内置，此处只需添加第三方发布者。
-  trusted_publishers: {}
+  trusted_publishers:
+    # Example: the Sub2API Sidecar Transport plugin. The value is the base64
+    # Ed25519 public key printed by `sub2api-sidecar pubkey <sidecar-token>`.
+    # wignerstan-transport-v1: "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"
   max_upload_bytes: 134217728
   max_uncompressed_bytes: 268435456
   start_timeout_seconds: 15

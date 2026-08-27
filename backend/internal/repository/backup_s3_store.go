@@ -21,8 +21,11 @@ type S3BackupStore struct {
 	bucket string
 }
 
-// NewS3BackupStoreFactory returns a BackupObjectStoreFactory that creates S3-backed stores
-func NewS3BackupStoreFactory() service.BackupObjectStoreFactory {
+// NewS3BackupStoreFactory returns a BackupObjectStoreFactory that creates S3-backed stores.
+// proxyURL routes backup upload/download (PutObject/GetObject) through an
+// http/https/socks5 proxy; empty means direct egress. Presigned download URLs
+// are opened by the admin browser directly against R2/OSS and never use it.
+func NewS3BackupStoreFactory(proxyURL string) service.BackupObjectStoreFactory {
 	return func(ctx context.Context, cfg *service.BackupS3Config) (service.BackupObjectStore, error) {
 		client, err := newS3Client(ctx, s3ClientParams{
 			Endpoint:        cfg.Endpoint,
@@ -30,6 +33,7 @@ func NewS3BackupStoreFactory() service.BackupObjectStoreFactory {
 			AccessKeyID:     cfg.AccessKeyID,
 			SecretAccessKey: cfg.SecretAccessKey,
 			ForcePathStyle:  cfg.ForcePathStyle,
+			ProxyURL:        proxyURL,
 		})
 		if err != nil {
 			return nil, err
