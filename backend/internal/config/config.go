@@ -16,6 +16,8 @@ import (
 
 	"github.com/spf13/viper"
 	"golang.org/x/net/http/httpguts"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 )
 
 const (
@@ -104,6 +106,7 @@ type Config struct {
 	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
 	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
 	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+	Backup                  BackupConfig                  `mapstructure:"backup"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -115,6 +118,15 @@ type PluginConfig struct {
 	MaxUploadBytes       int64             `mapstructure:"max_upload_bytes"`
 	MaxUncompressedBytes int64             `mapstructure:"max_uncompressed_bytes"`
 	StartTimeoutSeconds  int               `mapstructure:"start_timeout_seconds"`
+}
+
+// BackupConfig 数据库备份的进程级配置。S3 桶等业务参数存在 DB settings（管理端可改），
+// 这里只放部署相关的静态项：备份上传/下载（R2/OSS 等 S3 兼容存储）的可选代理。
+type BackupConfig struct {
+	// ProxyURL 备份 S3 出站代理。空 = 直连。
+	// 支持 http/https/socks5/socks5h，socks5 会归一化为 socks5h（DNS 走代理）。
+	// 环境变量 BACKUP_PROXY_URL 可覆盖配置文件。
+	ProxyURL string `mapstructure:"proxy_url"`
 }
 
 type LogConfig struct {
@@ -856,6 +868,17 @@ type ProxyProbeConfig struct {
 type ProbeURLConfig struct {
 	URL    string `mapstructure:"url"`
 	Parser string `mapstructure:"parser"` // "ip-api" / "ipify" / "chatgpt-trace"
+}
+
+// normalizeBackupProxyURL 归一化 backup.proxy_url：空值表示直连；非空必须能通过
+// proxyurl 校验（http/https/socks5/socks5h 白名单，socks5 升级 socks5h）。
+// 无效配置 fail-fast，由 Validate 在启动时拒绝，绝不静默回退直连。
+func normalizeBackupProxyURL(raw string) (string, error) {
+	normalized, _, err := proxyurl.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
 func normalizeProxyProbeURLs(targets []ProbeURLConfig) ([]ProbeURLConfig, error) {
@@ -2591,6 +2614,10 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
 
+	// backup.proxy_url follows the zero-value rule: empty string means direct
+	// egress for backup S3 traffic. Registering "" keeps BACKUP_PROXY_URL
+	// env-reachable (AutomaticEnv) without changing default behavior.
+	viper.SetDefault("backup.proxy_url", "")
 	// server.trusted_proxies and security.forwarded_client_ip_headers are the
 	// other exception: load() distinguishes explicit configuration from absence
 	// (issue #4600), and viper.IsSet also reports registered defaults, so a
@@ -2661,6 +2688,12 @@ func (c *Config) Validate() error {
 	if c.Plugins.StartTimeoutSeconds < 1 || c.Plugins.StartTimeoutSeconds > 120 {
 		return fmt.Errorf("plugins.start_timeout_seconds must be between 1 and 120")
 	}
+	// backup.proxy_url fail-fast：无效代理直接启动失败，绝不静默回退直连。
+	normalizedBackupProxy, err := normalizeBackupProxyURL(c.Backup.ProxyURL)
+	if err != nil {
+		return fmt.Errorf("backup.proxy_url: %w", err)
+	}
+	c.Backup.ProxyURL = normalizedBackupProxy
 	if c.Server.ReadHeaderTimeout < 1 || c.Server.ReadHeaderTimeout > 60 {
 		return fmt.Errorf("server.read_header_timeout must be between 1 and 60 seconds")
 	}
