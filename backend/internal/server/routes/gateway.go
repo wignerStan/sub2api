@@ -33,6 +33,8 @@ func RegisterGatewayRoutes(
 	compositeResolver *service.CompositeRouteResolver,
 	cfg *config.Config,
 ) {
+	registerCodexAssociationBlockRoutes(r)
+
 	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize)
 	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize)
 	clientRequestID := middleware.ClientRequestID()
@@ -700,6 +702,42 @@ func resetRequestBody(c *gin.Context, body []byte) {
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	c.Request.ContentLength = int64(len(body))
 	c.Request.Header.Set("Content-Length", strconv.Itoa(len(body)))
+}
+
+func registerCodexAssociationBlockRoutes(r *gin.Engine) {
+	block := func(c *gin.Context) {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": gin.H{
+				"type":    "not_found_error",
+				"message": "not found",
+			},
+		})
+	}
+	for _, path := range []string{
+		"/v1/analytics",
+		"/v1/analytics/*path",
+		"/analytics",
+		"/analytics/*path",
+		"/v1/traces",
+		"/v1/metrics",
+		"/v1/logs",
+		"/v1/logs/*path",
+		"/v1/telemetry",
+		"/v1/telemetry/*path",
+		"/telemetry",
+		"/telemetry/*path",
+		"/v1/rgstr",
+		"/v1/rgstr/*path",
+		"/v1/sdk_exception",
+		"/v1/log_event",
+		"/v1/get_config",
+		"/v1/feedback",
+		"/v1/feedback/*path",
+		"/feedback",
+		"/feedback/*path",
+	} {
+		r.Any(path, block)
+	}
 }
 
 func compositeRouteEndpointForPath(path string) string {

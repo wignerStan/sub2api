@@ -781,6 +781,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
 	}
 	firstClientMessage = updatedFirst
+	// 首帧直接 WriteFrame 出站，不经过下方 filter。必须在这里改写
+	// client_metadata，否则 OAuth passthrough 会把 cwd/git/OS/原 session
+	// 原样送到 ChatGPT。
+	rewrittenFirst, fpErr := applyStagedCodexFingerprintClientMetadataRaw(c, account, firstClientMessage)
+	if fpErr != nil {
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", fpErr)
+	}
+	firstClientMessage = rewrittenFirst
 
 	// 在 policy filter 之后再提取 service_tier / reasoning_effort 用于
 	// usage 上报：filter
@@ -1078,6 +1086,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				payload = s.ReplaceModelInBody(payload, model)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
+			if policyErr != nil || blocked != nil {
+				return out, blocked, policyErr
+			}
+			if isResponseCreate || gjson.GetBytes(out, "client_metadata").Exists() {
+				rewritten, fpErr := applyStagedCodexFingerprintClientMetadataRawForFollowup(c, account, out, isResponseCreate)
+				if fpErr != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", fpErr)
+				}
+				out = rewritten
+			}
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
 			// filter 处理后的 payload，与首帧 policy-after-extract 语义
@@ -1092,7 +1110,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     extractOpenAIServiceTierFromBody 返回 nil；这里有意
 			//     覆盖（Store(nil)），因为 OpenAI 上游对该帧实际不传
 			//     service_tier 时按 default 处理，billing 应如实反映。
-			if policyErr == nil && blocked == nil && isResponseCreate {
+			if isResponseCreate {
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
@@ -1100,7 +1118,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
 				acceptedTurn = true
 			}
-			return out, blocked, policyErr
+			return out, nil, nil
 		},
 		onBlock: func(blocked *OpenAIFastBlockedError) {
 			MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)

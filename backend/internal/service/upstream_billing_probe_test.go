@@ -65,6 +65,30 @@ func (r *upstreamBillingProbeAccountRepo) BulkUpdate(_ context.Context, ids []in
 	return int64(len(ids)), nil
 }
 
+func (r *upstreamBillingProbeAccountRepo) ListAllWithFilters(_ context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Account, 0, len(r.accounts))
+	for _, account := range r.accounts {
+		if account == nil {
+			continue
+		}
+		if platform != "" && account.Platform != platform {
+			continue
+		}
+		if accountType != "" && account.Type != accountType {
+			continue
+		}
+		if status != "" && account.Status != status {
+			continue
+		}
+		clone := *account
+		clone.Extra = mergeMap(nil, account.Extra)
+		out = append(out, clone)
+	}
+	return out, nil
+}
+
 func (r *upstreamBillingProbeAccountRepo) GetByID(_ context.Context, id int64) (*Account, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

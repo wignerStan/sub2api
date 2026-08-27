@@ -169,6 +169,8 @@ type AccountBulkUpdate struct {
 	// EnsureCodexFingerprintSeed asks the repository to atomically preserve an
 	// existing valid Codex fingerprint seed or create one for eligible rows.
 	EnsureCodexFingerprintSeed bool
+	// RotateCodexFingerprintSeed replaces existing valid seeds with new ones.
+	RotateCodexFingerprintSeed bool
 }
 
 // CreateAccountRequest 创建账号请求

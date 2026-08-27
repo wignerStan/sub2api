@@ -895,6 +895,42 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	return s.accountRepo.UpdateExtra(ctx, id, updates)
 }
 
+func (s *adminServiceImpl) ConvergeCodexFingerprints(ctx context.Context, rotateSeeds bool) (*ConvergeCodexFingerprintsResult, error) {
+	if s == nil || s.accountRepo == nil {
+		return &ConvergeCodexFingerprintsResult{RotateSeeds: rotateSeeds}, nil
+	}
+	accounts, err := s.accountRepo.ListAllWithFilters(ctx, PlatformOpenAI, AccountTypeOAuth, "", "", 0, "")
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(accounts))
+	for _, account := range accounts {
+		if account.ID <= 0 {
+			continue
+		}
+		ids = append(ids, account.ID)
+	}
+	result := &ConvergeCodexFingerprintsResult{
+		Matched:     len(ids),
+		RotateSeeds: rotateSeeds,
+	}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	updated, err := s.accountRepo.BulkUpdate(ctx, ids, AccountBulkUpdate{
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+		},
+		EnsureCodexFingerprintSeed: true,
+		RotateCodexFingerprintSeed: rotateSeeds,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Updated = updated
+	return result, nil
+}
+
 // BulkUpdateAccounts updates multiple accounts in one request.
 // It merges credentials/extra keys instead of overwriting the whole object.
 func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error) {

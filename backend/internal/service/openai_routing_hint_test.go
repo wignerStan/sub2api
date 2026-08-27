@@ -168,12 +168,12 @@ func TestOpenAIHTTPPassthroughStripsOnlyOAuthLegacyResponsesBeta(t *testing.T) {
 		require.Empty(t, headers.Values("OpenAI-Beta"))
 	})
 
-	t.Run("oauth mixed beta preserves independent tokens", func(t *testing.T) {
+	t.Run("oauth mixed beta is stripped fail-closed", func(t *testing.T) {
 		headers := build(t, oauth, []string{
 			"responses=experimental, future_feature=v1",
 			"another_feature=v2, RESPONSES=EXPERIMENTAL",
 		}, false)
-		require.Equal(t, []string{"future_feature=v1", "another_feature=v2"}, headers.Values("OpenAI-Beta"))
+		require.Empty(t, headers.Values("OpenAI-Beta"))
 	})
 
 	t.Run("api key explicit beta remains caller controlled", func(t *testing.T) {

@@ -189,27 +189,24 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 
 		stageCodexFingerprintIDs(c, nil)
-		// 指纹收敛：与非透传路径同门控（仅 OAuth、legacy compact 形态跳过）。
-		// 一次性解析收敛 ID：请求体 client_metadata 在此改写（raw 字节外科
-		// 手术，透传热路径禁全量 Unmarshal），出站头改写由请求构造器读取
-		// context 中的同一份 IDs 完成（turn_id 等随机字段两侧必须一致）。
-		if !isOpenAIResponsesCompactPath(c) {
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
-			if fpIDs != nil {
-				fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
-				if fpErr != nil {
-					return nil, fpErr
-				}
-				if fpChanged {
-					body = fpBody
-				}
-			}
-			stageCodexFingerprintIDs(c, fpIDs)
+		// 指纹收敛：OAuth 的 /responses 与 allowlisted /compact 共用同一套
+		// 解析。compact 体白名单会丢掉 client_metadata，但仍必须改写出站头，
+		// 否则客户端 installation/session/turn-metadata 会原样到达上游。
+		var clientHeaders http.Header
+		if c != nil && c.Request != nil {
+			clientHeaders = c.Request.Header
 		}
+		fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+		if fpIDs != nil && (!isOpenAIResponsesCompactPath(c) || gjson.GetBytes(body, "client_metadata").Exists()) {
+			fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
+			if fpErr != nil {
+				return nil, fpErr
+			}
+			if fpChanged {
+				body = fpBody
+			}
+		}
+		stageCodexFingerprintIDs(c, fpIDs)
 	}
 	if account != nil && account.IsOpenAI() {
 		responsesLite := isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) || isOpenAIResponsesLiteWebSocketPayload(body)
@@ -658,15 +655,12 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		clientSessionID := strings.TrimSpace(req.Header.Get("session_id"))
 		clientConversationID := strings.TrimSpace(req.Header.Get("conversation_id"))
 		if isOpenAIResponsesCompactPath(c) {
-			req.Header.Set("accept", "application/json")
 			if req.Header.Get("version") == "" {
 				req.Header.Set("version", CodexCanonicalClientVersion())
 			}
 			if clientSessionID == "" {
 				clientSessionID = resolveOpenAICompactSessionID(c)
 			}
-		} else if req.Header.Get("accept") == "" {
-			req.Header.Set("accept", "text/event-stream")
 		}
 		if req.Header.Get("originator") == "" {
 			req.Header.Set("originator", resolveCodexOutboundIdentity("").originator)
@@ -684,11 +678,6 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		if clientConversationID != "" {
 			req.Header.Set("conversation_id", isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), clientConversationID))
 		}
-	} else if isOpenAIResponsesCompactPath(c) {
-		// 透传白名单会放行客户端的 Accept: text/event-stream；compact 上游是
-		// unary JSON 协议，API-key 账号同样强制 Accept，避免上游按 SSE 返回
-		// （#3777 期望行为 4）。
-		req.Header.Set("accept", "application/json")
 	}
 
 	// 透传模式也支持账户自定义 User-Agent 与 ForceCodexCLI 兜底。
@@ -717,6 +706,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）
 	account.ApplyHeaderOverrides(req.Header)
+	if account.Type == AccountTypeOAuth {
+		sanitizeCodexOutboundAssociationHeaders(req.Header)
+	}
+	applyCodexOutboundAccept(req.Header, isOpenAIResponsesCompactPath(c))
 	// x-codex-beta-features：按真实 Codex 的会话级行为补注（在账号级覆写之后，
 	// 保证不被覆盖丢失）。
 	applyOpenAICodexBetaFeatures(c, account, req.Header)

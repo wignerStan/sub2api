@@ -883,6 +883,7 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	// 强制统一开启时客户端身份不参与构造，探针与真实转发用同一套规范身份出站。
 	enforceCodexIdentityHeadersWithUA(req.Header, account.GetOpenAIUserAgent())
 	setOpenAIChatGPTAccountHeaders(req.Header, account)
+	applyCodexFingerprintToUsageProbeRequest(account, req.Header)
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
@@ -896,6 +897,7 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	if err != nil {
 		return nil, fmt.Errorf("build openai probe client: %w", err)
 	}
+	client = ApplySidecarHTTPClient(nil, client, proxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("openai codex probe request failed: %w", err)

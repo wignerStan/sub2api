@@ -72,34 +72,30 @@ const (
 
 // OpenAI allowed headers whitelist (for non-passthrough).
 var openaiAllowedHeaders = map[string]bool{
-	"accept-language":         true,
 	"content-type":            true,
 	"conversation_id":         true,
 	"user-agent":              true,
 	"originator":              true,
 	"session_id":              true,
+	"openai-beta":             true,
 	"x-codex-beta-features":   true,
 	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
 	"x-codex-turn-metadata":   true,
 	"x-codex-window-id":       true,
 	responsesLiteHeaderKey:    true,
 }
 
 // OpenAI passthrough allowed headers whitelist.
-// 透传模式下仅放行这些低风险请求头，避免将非标准/环境噪声头传给上游触发风控。
+// locale / timeout / attestation 不透传。beta 先拷贝，OAuth 再由 sanitize 剥离并重建。
 var openaiPassthroughAllowedHeaders = map[string]bool{
-	"accept":                  true,
-	"accept-language":         true,
 	"content-type":            true,
 	"conversation_id":         true,
-	"openai-beta":             true,
 	"user-agent":              true,
 	"originator":              true,
 	"session_id":              true,
+	"openai-beta":             true,
 	"x-codex-beta-features":   true,
 	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
 	"x-codex-turn-metadata":   true,
 	"x-codex-window-id":       true,
 	responsesLiteHeaderKey:    true,

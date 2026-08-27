@@ -640,7 +640,7 @@ type openAIWSConnPool struct {
 func newOpenAIWSConnPool(cfg *config.Config) *openAIWSConnPool {
 	pool := &openAIWSConnPool{
 		cfg:          cfg,
-		clientDialer: newDefaultOpenAIWSClientDialer(),
+		clientDialer: newOpenAIWSClientDialer(cfg),
 		workerStopCh: make(chan struct{}),
 	}
 	pool.startBackgroundWorkers()
@@ -2039,13 +2039,10 @@ func normalizeOpenAIWSHandshakeCompatibility(account *Account, headers http.Head
 }
 
 func activeCodexFingerprintMode(account *Account) codexFingerprintMode {
-	if account == nil || account.GetCodexFingerprintMode() == codexFingerprintOff {
+	if account == nil || !account.IsOpenAIOAuth() {
 		return codexFingerprintOff
 	}
-	if _, ok := codexFingerprintSeed(account.Extra); !ok {
-		return codexFingerprintOff
-	}
-	return account.GetCodexFingerprintMode()
+	return effectiveCodexFingerprintMode(account.GetCodexFingerprintMode())
 }
 
 func normalizeOpenAIWSStableIdentityHeader(headers http.Header, name string) string {

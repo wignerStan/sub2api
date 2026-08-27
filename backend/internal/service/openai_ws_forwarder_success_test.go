@@ -798,9 +798,12 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthStoreFalseByDefault(t *testing.T
 	require.Equal(t, "native-wsv2", gjson.Get(requestJSON, "input.0.namespace").String(), "OAuth WSv2 应保留原生 namespace")
 	require.Equal(t, openAIWSBetaV2Value, captureDialer.lastHeaders.Get("OpenAI-Beta"))
 	require.Equal(t, "remote_compaction_v2", captureDialer.lastHeaders.Get("x-codex-beta-features"))
-	// OAuth 账号的 session_id/conversation_id 应同时按 API key 和上游账号隔离，
-	// 测试中未设置 api_key 到 context，apiKeyID=0。
-	require.Equal(t, isolateOpenAIUpstreamSessionID(0, account, "sess-oauth-1"), captureDialer.lastHeaders.Get("session_id"))
+	ids := resolveCodexFingerprintIDsFromRequest(account, c.Request.Header)
+	require.NotNil(t, ids)
+	// Fork: fingerprint staging overrides session_id with the converged
+	// per-account session; conversation_id stays identity-isolated (upstream).
+	require.Equal(t, ids.sessionID, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
 	require.Equal(t, isolateOpenAIUpstreamSessionID(0, account, "conv-oauth-1"), captureDialer.lastHeaders.Get("conversation_id"))
 }
 
@@ -1090,8 +1093,10 @@ func TestOpenAIGatewayService_Forward_WSv2_HeaderSessionFallbackFromPromptCacheK
 	require.NotNil(t, result)
 	require.Equal(t, "resp_prompt_cache_key", result.RequestID)
 
-	// OAuth 账号的 session_id 应同时按 API key 和上游账号隔离（apiKeyID=0）。
-	require.Equal(t, isolateOpenAIUpstreamSessionID(0, account, "pcache_123"), captureDialer.lastHeaders.Get("session_id"))
+	ids := resolveCodexFingerprintIDsFromRequest(account, c.Request.Header)
+	require.NotNil(t, ids)
+	require.Equal(t, ids.sessionID, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, isolateOpenAIUpstreamSessionID(0, account, "pcache_123"), captureDialer.lastHeaders.Get("session_id"))
 	require.Empty(t, captureDialer.lastHeaders.Get("conversation_id"))
 	require.NotNil(t, captureConn.lastWrite)
 	require.True(t, gjson.Get(requestToJSONString(captureConn.lastWrite), "stream").Exists())

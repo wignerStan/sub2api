@@ -252,12 +252,19 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 		t.Fatal("timed out waiting for replacement-account completion")
 	}
 	require.Len(t, upstream.bodies, 3)
+	// Fork: bridge bodies carry converged fingerprint identity. Staging at
+	// this entrypoint sees no client session header, so thread falls back to
+	// the per-account converged session (both stable per account).
+	idsFirst := resolveCodexFingerprintIDsFromRequest(account, http.Header{})
+	idsNext := resolveCodexFingerprintIDsFromRequest(&nextAccount, http.Header{})
+	require.NotNil(t, idsFirst)
+	require.NotNil(t, idsNext)
 	require.Contains(t, string(upstream.bodies[0]), "first")
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[1], "client_metadata.session_id").String())
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[1], "client_metadata.thread_id").String())
+	require.Equal(t, idsFirst.sessionID, gjson.GetBytes(upstream.bodies[1], "client_metadata.session_id").String())
+	require.Equal(t, idsFirst.threadID, gjson.GetBytes(upstream.bodies[1], "client_metadata.thread_id").String())
 	require.NotContains(t, string(upstream.bodies[2]), "previous_response_id")
 	require.Contains(t, string(upstream.bodies[2]), "second")
-	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[2], "client_metadata.session_id").String())
-	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[2], "client_metadata.thread_id").String())
+	require.Equal(t, idsNext.sessionID, gjson.GetBytes(upstream.bodies[2], "client_metadata.session_id").String())
+	require.Equal(t, idsNext.threadID, gjson.GetBytes(upstream.bodies[2], "client_metadata.thread_id").String())
 	require.Empty(t, upstream.requests[2].Header.Get(openAIWSTurnStateHeader))
 }

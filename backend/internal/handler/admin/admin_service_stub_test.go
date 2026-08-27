@@ -538,6 +538,14 @@ func (s *stubAdminService) SetAccountSchedulable(ctx context.Context, id int64, 
 	return &account, nil
 }
 
+func (s *stubAdminService) ConvergeCodexFingerprints(_ context.Context, rotateSeeds bool) (*service.ConvergeCodexFingerprintsResult, error) {
+	return &service.ConvergeCodexFingerprintsResult{
+		Matched:     len(s.accounts),
+		Updated:     int64(len(s.accounts)),
+		RotateSeeds: rotateSeeds,
+	}, nil
+}
+
 func (s *stubAdminService) BulkUpdateAccounts(ctx context.Context, input *service.BulkUpdateAccountsInput) (*service.BulkUpdateAccountsResult, error) {
 	s.lastBulkUpdateAccountInput = input
 	if s.bulkUpdateAccountErr != nil {

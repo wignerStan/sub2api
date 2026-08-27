@@ -1429,17 +1429,20 @@ func ensureCodexReasoningInclude(reqBody map[string]any) bool {
 	}
 }
 
-// applyCodexClientMetadata 在请求体补齐 client_metadata["x-codex-installation-id"]，
-// 取值为账号真实的 openai_device_id（最新 Codex 在请求体携带的安装标识）。
+// applyCodexClientMetadata 在请求体补齐 client_metadata["x-codex-installation-id"]。
+// 从不写 openai_device_id 原文；仅在账号有系统种子时写入派生 installation_id。
 //
-// 加法式、幂等：仅在账号存在 device_id 且该键缺失时注入，绝不覆盖既有 client_metadata
-// （如 turn metadata），也不伪造——无 device_id 时不写入。
+// 加法式、幂等：该键已有非空值时不覆盖（后续指纹收敛会改写），无种子时不写入。
 func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
-	if account == nil {
+	if account == nil || reqBody == nil {
 		return false
 	}
-	deviceID := strings.TrimSpace(account.GetOpenAIDeviceID())
-	if deviceID == "" {
+	seed, ok := codexFingerprintSeed(account.Extra)
+	if !ok {
+		return false
+	}
+	installationID := resolveConvergedInstallationID(account, seed)
+	if installationID == "" {
 		return false
 	}
 	const key = "x-codex-installation-id"
@@ -1448,7 +1451,7 @@ func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 		if v, ok := existing[key].(string); ok && strings.TrimSpace(v) != "" {
 			return false
 		}
-		existing[key] = deviceID
+		existing[key] = installationID
 		reqBody["client_metadata"] = existing
 		return true
 	case map[string]string:
@@ -1459,11 +1462,11 @@ func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 		for k, v := range existing {
 			next[k] = v
 		}
-		next[key] = deviceID
+		next[key] = installationID
 		reqBody["client_metadata"] = next
 		return true
 	case nil:
-		reqBody["client_metadata"] = map[string]any{key: deviceID}
+		reqBody["client_metadata"] = map[string]any{key: installationID}
 		return true
 	default:
 		return false

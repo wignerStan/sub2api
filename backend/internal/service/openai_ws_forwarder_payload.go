@@ -91,14 +91,6 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 
 	sessionResolution := resolveOpenAIWSSessionHeaders(c, promptCacheKey)
 	if c != nil && c.Request != nil {
-		if v := strings.TrimSpace(c.Request.Header.Get("accept-language")); v != "" {
-			headers.Set("accept-language", v)
-		}
-		for _, value := range c.Request.Header.Values("x-codex-beta-features") {
-			if value = strings.TrimSpace(value); value != "" {
-				headers.Add("x-codex-beta-features", value)
-			}
-		}
 		for _, name := range [...]string{
 			"x-codex-window-id",
 			"x-codex-installation-id",
@@ -111,12 +103,6 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 			}
 		}
 	}
-	// 真实 Codex 的 WS 握手同样携带会话级 x-codex-beta-features
-	// （client.rs build_websocket_headers 复用 build_responses_headers），
-	// 客户端未声明时补成默认形态，与 HTTP 出站保持一致。放在客户端头拷贝
-	// 之外：该头是账号/会话级属性，不依赖入站请求是否存在，也避免预热与
-	// 实际请求因头差异落进不同的连接池兼容分桶。
-	applyOpenAICodexBetaFeatures(c, account, headers)
 	// OAuth 账号：将 apiKeyID 混入 session 标识符，防止跨用户会话碰撞。
 	if account != nil && account.UsesOpenAICodexProtocol() {
 		apiKeyID := getAPIKeyIDFromContext(c)
@@ -141,7 +127,12 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
 	applyCodexAccountIdentityHeaders(headers, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+	ensureStagedCodexFingerprintIDs(c, account)
 	applyStagedCodexFingerprintHeaders(c, account, headers)
+	if account != nil && account.Type == AccountTypeOAuth {
+		sanitizeCodexOutboundAssociationHeaders(headers)
+	}
+	applyOpenAICodexBetaFeatures(c, account, headers)
 
 	if account != nil && account.UsesOpenAICodexProtocol() {
 		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, headers, account); err != nil {

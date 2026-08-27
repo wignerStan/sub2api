@@ -193,6 +193,7 @@ func registerAgentIdentityTask(ctx context.Context, account *Account) (string, e
 	if err != nil {
 		return "", errors.New("invalid proxy configuration for agent task registration")
 	}
+	client = ApplySidecarHTTPClient(nil, client, proxyURL)
 	body, err := json.Marshal(map[string]string{
 		"timestamp": timestamp,
 		"signature": signature,

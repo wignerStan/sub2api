@@ -582,9 +582,21 @@ func openAIResponsesRequestPathSuffix(c *gin.Context) string {
 
 // IsForwardableOpenAIResponsesRequestPath 判断入站请求携带的 /responses 子路径
 // 是否可以安全转发。路由层用它在鉴权后、调度前直接拒绝畸形子路径。
+func isAllowedCodexResponsesSuffix(suffix string) bool {
+	switch suffix {
+	case "", "/compact", "/input_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
 func IsForwardableOpenAIResponsesRequestPath(c *gin.Context) bool {
-	_, ok := sanitizedUpstreamPathSuffix(rawOpenAIResponsesRequestPathSuffix(c))
-	return ok
+	suffix, ok := sanitizedUpstreamPathSuffix(rawOpenAIResponsesRequestPathSuffix(c))
+	if !ok {
+		return false
+	}
+	return isAllowedCodexResponsesSuffix(suffix)
 }
 
 // IsOpenAIResponsesInputTokensRequestPath reports whether the request targets
@@ -1139,6 +1151,9 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
+	}
+	if err := validateNoDuplicateTopLevelJSONKeys(body); err != nil {
+		return body, false, fmt.Errorf("normalize passthrough body: %w", err)
 	}
 
 	normalized, changed, err := normalizeOpenAIOAuthResponsesCompatibilityBody(body)

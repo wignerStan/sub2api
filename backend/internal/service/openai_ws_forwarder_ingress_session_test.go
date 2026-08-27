@@ -1242,9 +1242,13 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 		t.Fatal("等待 passthrough websocket 结束超时")
 	}
 
-	require.Equal(t, isolateOpenAIUpstreamSessionID(0, account, "pcache_passthrough"), captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, "turn-state-1", captureDialer.lastHeaders.Get(openAIWSTurnStateHeader))
-	require.Equal(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader))
+	ids := resolveCodexFingerprintIDsFromRequest(account, http.Header{})
+	require.NotNil(t, ids)
+	require.Equal(t, ids.sessionID, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, isolateOpenAIUpstreamSessionID(0, account, "pcache_passthrough"), captureDialer.lastHeaders.Get("session_id"))
+	require.Empty(t, captureDialer.lastHeaders.Get(openAIWSTurnStateHeader), "client turn-state must not reach upstream")
+	require.NotEqual(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader), "opaque client turn-metadata must be rebuilt")
+	require.Contains(t, captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader), ids.sessionID)
 	require.Len(t, upstreamConn.writes, 1)
 	forwarded := requestToJSONString(upstreamConn.writes[0])
 	require.False(t, gjson.Get(forwarded, `tools.#(type=="namespace")`).Exists())
@@ -1253,8 +1257,144 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 	require.Equal(t, "collaboration", gjson.Get(forwarded, "tool_choice.name").String())
 	require.Equal(t, "medium", gjson.Get(forwarded, "reasoning.effort").String())
 	require.Equal(t, "all_turns", gjson.Get(forwarded, "reasoning.context").String())
+	require.Equal(t, ids.sessionID, gjson.Get(forwarded, "client_metadata.session_id").String())
+	require.Equal(t, ids.installationID, gjson.Get(forwarded, "client_metadata.x-codex-installation-id").String())
+	require.False(t, gjson.Get(forwarded, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").Exists())
 	require.True(t, gjson.Get(forwarded, "parallel_tool_calls").Exists())
 	require.False(t, gjson.Get(forwarded, "parallel_tool_calls").Bool())
+}
+
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_CtxPoolRewritesClientMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	cfg.Gateway.OpenAIWS.IngressModeDefault = OpenAIWSIngressModeCtxPool
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 8
+	cfg.Gateway.OpenAIWS.DialTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
+
+	captureConn := &openAIWSCaptureConn{
+		events: [][]byte{
+			[]byte(`{"type":"response.completed","response":{"id":"resp_fp_first","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_fp_second","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		},
+	}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	account := newTestOAuthAccount(4530, map[string]any{
+		codexFingerprintModeExtraKey:                "session",
+		"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeCtxPool,
+	})
+	account.Name = "openai-ingress-ctx-pool-fingerprint"
+	account.Status = StatusActive
+	account.Schedulable = true
+	account.Concurrency = 1
+	account.Credentials = map[string]any{"access_token": "oauth-token"}
+
+	serverErrCh := make(chan error, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		req := r.Clone(r.Context())
+		req.Header = req.Header.Clone()
+		req.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		req.Header.Set("session-id", "header-session")
+		req.Header.Set("x-codex-installation-id", "client-install")
+		ginCtx.Request = req
+
+		readCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		msgType, firstMessage, readErr := conn.Read(readCtx)
+		cancel()
+		if readErr != nil {
+			serverErrCh <- readErr
+			return
+		}
+		if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
+			serverErrCh <- errors.New("unsupported websocket client message type")
+			return
+		}
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "oauth-token", firstMessage, nil)
+	}))
+	defer wsServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(leakedCodexWSPassthroughFrame))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+	_, event, readErr := clientConn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, readErr)
+	require.Equal(t, "resp_fp_first", gjson.GetBytes(event, "response.id").String())
+
+	writeCtx, cancelWrite = context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(leakedCodexWSPassthroughFrameTurn2))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead = context.WithTimeout(context.Background(), 3*time.Second)
+	_, event, readErr = clientConn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, readErr)
+	require.Equal(t, "resp_fp_second", gjson.GetBytes(event, "response.id").String())
+	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
+
+	select {
+	case serverErr := <-serverErrCh:
+		if serverErr != nil {
+			require.Contains(t, serverErr.Error(), "StatusNormalClosure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待 ctx_pool websocket 结束超时")
+	}
+
+	ids := resolveCodexFingerprintIDsFromRequest(account, http.Header{"session-id": []string{"header-session"}})
+	require.NotNil(t, ids)
+	require.Len(t, captureConn.writes, 2)
+	firstUpstream := requestToJSONString(captureConn.writes[0])
+	secondUpstream := requestToJSONString(captureConn.writes[1])
+	requireConvergedCodexWSClientMetadata(t, []byte(firstUpstream), ids, "body-session")
+	require.Equal(t, ids.sessionID, gjson.Get(firstUpstream, "prompt_cache_key").String())
+	requireConvergedCodexWSClientMetadata(t, []byte(secondUpstream), ids, "body-session-2")
+	require.Equal(t, ids.sessionID, gjson.Get(secondUpstream, "prompt_cache_key").String())
+	require.NotEqual(t,
+		gjson.Get(firstUpstream, "client_metadata.turn_id").String(),
+		gjson.Get(secondUpstream, "client_metadata.turn_id").String(),
+	)
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_HTTPBridgeModeRelaysHTTPStream(t *testing.T) {

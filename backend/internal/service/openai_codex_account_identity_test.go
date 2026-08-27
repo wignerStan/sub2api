@@ -165,7 +165,13 @@ func TestBuildOpenAIWSHeadersNamespacesCodexIdentityByOAuthAccount(t *testing.T)
 		"token", true, "client-session", true,
 	)
 	require.NoError(t, err)
-	require.Equal(t, httpRequest.Header.Get("session_id"), first.Get("session_id"), "HTTP and WS must derive the same identity from the raw client key")
+	// Fork: production HTTP flow stages fingerprint identity after
+	// buildUpstreamRequest (forward.go), same as the WS handshake does.
+	// Compare at that final stage so both transports converge on the same
+	// per-account fingerprint session.
+	ensureStagedCodexFingerprintIDs(c, account11)
+	applyStagedCodexFingerprintHeaders(c, account11, httpRequest.Header)
+	require.Equal(t, httpRequest.Header.Get("session_id"), first.Get("session_id"), "HTTP and WS must converge to the same fingerprint identity")
 }
 
 func TestBuildUpstreamRequestNamespacesCodexIdentityByOAuthAccount(t *testing.T) {
