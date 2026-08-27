@@ -215,8 +215,8 @@ const (
 	// 上游看到 1 台设备 + 多会话（每用户各自的 session）。
 	codexFingerprintDevice codexFingerprintMode = "device"
 	// codexFingerprintSession 收敛 installation_id + session_id，
-	// thread_id 按客户端原始 session-id 确定性派生（每个真实 Codex 会话一个独立线程）。
-	// 上游看到 1 台设备 + 1 会话 + N 线程，最接近正常用户 spawn 子代理的模式。
+	// thread_id 按客户端原始 thread-id 确定性派生；缺失 thread-id 时才回退到 session-id。
+	// 上游看到 1 台设备 + 1 会话 + N 线程，并保留 root/subagent 的线程拓扑。
 	codexFingerprintSession codexFingerprintMode = "session"
 	// codexFingerprintFull 收敛所有标识：installation_id + session_id + thread_id。
 	// 上游看到 1 台设备 + 1 会话 + 1 线程，最激进。
@@ -462,14 +462,14 @@ func resolveConvergedSessionID(seed string) string {
 	return deriveStableUUIDv4("sub2api:codex-session-id:v2:" + seed)
 }
 
-// resolveConvergedThreadID 按客户端原始 session-id 确定性派生 thread_id。
-// 每个真实 Codex 会话（不同客户端启动实例）获得一个独立线程，
-// 模拟正常用户 spawn 子代理或开多窗口的模式。
-func resolveConvergedThreadID(seed, clientSessionID string) string {
-	if seed == "" || clientSessionID == "" {
+// resolveConvergedThreadID 按客户端原始 thread-id 确定性派生 thread_id。
+// 同一原始 thread 在同一账号种子下稳定映射，不同 root/subagent thread 保持不同。
+// 调用方可在缺失 thread-id 时显式传入 session-id 作为兼容回退。
+func resolveConvergedThreadID(seed, clientThreadID string) string {
+	if seed == "" || clientThreadID == "" {
 		return ""
 	}
-	return deriveStableUUIDv4("sub2api:codex-thread-id:v2:" + seed + ":" + clientSessionID)
+	return deriveStableUUIDv4("sub2api:codex-thread-id:v2:" + seed + ":" + clientThreadID)
 }
 
 // codexFingerprintIDs 收敛后的完整 ID 集合。
@@ -479,9 +479,12 @@ func resolveConvergedThreadID(seed, clientSessionID string) string {
 type codexFingerprintIDs struct {
 	accountID                     int64
 	mode                          codexFingerprintMode
+	seed                          string
 	installationID                string
 	sessionID                     string
 	threadID                      string
+	parentThreadID                string
+	forkedFromThreadID            string
 	turnID                        string
 	windowID                      string
 	windowNumber                  uint64
@@ -527,6 +530,7 @@ func resolveCodexFingerprintIDsWithWindow(account *Account, clientSessionID stri
 	ids := &codexFingerprintIDs{
 		accountID:           account.ID,
 		mode:                mode,
+		seed:                seed,
 		windowNumber:        windowNumber,
 		turnStartedAtUnixMs: time.Now().UnixMilli(),
 	}
@@ -573,8 +577,47 @@ func extractClientSessionID(h http.Header) string {
 	return strings.TrimSpace(h.Get("session_id"))
 }
 
+func codexFingerprintTurnMetadataString(h http.Header, key string) string {
+	if h == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(h.Get("x-codex-turn-metadata"))
+	if raw == "" || !gjson.Valid(raw) {
+		return ""
+	}
+	return strings.TrimSpace(gjson.Get(raw, key).String())
+}
+
+func extractClientThreadID(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(h.Get("thread-id")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(h.Get("thread_id")); v != "" {
+		return v
+	}
+	return codexFingerprintTurnMetadataString(h, "thread_id")
+}
+
+func extractClientParentThreadID(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(h.Get("x-codex-parent-thread-id")); v != "" {
+		return v
+	}
+	return codexFingerprintTurnMetadataString(h, "parent_thread_id")
+}
+
+func extractClientForkedFromThreadID(h http.Header) string {
+	return codexFingerprintTurnMetadataString(h, "forked_from_thread_id")
+}
+
 // resolveCodexFingerprintIDsFromRequest 从客户端原始请求头中提取 session-id 与 window-id，
-// 结合账号配置一次性解析收敛 ID 集合。
+// 结合账号配置一次性解析收敛 ID 集合。调用方应将返回的 ids 同时传给
+// applyCodexFingerprintHeaders 和 applyCodexFingerprintClientMetadata。
 func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.Header) *codexFingerprintIDs {
 	if account == nil || !account.IsOpenAIOAuth() {
 		return nil
@@ -586,7 +629,25 @@ func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.
 		clientSessionID = extractClientSessionID(clientHeaders)
 		windowNumber = extractClientWindowNumber(clientHeaders)
 	}
-	return resolveCodexFingerprintIDsWithWindow(account, clientSessionID, windowNumber, mode)
+	ids := resolveCodexFingerprintIDsWithWindow(account, clientSessionID, windowNumber, mode)
+	if ids == nil || mode != codexFingerprintSession || clientHeaders == nil {
+		return ids
+	}
+
+	// Session convergence must preserve Codex's graph: one session can contain a
+	// root thread plus multiple subagent/fork threads. Derive each node from the
+	// original thread identity, not from the shared session-id.
+	if clientThreadID := extractClientThreadID(clientHeaders); clientThreadID != "" {
+		ids.threadID = resolveConvergedThreadID(ids.seed, clientThreadID)
+		ids.windowID = fmt.Sprintf("%s:%d", ids.threadID, windowNumber)
+	}
+	if parentThreadID := extractClientParentThreadID(clientHeaders); parentThreadID != "" {
+		ids.parentThreadID = resolveConvergedThreadID(ids.seed, parentThreadID)
+	}
+	if forkedFromThreadID := extractClientForkedFromThreadID(clientHeaders); forkedFromThreadID != "" {
+		ids.forkedFromThreadID = resolveConvergedThreadID(ids.seed, forkedFromThreadID)
+	}
+	return ids
 }
 
 // applyCodexFingerprintHeaders 按预计算的收敛 ID 改写出站 HTTP 头中的设备指纹。
@@ -612,8 +673,11 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 	h.Set("session-id", ids.sessionID)
 	h.Set("session_id", ids.sessionID)
 	h.Set("thread-id", ids.threadID)
+	if ids.mode == codexFingerprintSession && ids.parentThreadID != "" && strings.TrimSpace(h.Get("x-codex-parent-thread-id")) != "" {
+		h.Set("x-codex-parent-thread-id", ids.parentThreadID)
+	}
 
-	rewriteCodexTurnMetadataFields(h, map[string]any{
+	fields := map[string]any{
 		"installation_id":         ids.installationID,
 		"session_id":              ids.sessionID,
 		"thread_id":               ids.threadID,
@@ -621,7 +685,16 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 		"window_id":               ids.windowID,
 		"window_number":           ids.windowNumber,
 		"turn_started_at_unix_ms": ids.turnStartedAtUnixMs,
-	})
+	}
+	if ids.mode == codexFingerprintSession {
+		if ids.parentThreadID != "" {
+			fields["parent_thread_id"] = ids.parentThreadID
+		}
+		if ids.forkedFromThreadID != "" {
+			fields["forked_from_thread_id"] = ids.forkedFromThreadID
+		}
+	}
+	rewriteCodexTurnMetadataFields(h, fields)
 }
 
 func isAllowedCodexClientMetadataKey(key string) bool {
@@ -785,8 +858,13 @@ func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *code
 	existing["x-codex-window-id"] = ids.windowID
 	existing["window_id"] = ids.windowID
 	existing["window_number"] = float64(ids.windowNumber)
+	if ids.mode == codexFingerprintSession && ids.parentThreadID != "" {
+		if _, exists := existing["x-codex-parent-thread-id"]; exists {
+			existing["x-codex-parent-thread-id"] = ids.parentThreadID
+		}
+	}
 
-	rewriteClientMetadataEmbeddedTurnMetadata(existing, map[string]any{
+	fields := map[string]any{
 		"installation_id":         ids.installationID,
 		"session_id":              ids.sessionID,
 		"thread_id":               ids.threadID,
@@ -794,7 +872,16 @@ func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *code
 		"window_id":               ids.windowID,
 		"window_number":           ids.windowNumber,
 		"turn_started_at_unix_ms": ids.turnStartedAtUnixMs,
-	})
+	}
+	if ids.mode == codexFingerprintSession {
+		if ids.parentThreadID != "" {
+			fields["parent_thread_id"] = ids.parentThreadID
+		}
+		if ids.forkedFromThreadID != "" {
+			fields["forked_from_thread_id"] = ids.forkedFromThreadID
+		}
+	}
+	rewriteClientMetadataEmbeddedTurnMetadata(existing, fields)
 	stripLeakedCodexClientMetadata(existing)
 	return true
 }
