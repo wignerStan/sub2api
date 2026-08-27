@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -45,6 +46,66 @@ func TestSidecarOpenAIWSClientDialerFallsBackOutsideCodex(t *testing.T) {
 	require.Error(t, err)
 	require.NotEqual(t, "fallback used", err.Error())
 	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
+}
+
+func TestSidecarOpenAIWSClientDialerTrustedAccountSelector(t *testing.T) {
+	seen := make(chan [2]string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- [2]string{
+			r.Header.Get(SidecarAccountIDHeader),
+			r.Header.Get("x-account-id"),
+		}
+		http.Error(w, "expected handshake failure", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	dialer := &sidecarOpenAIWSClientDialer{
+		cfg: &config.Config{},
+		settings: SidecarSettings{
+			Enabled: true,
+			BaseURL: server.URL,
+			Token:   "tok",
+		},
+		fallback: &recordingOpenAIWSDialer{},
+	}
+	headers := http.Header{}
+	headers.Set(SidecarAccountIDHeader, "999")
+	headers.Set("x-account-id", "998")
+	_, _, _, err := dialer.DialForAccount(
+		context.Background(),
+		"wss://chatgpt.com/backend-api/codex/call_proxy",
+		headers,
+		"",
+		42,
+	)
+	require.Error(t, err)
+	require.Equal(t, [2]string{"42", ""}, <-seen)
+}
+
+func TestStripSidecarControlHeaders(t *testing.T) {
+	headers := http.Header{
+		"Authorization":         {"Bearer keep"},
+		"X-Account-Id":          {"1"},
+		"X-Upstream-Account-Id": {"2"},
+		"X-Upstream-Url":        {"https://example.invalid"},
+		"X-Upstream-Proxy":      {"proxy"},
+		"X-S2s-Token":           {"token"},
+		"X-S2s-Enc":             {"1"},
+		"X-S2s-Enc-Len":         {"10"},
+	}
+	stripSidecarControlHeaders(headers)
+	require.Equal(t, "Bearer keep", headers.Get("Authorization"))
+	for _, name := range []string{
+		"x-account-id",
+		SidecarAccountIDHeader,
+		"x-upstream-url",
+		"x-upstream-proxy",
+		"x-s2s-token",
+		SidecarE2EEHeader,
+		SidecarE2EEOrigLenHeader,
+	} {
+		require.Empty(t, headers.Get(name), name)
+	}
 }
 
 func TestSidecarOpenAIWSClientDialerRejectsInvalidProxy(t *testing.T) {

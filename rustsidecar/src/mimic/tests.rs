@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
     use crate::mimic::body::{transform_request_body, transform_ws_frame};
-    use crate::mimic::headers::sanitize_and_inject_headers;
+    use crate::mimic::headers::{sanitize_and_inject_headers, sanitize_and_inject_headers_for_request};
     use crate::mimic::identity::{
         derive_converged_thread_id, derive_converged_uuid_v4, extract_client_version_from_headers,
         extract_window_number, sanitize_workspace_path,
@@ -529,7 +529,7 @@ use serde_json::{json, Value};
         // Allowed fields kept without mutation
         assert_eq!(meta.get("session_id").unwrap(), "client_session_abc");
         assert_eq!(meta.get("window_number").unwrap(), 2);
-        assert_eq!(parsed.get("prompt_cache_key").unwrap(), "21e2cc47-2268-472e-99f2-cc27b26b86a9");
+        assert_eq!(parsed.get("prompt_cache_key").unwrap(), "client_session_abc");
 
         // Unknown extra field returns Forbidden error under Forbidden policy
         let bad_input = json!({
@@ -752,6 +752,53 @@ use serde_json::{json, Value};
         sse_accept_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
         assert!(sanitize_and_inject_headers(&mut sse_accept_headers, "seed", None, None, "salt", Some("0.1.183"), 0, true, UnknownFieldPolicy::Forbidden).is_ok());
         assert_eq!(sse_accept_headers.get("accept").unwrap().to_str().unwrap(), "text/event-stream");
+    }
+
+    #[test]
+    fn compact_accepts_json_without_changing_gateway_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("session-id"),
+            HeaderValue::from_static("gateway-session"),
+        );
+        headers.insert(
+            HeaderName::from_static("thread-id"),
+            HeaderValue::from_static("gateway-thread"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-codex-window-id"),
+            HeaderValue::from_static("gateway-thread:2"),
+        );
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+
+        assert!(sanitize_and_inject_headers_for_request(
+            &mut headers,
+            "profile-seed",
+            Some("gateway-session"),
+            None,
+            "deployment-salt",
+            Some("0.1.183"),
+            2,
+            true,
+            true,
+            UnknownFieldPolicy::Forbidden,
+        )
+        .is_ok());
+        assert_eq!(
+            headers.get("accept").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get("session-id").unwrap().to_str().unwrap(),
+            "gateway-session"
+        );
+        assert_eq!(
+            headers.get("thread-id").unwrap().to_str().unwrap(),
+            "gateway-thread"
+        );
     }
 
     #[test]

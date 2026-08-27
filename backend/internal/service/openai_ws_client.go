@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,13 @@ type openAIWSClientDialer interface {
 	Dial(ctx context.Context, wsURL string, headers http.Header, proxyURL string) (openAIWSClientConn, int, http.Header, error)
 }
 
+// openAIWSAccountAwareClientDialer is implemented only by transports that need
+// the scheduler-owned local account ID. Keeping it out of the base interface
+// prevents internal selectors from leaking to ordinary upstream WebSockets.
+type openAIWSAccountAwareClientDialer interface {
+	DialForAccount(ctx context.Context, wsURL string, headers http.Header, proxyURL string, accountID int64) (openAIWSClientConn, int, http.Header, error)
+}
+
 type openAIWSTransportMetricsDialer interface {
 	SnapshotTransportMetrics() OpenAIWSTransportMetricsSnapshot
 }
@@ -89,11 +97,48 @@ type sidecarOpenAIWSClientDialer struct {
 	fallback openAIWSClientDialer
 }
 
+func stripSidecarControlHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	for _, name := range []string{
+		"x-account-id",
+		SidecarAccountIDHeader,
+		"x-upstream-url",
+		"x-upstream-proxy",
+		"x-s2s-token",
+		SidecarE2EEHeader,
+		SidecarE2EEOrigLenHeader,
+	} {
+		headers.Del(name)
+	}
+}
+
 func (d *sidecarOpenAIWSClientDialer) Dial(
 	ctx context.Context,
 	wsURL string,
 	headers http.Header,
 	proxyURL string,
+) (openAIWSClientConn, int, http.Header, error) {
+	return d.dial(ctx, wsURL, headers, proxyURL, 0)
+}
+
+func (d *sidecarOpenAIWSClientDialer) DialForAccount(
+	ctx context.Context,
+	wsURL string,
+	headers http.Header,
+	proxyURL string,
+	accountID int64,
+) (openAIWSClientConn, int, http.Header, error) {
+	return d.dial(ctx, wsURL, headers, proxyURL, accountID)
+}
+
+func (d *sidecarOpenAIWSClientDialer) dial(
+	ctx context.Context,
+	wsURL string,
+	headers http.Header,
+	proxyURL string,
+	accountID int64,
 ) (openAIWSClientConn, int, http.Header, error) {
 	if d == nil {
 		return nil, 0, nil, errors.New("sidecar ws dialer is nil")
@@ -113,6 +158,10 @@ func (d *sidecarOpenAIWSClientDialer) Dial(
 	header := cloneHeader(headers)
 	if header == nil {
 		header = make(http.Header)
+	}
+	stripSidecarControlHeaders(header)
+	if accountID > 0 {
+		header.Set(SidecarAccountIDHeader, strconv.FormatInt(accountID, 10))
 	}
 	opts := &coderws.DialOptions{
 		HTTPHeader:      header,
@@ -230,8 +279,10 @@ func (d *coderOpenAIWSClientDialer) Dial(
 		return nil, 0, nil, errors.New("ws url is empty")
 	}
 
+	outboundHeaders := cloneHeader(headers)
+	stripSidecarControlHeaders(outboundHeaders)
 	opts := &coderws.DialOptions{
-		HTTPHeader:      cloneHeader(headers),
+		HTTPHeader:      outboundHeaders,
 		CompressionMode: coderws.CompressionContextTakeover,
 	}
 	if proxy := strings.TrimSpace(proxyURL); proxy != "" {

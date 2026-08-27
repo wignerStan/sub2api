@@ -5,7 +5,7 @@
 //! 1. Direct PostgreSQL DB lookup with Moka in-memory cache and PG LISTEN/NOTIFY invalidation.
 //! 2. Realistic workstation client simulation (OS, arch, cwd, git branch, terminal, exact agent version).
 //! 3. Exact protocol-fidelity window_id/window_number preservation across compactions.
-//! 4. Device & Session ID convergence, header normalization, and metadata leak sanitization.
+//! 4. Gateway-established identity validation, header normalization, and metadata leak sanitization.
 //! 5. Official Codex rustls 0.23 + aws-lc-rs TLS disguise.
 //! 6. AES-256-GCM E2EE loopback security.
 
@@ -169,12 +169,50 @@ fn normalize_proxy_url(proxy_url: String) -> Result<String, Response> {
         "http" | "https" | "socks5" | "socks5h" => {}
         _ => return Err(StatusCode::BAD_REQUEST.into_response()),
     }
-    if let Some(host) = parsed.host_str() {
-        if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
-            return Err(StatusCode::BAD_REQUEST.into_response());
-        }
+    // Proxy selectors are rebuilt by the authenticated Go loopback client or
+    // loaded from the local account DB. Loopback proxies are therefore valid
+    // and common (Clash, SSH tunnels, local SOCKS forwarders).
+    if parsed.host_str().is_none() {
+        return Err(StatusCode::BAD_REQUEST.into_response());
     }
     Ok(parsed.to_string())
+}
+
+#[cfg(test)]
+mod proxy_url_tests {
+    use super::*;
+
+    #[test]
+    fn allows_trusted_loopback_proxies() {
+        for raw in [
+            "http://127.0.0.1:8080",
+            "socks5h://localhost:1080",
+            "socks5://[::1]:1080",
+        ] {
+            assert!(normalize_proxy_url(raw.to_string()).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_proxy_targets() {
+        for raw in ["ftp://127.0.0.1:21", "http://", "://bad"] {
+            assert!(normalize_proxy_url(raw.to_string()).is_err(), "{raw}");
+        }
+    }
+}
+
+fn classify_upstream_target(target: &str) -> (bool, bool) {
+    let path = reqwest::Url::parse(target)
+        .ok()
+        .map(|url| url.path().trim_end_matches('/').to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_compact_path =
+        path.ends_with("/responses/compact") || path.ends_with("/codex/compact");
+    let is_responses_path = is_compact_path
+        || path.contains("/responses")
+        || path.contains("/completions")
+        || path.contains("/chat/");
+    (is_responses_path, is_compact_path)
 }
 
 fn forwarded_headers(
@@ -182,6 +220,7 @@ fn forwarded_headers(
     profile: &AccountProfile,
     salt: &str,
     is_responses_path: bool,
+    is_compact_path: bool,
     policy: UnknownFieldPolicy,
 ) -> Result<(HeaderMap, Option<String>, u64), MimicError> {
     let mut out = HeaderMap::new();
@@ -211,7 +250,7 @@ fn forwarded_headers(
     }
 
     // Apply strict account mimic, tracking header stripping & exact window number normalization
-    mimic::sanitize_and_inject_headers(
+    mimic::sanitize_and_inject_headers_for_request(
         &mut out,
         &profile.fingerprint_seed,
         client_session_id.as_deref(),
@@ -220,6 +259,7 @@ fn forwarded_headers(
         agent_version.as_deref(),
         window_number,
         is_responses_path,
+        is_compact_path,
         policy,
     )?;
 
@@ -261,9 +301,9 @@ async fn http_tunnel(
         Ok(client) => client,
         Err(response) => return response,
     };
-    let is_responses_path = target.contains("/responses") || target.contains("/completions") || target.contains("/chat/");
+    let (is_responses_path, is_compact_path) = classify_upstream_target(target);
     let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };
@@ -354,9 +394,9 @@ async fn http_tunnel_e2ee(
         Ok(client) => client,
         Err(response) => return response,
     };
-    let is_responses_path = target.contains("/responses") || target.contains("/completions") || target.contains("/chat/");
+    let (is_responses_path, is_compact_path) = classify_upstream_target(target);
     let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };
@@ -600,8 +640,9 @@ async fn ws_tunnel(
         Err(response) => return response,
     };
     let is_responses_path = true;
+    let is_compact_path = false;
     let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, state.unknown_field_policy) {
+        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };

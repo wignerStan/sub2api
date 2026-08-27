@@ -105,15 +105,37 @@ func TestEncodeSidecarUpstreamProxy(t *testing.T) {
 }
 
 func TestSidecarTLSEnabled(t *testing.T) {
-	t.Setenv("GATEWAY_SIDECAR_ENABLED", "false")
-	t.Setenv("GATEWAY_SIDECAR_BASE_URL", "")
-	t.Setenv("GATEWAY_SIDECAR_TOKEN", "")
-	require.False(t, SidecarTLSEnabled(nil))
-
-	t.Setenv("GATEWAY_SIDECAR_ENABLED", "true")
 	t.Setenv("GATEWAY_SIDECAR_BASE_URL", "http://127.0.0.1:21333")
 	t.Setenv("GATEWAY_SIDECAR_TOKEN", "tok")
+	t.Setenv("SUB2API_SIDECAR_ENABLED", "")
+
+	for _, value := range []string{"false", "FALSE", "0", "invalid"} {
+		t.Run("explicit_"+value+"_stays_disabled", func(t *testing.T) {
+			t.Setenv("GATEWAY_SIDECAR_ENABLED", value)
+			require.False(t, SidecarTLSEnabled(nil))
+		})
+	}
+
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "true")
 	require.True(t, SidecarTLSEnabled(nil))
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "1")
+	require.True(t, SidecarTLSEnabled(nil))
+
+	// With no explicit enablement value, base URL + token retain the historical
+	// convenience auto-enable behavior.
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "")
+	require.True(t, SidecarTLSEnabled(nil))
+}
+
+func TestResolveSidecarSettingsEnablementPrecedence(t *testing.T) {
+	t.Setenv("GATEWAY_SIDECAR_BASE_URL", "http://127.0.0.1:21333")
+	t.Setenv("GATEWAY_SIDECAR_TOKEN", "tok")
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "0")
+	t.Setenv("SUB2API_SIDECAR_ENABLED", "true")
+	require.False(t, ResolveSidecarSettings(nil).Enabled, "gateway setting must take precedence")
+
+	t.Setenv("GATEWAY_SIDECAR_ENABLED", "")
+	require.True(t, ResolveSidecarSettings(nil).Enabled, "sub2api fallback should be honored")
 }
 
 func sidecarTestConfig(t *testing.T, baseURL string) *config.Config {
@@ -121,6 +143,40 @@ func sidecarTestConfig(t *testing.T, baseURL string) *config.Config {
 	t.Setenv("GATEWAY_SIDECAR_BASE_URL", baseURL)
 	t.Setenv("GATEWAY_SIDECAR_TOKEN", "test-token")
 	return &config.Config{}
+}
+
+func TestForwardHTTPViaSidecarTrustedAccountSelector(t *testing.T) {
+	seen := make(chan [3]string, 2)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- [3]string{
+			r.Header.Get(SidecarAccountIDHeader),
+			r.Header.Get("x-account-id"),
+			r.Header.Get("x-upstream-proxy"),
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sidecar.Close()
+	cfg := sidecarTestConfig(t, sidecar.URL)
+
+	trustedReq, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	trustedReq.Header.Set(SidecarAccountIDHeader, "999")
+	trustedReq.Header.Set("x-account-id", "998")
+	trustedReq.Header.Set("x-upstream-proxy", "client-controlled-proxy")
+	resp, err := ForwardHTTPViaSidecarForAccount(cfg, sidecar.Client(), trustedReq, "", 42)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, [3]string{"42", "", ""}, <-seen)
+
+	unscopedReq, err := http.NewRequest(http.MethodPost, "https://auth.openai.com/oauth/token", nil)
+	require.NoError(t, err)
+	unscopedReq.Header.Set(SidecarAccountIDHeader, "997")
+	unscopedReq.Header.Set("x-account-id", "996")
+	unscopedReq.Header.Set("x-upstream-proxy", "client-controlled-proxy")
+	resp, err = ForwardHTTPViaSidecar(cfg, sidecar.Client(), unscopedReq, "")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, [3]string{"", "", ""}, <-seen)
 }
 
 func TestApplySidecarHTTPClientRoutesOAuthHosts(t *testing.T) {

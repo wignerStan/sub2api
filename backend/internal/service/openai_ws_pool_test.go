@@ -44,6 +44,22 @@ func TestOpenAIWSConnPool_CleanupStaleAndTrimIdle(t *testing.T) {
 	require.NotNil(t, ap.conns["idle_new"], "newer idle should be kept")
 }
 
+func TestOpenAIWSConnPool_DialPassesAccountIDToAwareDialer(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	dialer := &openAIWSAccountAwareCaptureDialer{}
+	pool.setClientDialerForTest(dialer)
+	account := &Account{ID: 4242, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+
+	conn, err := pool.dialConn(context.Background(), openAIWSAcquireRequest{
+		Account: account,
+		WSURL:   "wss://chatgpt.com/backend-api/codex/call_proxy",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, int64(4242), dialer.accountID)
+	conn.close()
+}
+
 func TestOpenAIWSConnPool_NextConnIDFormat(t *testing.T) {
 	pool := newOpenAIWSConnPool(&config.Config{})
 	id1 := pool.nextConnID(42)
@@ -2020,6 +2036,30 @@ func TestOpenAIWSConnPool_Acquire_ErrorBranches(t *testing.T) {
 		WSURL:   "wss://example.com/v1/responses",
 	})
 	require.ErrorIs(t, err, errOpenAIWSConnQueueFull)
+}
+
+type openAIWSAccountAwareCaptureDialer struct {
+	accountID int64
+}
+
+func (d *openAIWSAccountAwareCaptureDialer) Dial(
+	context.Context,
+	string,
+	http.Header,
+	string,
+) (openAIWSClientConn, int, http.Header, error) {
+	return nil, 0, nil, errors.New("account-aware dial path was not used")
+}
+
+func (d *openAIWSAccountAwareCaptureDialer) DialForAccount(
+	_ context.Context,
+	_ string,
+	_ http.Header,
+	_ string,
+	accountID int64,
+) (openAIWSClientConn, int, http.Header, error) {
+	d.accountID = accountID
+	return &openAIWSFakeConn{}, 0, nil, nil
 }
 
 type openAIWSFakeDialer struct{}

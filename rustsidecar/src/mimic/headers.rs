@@ -32,6 +32,34 @@ pub fn sanitize_and_inject_headers(
     is_responses_path: bool,
     policy: UnknownFieldPolicy,
 ) -> Result<(), MimicError> {
+    sanitize_and_inject_headers_for_request(
+        headers,
+        seed,
+        client_session_id,
+        custom_device_id,
+        salt,
+        agent_version,
+        window_number,
+        is_responses_path,
+        false,
+        policy,
+    )
+}
+
+/// Request-aware variant used by the tunnel so compact JSON requests are not
+/// forced onto the normal Responses SSE transport.
+pub fn sanitize_and_inject_headers_for_request(
+    headers: &mut HeaderMap,
+    seed: &str,
+    client_session_id: Option<&str>,
+    custom_device_id: Option<&str>,
+    salt: &str,
+    agent_version: Option<&str>,
+    window_number: u64,
+    is_responses_path: bool,
+    is_compact_path: bool,
+    policy: UnknownFieldPolicy,
+) -> Result<(), MimicError> {
     let identity = ConvergedIdentity::new(
         seed,
         client_session_id,
@@ -41,15 +69,29 @@ pub fn sanitize_and_inject_headers(
         window_number,
     );
 
-    // 0. On Responses/Inference path: reject application/json Accept header (only text/event-stream is supported)
+    // 0. Normal Responses requests stream SSE. /responses/compact is a
+    // JSON request/response and must retain the JSON Accept contract.
     if is_responses_path {
-        if let Some(accept_val) = headers.get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()) {
-            let lower = accept_val.to_ascii_lowercase();
-            if lower.contains("application/json") && !lower.contains("text/event-stream") {
-                return Err(MimicError::ForbiddenAcceptHeader(accept_val.to_string()));
+        if is_compact_path {
+            headers.insert(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+        } else {
+            if let Some(accept_val) = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+            {
+                let lower = accept_val.to_ascii_lowercase();
+                if lower.contains("application/json") && !lower.contains("text/event-stream") {
+                    return Err(MimicError::ForbiddenAcceptHeader(accept_val.to_string()));
+                }
             }
+            headers.insert(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
         }
-        headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
     }
 
     let (allowed_x_headers, stripped_x_headers) = if is_responses_path {

@@ -1,12 +1,12 @@
-//! Request body and WebSocket frame transformation, leak sanitization, and prompt cache key convergence.
+//! Request body and WebSocket frame validation plus metadata leak sanitization.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::identity::extract_window_number;
 use super::metadata::sanitize_client_metadata;
 use super::types::{ConvergedIdentity, MimicError, UnknownFieldPolicy};
 
-/// Transform HTTP JSON request body: apply explicit strip sanitization, policy-based validation, and identity convergence.
+/// Transform an HTTP JSON body without changing the identity already established by the Go gateway.
 pub fn transform_request_body(
     body_bytes: &[u8],
     seed: &str,
@@ -58,15 +58,6 @@ pub fn transform_request_body(
 
     let mut modified = false;
 
-    // If prompt_cache_key matches client session, rewrite to converged session_id
-    if let Some(pck) = obj.get("prompt_cache_key").and_then(|v| v.as_str()) {
-        if let Some(ref csess) = client_session_id {
-            if pck == csess {
-                obj.insert("prompt_cache_key".to_string(), json!(identity.session_id));
-                modified = true;
-            }
-        }
-    }
 
     // If client_metadata is present, validate, sanitize, and converge
     if let Some(metadata) = obj.get_mut("client_metadata") {
@@ -83,7 +74,7 @@ pub fn transform_request_body(
     }
 }
 
-/// Transform WebSocket text frame (e.g. `response.create`): validate, strip leaks and converge.
+/// Transform a WebSocket text frame (e.g. `response.create`) without re-converging identity.
 pub fn transform_ws_frame(
     frame_text: &str,
     seed: &str,
@@ -143,29 +134,12 @@ pub fn transform_ws_frame(
 
     let mut modified = false;
 
-    // If prompt_cache_key matches client session, rewrite to converged session_id
-    if let Some(pck) = obj.get("prompt_cache_key").and_then(|v| v.as_str()) {
-        if let Some(ref csess) = client_session_id {
-            if pck == csess {
-                obj.insert("prompt_cache_key".to_string(), json!(identity.session_id));
-                modified = true;
-            }
-        }
-    }
 
     if let Some(metadata) = obj.get_mut("client_metadata") {
         sanitize_client_metadata(metadata, &identity, policy)?;
         modified = true;
     }
     if let Some(response) = obj.get_mut("response").and_then(|r| r.as_object_mut()) {
-        if let Some(pck) = response.get("prompt_cache_key").and_then(|v| v.as_str()) {
-            if let Some(ref csess) = client_session_id {
-                if pck == csess {
-                    response.insert("prompt_cache_key".to_string(), json!(identity.session_id));
-                    modified = true;
-                }
-            }
-        }
         if let Some(metadata) = response.get_mut("client_metadata") {
             sanitize_client_metadata(metadata, &identity, policy)?;
             modified = true;

@@ -1784,7 +1784,16 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 			return nil, err
 		}
 	}
-	conn, status, handshakeHeaders, err := p.clientDialer.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+	var (
+		conn             openAIWSClientConn
+		status           int
+		handshakeHeaders http.Header
+	)
+	if accountAware, ok := p.clientDialer.(openAIWSAccountAwareClientDialer); ok && req.Account != nil {
+		conn, status, handshakeHeaders, err = accountAware.DialForAccount(ctx, req.WSURL, headers, req.ProxyURL, req.Account.ID)
+	} else {
+		conn, status, handshakeHeaders, err = p.clientDialer.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+	}
 	if err != nil {
 		var handshakeErr *openAIWSHandshakeError
 		var responseBody []byte

@@ -25,6 +25,9 @@ const (
 	// SidecarE2EEOrigLenHeader carries the pre-sealing body length so the
 	// sidecar can restore Content-Length toward upstream.
 	SidecarE2EEOrigLenHeader = "x-s2s-enc-len"
+	// SidecarAccountIDHeader carries the trusted local account primary key over
+	// the authenticated loopback hop. It is consumed and stripped by the sidecar.
+	SidecarAccountIDHeader = "x-upstream-account-id"
 )
 
 // ShouldUseSidecarTLS reports whether this upstream request should leave through
@@ -97,10 +100,16 @@ type SidecarSettings struct {
 // environment variables (GATEWAY_SIDECAR_* / SUB2API_SIDECAR_*).
 func ResolveSidecarSettings(_ *config.Config) SidecarSettings {
 	var s SidecarSettings
-	if envEnabled := os.Getenv("GATEWAY_SIDECAR_ENABLED"); envEnabled != "" {
-		s.Enabled = strings.EqualFold(envEnabled, "true") || envEnabled == "1"
-	} else if envEnabled := os.Getenv("SUB2API_SIDECAR_ENABLED"); envEnabled != "" {
-		s.Enabled = strings.EqualFold(envEnabled, "true") || envEnabled == "1"
+	enabledConfigured := false
+	for _, name := range []string{"GATEWAY_SIDECAR_ENABLED", "SUB2API_SIDECAR_ENABLED"} {
+		raw, exists := os.LookupEnv(name)
+		if !exists || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		enabledConfigured = true
+		value := strings.TrimSpace(raw)
+		s.Enabled = value == "1" || strings.EqualFold(value, "true")
+		break
 	}
 	if u := os.Getenv("GATEWAY_SIDECAR_BASE_URL"); u != "" {
 		s.BaseURL = strings.TrimSpace(u)
@@ -112,10 +121,10 @@ func ResolveSidecarSettings(_ *config.Config) SidecarSettings {
 	} else if tok := os.Getenv("SUB2API_SIDECAR_TOKEN"); tok != "" {
 		s.Token = strings.TrimSpace(tok)
 	}
-	if !s.Enabled && s.BaseURL != "" && s.Token != "" {
-		if os.Getenv("GATEWAY_SIDECAR_ENABLED") != "false" && os.Getenv("SUB2API_SIDECAR_ENABLED") != "false" {
-			s.Enabled = true
-		}
+	// Preserve the historical convenience auto-enable only when no explicit
+	// enablement value was supplied. Explicit false/0/invalid values fail closed.
+	if !enabledConfigured && s.BaseURL != "" && s.Token != "" {
+		s.Enabled = true
 	}
 	return s
 }
@@ -199,8 +208,21 @@ func cachedSidecarLoopbackClient(cfg *config.Config) *http.Client {
 	return client
 }
 
-// ForwardHTTPViaSidecar rewrites req to the local sidecar /v1/http tunnel.
+// ForwardHTTPViaSidecar rewrites req to the local sidecar /v1/http tunnel
+// without an account selector. Any untrusted selector already present on req is
+// removed before the authenticated loopback hop.
 func ForwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Request, proxyURL string) (*http.Response, error) {
+	return forwardHTTPViaSidecar(cfg, client, req, proxyURL, 0)
+}
+
+// ForwardHTTPViaSidecarForAccount rewrites req to the local sidecar and binds
+// the tunnel to the scheduler-selected account. The caller-provided account ID
+// always overrides client-controlled headers.
+func ForwardHTTPViaSidecarForAccount(cfg *config.Config, client *http.Client, req *http.Request, proxyURL string, accountID int64) (*http.Response, error) {
+	return forwardHTTPViaSidecar(cfg, client, req, proxyURL, accountID)
+}
+
+func forwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Request, proxyURL string, accountID int64) (*http.Response, error) {
 	if req == nil || req.URL == nil {
 		return nil, errors.New("sidecar forward is missing request")
 	}
@@ -222,6 +244,12 @@ func ForwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Re
 	clone.URL = sidecarBase
 	clone.Host = sidecarBase.Host
 	clone.Header = req.Header.Clone()
+	// Never trust sidecar control headers originating from the client request.
+	// Rebuild every selector from scheduler-owned arguments below.
+	stripSidecarControlHeaders(clone.Header)
+	if accountID > 0 {
+		clone.Header.Set(SidecarAccountIDHeader, strconv.FormatInt(accountID, 10))
+	}
 	clone.Header.Set("x-s2s-token", settings.Token)
 	clone.Header.Set("x-upstream-url", originalURL)
 	encodedProxy, err := EncodeSidecarUpstreamProxy(proxyURL)
