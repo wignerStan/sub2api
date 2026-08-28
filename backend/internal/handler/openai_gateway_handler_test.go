@@ -1193,15 +1193,8 @@ func TestOpenAIResponsesWebSocket_PreviousResponseIDKindLoggedBeforeAcquireFailu
 	require.NoError(t, err)
 
 	readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
-	msgType, payload, err := clientConn.Read(readCtx)
+	_, _, err = clientConn.Read(readCtx)
 	cancelRead()
-	if err == nil {
-		require.Equal(t, coderws.MessageText, msgType)
-		require.Contains(t, string(payload), `"type":"error"`)
-		readCtx2, cancelRead2 := context.WithTimeout(context.Background(), 3*time.Second)
-		_, _, err = clientConn.Read(readCtx2)
-		cancelRead2()
-	}
 	require.Error(t, err)
 	var closeErr coderws.CloseError
 	require.ErrorAs(t, err, &closeErr)
