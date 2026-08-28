@@ -44,14 +44,16 @@ pub fn derive_key_from_token(token: &[u8]) -> Result<[u8; 32], String> {
     derive_key(token, b"loopback-channel")
 }
 
-fn random_nonce() -> [u8; NONCE_LEN] {
+fn random_nonce() -> Result<[u8; NONCE_LEN], String> {
     let mut n = [0u8; NONCE_LEN];
-    let _ = aws_lc_rs::rand::fill(&mut n);
-    n
+    aws_lc_rs::rand::fill(&mut n)
+        .map_err(|_| "failed to generate e2ee nonce".to_string())?;
+    Ok(n)
 }
 
 pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    seal_with_nonce(key, &random_nonce(), plaintext)
+    let nonce = random_nonce()?;
+    seal_with_nonce(key, &nonce, plaintext)
 }
 
 pub fn seal_with_nonce(
@@ -59,6 +61,9 @@ pub fn seal_with_nonce(
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, String> {
+    if plaintext.len() > MAX_PAYLOAD_LEN - NONCE_LEN - TAG_LEN {
+        return Err("e2ee record payload too large".into());
+    }
     let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|e| e.to_string())?;
     let key = LessSafeKey::new(unbound);
     let mut in_out = plaintext.to_vec();
@@ -66,7 +71,13 @@ pub fn seal_with_nonce(
     let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|e| e.to_string())?;
     key.seal_in_place_append_tag(nonce, Aad::from(AEAD_AAD), &mut in_out)
         .map_err(|e| e.to_string())?;
-    let payload_len = (NONCE_LEN + in_out.len()) as u32;
+    let payload_len = NONCE_LEN
+        .checked_add(in_out.len())
+        .ok_or_else(|| "e2ee record payload too large".to_string())?;
+    if payload_len > MAX_PAYLOAD_LEN || payload_len > u32::MAX as usize {
+        return Err("e2ee record payload too large".into());
+    }
+    let payload_len = payload_len as u32;
     let mut out = Vec::with_capacity(HEADER_LEN + payload_len as usize);
     out.push(RECORD_MAGIC);
     out.push(RECORD_VERSION);
@@ -88,7 +99,7 @@ pub fn open_chunk(key: &[u8; 32], record: &[u8]) -> Result<Vec<u8>, String> {
     open(key, record)
 }
 
-/// Open a full record (header + payload).
+/// Open exactly one full record (header + payload).
 pub fn open(key: &[u8; 32], record: &[u8]) -> Result<Vec<u8>, String> {
     if record.len() < HEADER_LEN + NONCE_LEN + TAG_LEN {
         return Err("e2ee record too short".into());
@@ -97,18 +108,27 @@ pub fn open(key: &[u8; 32], record: &[u8]) -> Result<Vec<u8>, String> {
         return Err("unsupported e2ee record header".into());
     }
     let payload_len = u32::from_be_bytes([record[2], record[3], record[4], record[5]]) as usize;
+    if payload_len < NONCE_LEN + TAG_LEN {
+        return Err("e2ee record payload too short".into());
+    }
     if payload_len > MAX_PAYLOAD_LEN {
         return Err("e2ee record payload too large".into());
     }
-    if record.len() < HEADER_LEN + payload_len {
+    let total = HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| "e2ee record payload too large".to_string())?;
+    if record.len() < total {
         return Err("e2ee record truncated".into());
+    }
+    if record.len() > total {
+        return Err("e2ee record has trailing bytes".into());
     }
     let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|e| e.to_string())?;
     let key = LessSafeKey::new(unbound);
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&record[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
     let nonce = Nonce::try_assume_unique_for_key(&nonce).map_err(|e| e.to_string())?;
-    let mut in_out = record[HEADER_LEN + NONCE_LEN..HEADER_LEN + payload_len].to_vec();
+    let mut in_out = record[HEADER_LEN + NONCE_LEN..total].to_vec();
     let plain = key
         .open_in_place(nonce, Aad::from(AEAD_AAD), &mut in_out)
         .map_err(|e| e.to_string())?;
@@ -148,10 +168,15 @@ impl RecordDecoder {
                 return Err("unsupported e2ee record header".into());
             }
             let payload_len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]) as usize;
+            if payload_len < NONCE_LEN + TAG_LEN {
+                return Err("e2ee record payload too short".into());
+            }
             if payload_len > MAX_PAYLOAD_LEN {
                 return Err("e2ee record payload too large".into());
             }
-            let total = HEADER_LEN + payload_len;
+            let total = HEADER_LEN
+                .checked_add(payload_len)
+                .ok_or_else(|| "e2ee record payload too large".to_string())?;
             if self.buf.len() < total {
                 break;
             }
@@ -163,6 +188,16 @@ impl RecordDecoder {
         }
         Ok(out)
     }
+}
+
+/// Open a complete HTTP-style record stream and reject a truncated final record.
+pub fn open_record_stream(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = RecordDecoder::new();
+    let plain = decoder.push(key, sealed)?;
+    if !decoder.is_empty() {
+        return Err("e2ee record stream truncated".into());
+    }
+    Ok(plain)
 }
 
 #[cfg(test)]
@@ -274,5 +309,32 @@ mod tests {
         let mut bad_header = sealed.clone();
         bad_header[0] = 0x00;
         assert!(dec.push(&key, &bad_header).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_record_lengths_and_trailing_bytes() {
+        let key = test_key();
+        let record = seal(&key, b"payload").unwrap();
+
+        let mut impossible_len = record.clone();
+        impossible_len[2..6].copy_from_slice(&0u32.to_be_bytes());
+        assert!(open(&key, &impossible_len).is_err());
+
+        let mut trailing = record;
+        trailing.push(0);
+        assert!(open(&key, &trailing).is_err());
+    }
+
+    #[test]
+    fn complete_stream_rejects_truncated_final_record() {
+        let key = test_key();
+        let r1 = seal(&key, b"first-").unwrap();
+        let r2 = seal(&key, b"second").unwrap();
+        let mut all = r1;
+        all.extend_from_slice(&r2);
+
+        assert_eq!(open_record_stream(&key, &all).unwrap(), b"first-second");
+        all.pop();
+        assert!(open_record_stream(&key, &all).is_err());
     }
 }

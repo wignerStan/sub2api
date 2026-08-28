@@ -236,6 +236,7 @@ fn forwarded_headers(
         }
         if name == HOST
             || name == ACCEPT_ENCODING
+            || name == CONTENT_LENGTH
             || name == HeaderName::from_static("sec-websocket-extensions")
             || name.as_str().starts_with("x-s2s-")
             || name == ACCOUNT_ID_HEADER
@@ -357,6 +358,9 @@ async fn http_tunnel(
         }
     }
 
+    // Metadata normalization can change the body length, so never reuse a
+    // client-supplied Content-Length after rebuilding the outbound request.
+    builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
     builder = builder.body(transformed_body);
 
     let response = match builder.send().await {
@@ -440,17 +444,17 @@ async fn http_tunnel_e2ee(
     builder = builder.headers(forwarded);
     builder = builder.header(ACCEPT_ENCODING, "identity");
 
-    // Read sealed E2EE request body and decrypt
+    // Read sealed E2EE request body and decrypt. HTTP bodies are complete
+    // record streams; leftover bytes therefore indicate a truncated request.
     let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let mut decoder = e2ee::RecordDecoder::new();
     let plain_body = if sealed_bytes.is_empty() {
         Vec::new()
     } else {
-        match decoder.push(&key, &sealed_bytes) {
+        match e2ee::open_record_stream(&key, &sealed_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "e2ee decode failed");
@@ -491,6 +495,9 @@ async fn http_tunnel_e2ee(
         }
     }
 
+    // The inbound loopback body is ciphertext and metadata normalization can
+    // also change plaintext length. Always describe the actual upstream body.
+    builder = builder.header(CONTENT_LENGTH, transformed_body.len() as u64);
     builder = builder.body(transformed_body);
 
     let response = match builder.send().await {
@@ -576,11 +583,23 @@ async fn pump_ws(
         match (&e2ee_key, message) {
             (Some(key), TsMessage::Text(text)) => match e2ee::seal(key, text.as_bytes()) {
                 Ok(sealed) => TsMessage::Binary(sealed.into()),
-                Err(_) => TsMessage::Text(text),
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2ee server WS frame encryption failed");
+                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "e2ee frame encryption failed".into(),
+                    }))
+                }
             },
             (Some(key), TsMessage::Binary(bytes)) => match e2ee::seal(key, &bytes) {
                 Ok(sealed) => TsMessage::Binary(sealed.into()),
-                Err(_) => TsMessage::Binary(bytes),
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2ee server WS frame encryption failed");
+                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "e2ee frame encryption failed".into(),
+                    }))
+                }
             },
             (_, message) => message,
         }
@@ -596,14 +615,26 @@ async fn pump_ws(
                     Ok(text) => TsMessage::text(text),
                     Err(e) => TsMessage::Binary(e.into_bytes().into()),
                 },
-                Err(_) => TsMessage::Text(text),
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2ee client WS frame authentication failed");
+                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "invalid encrypted websocket frame".into(),
+                    }))
+                }
             },
             (Some(key), TsMessage::Binary(bytes)) => match e2ee::open(key, &bytes) {
                 Ok(plain) => match String::from_utf8(plain) {
                     Ok(text) => TsMessage::text(text),
                     Err(e) => TsMessage::Binary(e.into_bytes().into()),
                 },
-                Err(_) => TsMessage::Binary(bytes),
+                Err(err) => {
+                    tracing::warn!(error = %err, "e2ee client WS frame authentication failed");
+                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "invalid encrypted websocket frame".into(),
+                    }))
+                }
             },
             (_, message) => message,
         };
@@ -704,7 +735,10 @@ async fn ws_tunnel(
     let e2ee_key = match headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) {
         Some("1") => match e2ee::derive_key_from_token(state.token.as_bytes()) {
             Ok(key) => Some(key),
-            Err(_) => None,
+            Err(error) => {
+                tracing::error!(error = %error, "e2ee websocket key derivation failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         },
         _ => None,
     };
