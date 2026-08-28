@@ -58,7 +58,24 @@ func shouldUseSidecarTLSURL(u *url.URL) bool {
 	if scheme != "https" && scheme != "wss" {
 		return false
 	}
-	return isOpenAIOAuthSidecarHost(u.Hostname())
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if !isOpenAIOAuthSidecarHost(host) {
+		return false
+	}
+
+	// 1. auth.openai.com: OAuth token exchange, token refresh, user-auth-credential APIs
+	if host == "auth.openai.com" || strings.HasSuffix(host, ".auth.openai.com") {
+		return true
+	}
+
+	// 2. chatgpt.com / chat.openai.com: ONLY Codex CLI / wham / files / conversation endpoints
+	p := strings.TrimSpace(u.Path)
+	return strings.HasPrefix(p, "/backend-api/codex/") ||
+		p == "/backend-api/codex" ||
+		strings.HasPrefix(p, "/backend-api/wham/") ||
+		p == "/backend-api/wham" ||
+		strings.HasPrefix(p, "/backend-api/files") ||
+		strings.HasPrefix(p, "/backend-api/conversation")
 }
 
 func isOpenAIOAuthSidecarHost(host string) bool {

@@ -71,7 +71,14 @@ func disableOpenAITraining(ctx context.Context, clientFactory PrivacyClientFacto
 
 	if resp.StatusCode == 403 || resp.StatusCode == 503 {
 		body := resp.String()
-		if strings.Contains(body, "cloudflare") || strings.Contains(body, "cf-") || strings.Contains(body, "Just a moment") {
+		lowerBody := strings.ToLower(body)
+		if strings.Contains(lowerBody, "cloudflare") ||
+			strings.Contains(lowerBody, "cf-") ||
+			strings.Contains(lowerBody, "_cf_") ||
+			strings.Contains(lowerBody, "just a moment") ||
+			strings.Contains(lowerBody, "challenge-platform") ||
+			strings.Contains(lowerBody, "challenge-error-text") ||
+			strings.Contains(lowerBody, "<html") {
 			slog.Warn("openai_privacy_cf_blocked", "status", resp.StatusCode)
 			return PrivacyModeCFBlocked
 		}

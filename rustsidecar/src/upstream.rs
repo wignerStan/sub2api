@@ -54,12 +54,13 @@ fn is_allowed_codex_path(host: &str, path: &str) -> bool {
             || path.starts_with("/api/accounts/");
     }
 
-    // ChatGPT / Codex paths
+    // ChatGPT / Codex paths (strictly CLI & usage endpoints, blocking REST/Web APIs)
     path == "/backend-api/codex/responses"
         || path == "/backend-api/codex/models"
         || path == "/backend-api/codex/compact"
         || path == "/backend-api/codex/call_proxy"
         || path == "/backend-api/wham/usage"
+        || path.starts_with("/backend-api/wham/")
         || path == "/backend-api/files"
         || path.starts_with("/backend-api/files/")
         || path == "/backend-api/conversation"
@@ -91,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ssrf_and_non_oauth_hosts() {
+    fn rejects_ssrf_non_oauth_hosts_and_rest_apis() {
         for raw in [
             "",
             "https://api.openai.com/v1/models",
@@ -105,6 +106,10 @@ mod tests {
             "https://user:pass@chatgpt.com/backend-api/codex/responses",
             "https://chatgpt.com/admin/delete-everything",
             "https://chatgpt.com/random-unknown-endpoint",
+            // REST / Web endpoints must be blocked by sidecar (handled directly by Go ImpersonateChrome)
+            "https://chatgpt.com/backend-api/settings/account_user_setting",
+            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+            "https://chatgpt.com/backend-api/subscriptions",
         ] {
             assert!(!allowed_codex_upstream_url(raw), "{raw}");
         }

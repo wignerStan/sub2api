@@ -121,23 +121,19 @@ func CreatePrivacyReqClient(proxyURL string) (*req.Client, error) {
 	return CreatePrivacyReqClientWithConfig(nil, proxyURL)
 }
 
-// NewPrivacyReqClientFactory returns a privacy client factory that sends
-// official OpenAI OAuth hosts through the rustls sidecar when enabled.
+// NewPrivacyReqClientFactory returns a privacy client factory that uses
+// Chrome browser impersonation (JA3/JA4 TLS + headers) for ChatGPT Web endpoints.
 func NewPrivacyReqClientFactory(cfg *config.Config) service.PrivacyClientFactory {
 	return func(proxyURL string) (*req.Client, error) {
 		return CreatePrivacyReqClientWithConfig(cfg, proxyURL)
 	}
 }
 
-func CreatePrivacyReqClientWithConfig(cfg *config.Config, proxyURL string) (*req.Client, error) {
+func CreatePrivacyReqClientWithConfig(_ *config.Config, proxyURL string) (*req.Client, error) {
 	opts := reqClientOptions{
 		ProxyURL:    proxyURL,
 		Timeout:     30 * time.Second,
-		Impersonate: true, // unmatched hosts (tests / CF-only fallbacks) keep Chrome impersonation
+		Impersonate: true, // ChatGPT Web settings/accounts APIs require Chrome browser TLS fingerprint and headers
 	}
-	sidecar := sidecarOptsFromConfig(cfg)
-	opts.SidecarEnabled = sidecar.SidecarEnabled
-	opts.SidecarBaseURL = sidecar.SidecarBaseURL
-	opts.SidecarToken = sidecar.SidecarToken
 	return getSharedReqClient(opts)
 }

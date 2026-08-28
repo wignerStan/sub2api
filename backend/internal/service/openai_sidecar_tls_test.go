@@ -24,15 +24,12 @@ func TestShouldUseSidecarTLSURL(t *testing.T) {
 		"wss://chatgpt.com/backend-api/codex/responses",
 		"https://chatgpt.com/backend-api/codex/models",
 		"https://chatgpt.com/backend-api/wham/usage",
-		"https://chatgpt.com/backend-api/settings/account_user_setting",
-		"https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
 		"https://chatgpt.com/backend-api/files",
-		"https://chatgpt.com/",
+		"https://chatgpt.com/backend-api/conversation/c_123/attachment/a_456/download",
 		"https://ab.chatgpt.com/backend-api/wham/usage",
 		"https://chat.openai.com/backend-api/codex/responses",
 		"https://auth.openai.com/oauth/token",
 		"https://auth.openai.com/api/accounts/v1/agent/runtime/task/register",
-		"https://chatgpt.com/backend-api/codex/responses/../../../backend-api/wham/usage",
 	}
 	for _, raw := range yes {
 		require.True(t, ShouldUseSidecarTLSURL(raw), raw)
@@ -41,6 +38,10 @@ func TestShouldUseSidecarTLSURL(t *testing.T) {
 	no := []string{
 		"",
 		"://bad",
+		"https://chatgpt.com/",
+		"https://chatgpt.com/backend-api/settings/account_user_setting",
+		"https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+		"https://chatgpt.com/backend-api/subscriptions",
 		"http://chatgpt.com/backend-api/codex/responses",
 		"ws://chatgpt.com/backend-api/codex/call_proxy",
 		"https://api.openai.com/v1/responses",
