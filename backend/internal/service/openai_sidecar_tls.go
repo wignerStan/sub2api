@@ -58,24 +58,62 @@ func shouldUseSidecarTLSURL(u *url.URL) bool {
 	if scheme != "https" && scheme != "wss" {
 		return false
 	}
+	if u.User != nil {
+		if u.User.Username() != "" {
+			return false
+		}
+		if _, ok := u.User.Password(); ok {
+			return false
+		}
+	}
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	if !isOpenAIOAuthSidecarHost(host) {
 		return false
 	}
 
-	// 1. auth.openai.com: OAuth token exchange, token refresh, user-auth-credential APIs
-	if host == "auth.openai.com" || strings.HasSuffix(host, ".auth.openai.com") {
-		return true
+	// Match against the escaped path so percent-encoded separators cannot be
+	// interpreted as routing structure by Go when the Rust URL parser would keep
+	// them inside a segment. Reject dot segments because rust-url normalizes them
+	// before the sidecar allowlist is evaluated.
+	p := u.EscapedPath()
+	if hasOpenAISidecarDotSegment(p) {
+		return false
 	}
 
-	// 2. chatgpt.com / chat.openai.com: ONLY Codex CLI / wham / files / conversation endpoints
-	p := strings.TrimSpace(u.Path)
+	// 1. auth.openai.com: only OAuth/token and account-auth API traffic belongs
+	// on the Codex sidecar. Browser/login/UI routes remain on the origin transport.
+	if host == "auth.openai.com" || strings.HasSuffix(host, ".auth.openai.com") {
+		return shouldUseOpenAIAuthSidecarPath(p)
+	}
+
+	// 2. chatgpt.com / chat.openai.com: only explicit Codex CLI and wham
+	// endpoints are classified automatically. Files/conversation traffic is
+	// transport-neutral and must be routed explicitly by its owning caller.
+	return shouldUseOpenAIChatSidecarPath(p)
+}
+
+func shouldUseOpenAIAuthSidecarPath(p string) bool {
+	return strings.HasPrefix(p, "/oauth/") ||
+		p == "/api/v1/oauth/token" ||
+		strings.HasPrefix(p, "/api/accounts/")
+}
+
+func shouldUseOpenAIChatSidecarPath(p string) bool {
 	return strings.HasPrefix(p, "/backend-api/codex/") ||
-		p == "/backend-api/codex" ||
-		strings.HasPrefix(p, "/backend-api/wham/") ||
-		p == "/backend-api/wham" ||
-		strings.HasPrefix(p, "/backend-api/files") ||
-		strings.HasPrefix(p, "/backend-api/conversation")
+		strings.HasPrefix(p, "/backend-api/wham/")
+}
+
+func hasOpenAISidecarDotSegment(p string) bool {
+	for _, segment := range strings.Split(p, "/") {
+		decoded, err := url.PathUnescape(segment)
+		if err != nil {
+			return true
+		}
+		if decoded == "." || decoded == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func isOpenAIOAuthSidecarHost(host string) bool {
