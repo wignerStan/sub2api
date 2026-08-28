@@ -9,6 +9,23 @@ use super::types::{
     UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS,
 };
 
+pub(super) fn parse_wire_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()))
+}
+
+pub(super) fn parse_turn_metadata_object(raw: &str) -> Result<Value, MimicError> {
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| MimicError::InvalidJson(format!("x-codex-turn-metadata: {error}")))?;
+    if !value.is_object() {
+        return Err(MimicError::InvalidJson(
+            "x-codex-turn-metadata must be a JSON object".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
 /// Sanitize client_metadata in place:
 /// 1. Allowed keys (in ALLOWED_FLAT_CLIENT_METADATA_KEYS): kept.
 /// 2. Explicitly stripped keys (in UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS / EXPLICITLY_STRIPPED_*): stripped normally.
@@ -49,16 +66,47 @@ pub fn sanitize_client_metadata(
         }
 
         // 4. Validate fingerprint consistency across flat client_metadata fields (Do not align; reject divergence with 403)
-        let flat_session = map.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_thread = map.get("thread_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_install = map.get("x-codex-installation-id").or_else(|| map.get("installation_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_parent_thread = map.get("x-codex-parent-thread-id").or_else(|| map.get("parent_thread_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_subagent = map.get("x-openai-subagent").or_else(|| map.get("subagent_header")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_win_id = map.get("window_id").or_else(|| map.get("x-codex-window-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_win_num = map.get("window_number").and_then(|v| {
-            v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-        });
-        let flat_prev_win = map.get("previous_window_id").or_else(|| map.get("context_window_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let flat_session = map
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_thread = map
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_install = map
+            .get("x-codex-installation-id")
+            .or_else(|| map.get("installation_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_parent_thread = map
+            .get("x-codex-parent-thread-id")
+            .or_else(|| map.get("parent_thread_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_subagent = map
+            .get("x-openai-subagent")
+            .or_else(|| map.get("subagent_header"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_win_id = map
+            .get("window_id")
+            .or_else(|| map.get("x-codex-window-id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let flat_win_num = match map.get("window_number") {
+            Some(value) => Some(parse_wire_u64(value).ok_or_else(|| {
+                MimicError::ForbiddenDivergingFingerprint(
+                    "flat window_number is not an unsigned integer".to_string(),
+                )
+            })?),
+            None => None,
+        };
+        let flat_prev_win = map
+            .get("previous_window_id")
+            .or_else(|| map.get("context_window_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         // Validate parent_thread_id UUID format if present
         if let Some(ref p_th) = flat_parent_thread {
@@ -91,7 +139,8 @@ pub fn sanitize_client_metadata(
                     if let Some(ref prev) = flat_prev_win {
                         if parsed_num == 0 {
                             return Err(MimicError::ForbiddenDivergingFingerprint(
-                                "previous_window_id cannot exist when window_number is 0".to_string(),
+                                "previous_window_id cannot exist when window_number is 0"
+                                    .to_string(),
                             ));
                         }
                         let exp_prev = format!("{}:{}", win_tid, parsed_num - 1);
@@ -115,108 +164,196 @@ pub fn sanitize_client_metadata(
 
         // 5. Open Schema on nested x-codex-turn-metadata: sanitize workspaces, validate divergence
         if let Some(turn_meta_val) = map.get_mut("x-codex-turn-metadata") {
-            if let Some(turn_meta_str) = turn_meta_val.as_str() {
-                if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
-                    if let Some(tm_map) = tm.as_object_mut() {
-                        if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
-                            if let Some(ref fsess) = flat_session {
-                                if tm_sess != fsess {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata session_id '{tm_sess}' diverges from flat session_id '{fsess}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
-                            if let Some(ref fth) = flat_thread {
-                                if tm_th != fth {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata thread_id '{tm_th}' diverges from flat thread_id '{fth}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_inst) = tm_map.get("installation_id").and_then(|v| v.as_str()) {
-                            if let Some(ref finst) = flat_install {
-                                if tm_inst != finst {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata installation_id '{tm_inst}' diverges from flat installation_id '{finst}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
-                            if let Some(ref fparent) = flat_parent_thread {
-                                if tm_parent != fparent {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata parent_thread_id '{tm_parent}' diverges from flat parent_thread_id '{fparent}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
-                            if let Some(ref fsub) = flat_subagent {
-                                if tm_sub != fsub {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata subagent_header '{tm_sub}' diverges from flat subagent '{fsub}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
-                            if let Some(ref fwin) = flat_win_id {
-                                if tm_win != fwin {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata window_id '{tm_win}' diverges from flat window_id '{fwin}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_wnum) = tm_map.get("window_number").and_then(|v| v.as_u64()) {
-                            if let Some(fwnum) = flat_win_num {
-                                if tm_wnum != fwnum {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "turn_metadata window_number '{tm_wnum}' diverges from flat window_number '{fwnum}'"
-                                    )));
-                                }
-                            }
-                            if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
-                                if tm_wnum == 0 {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(
-                                        "turn_metadata previous_window_id cannot exist when window_number is 0".to_string(),
-                                    ));
-                                }
-                                let tm_th = tm_map.get("thread_id").and_then(|v| v.as_str()).unwrap_or("");
-                                if !tm_th.is_empty() {
-                                    let exp_prev = format!("{}:{}", tm_th, tm_wnum - 1);
-                                    if tm_prev != exp_prev {
-                                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                            "turn_metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
-                                        )));
-                                    }
-                                }
-                            }
-                        }
+            let turn_meta_str = turn_meta_val.as_str().ok_or_else(|| {
+                MimicError::InvalidJson(
+                    "x-codex-turn-metadata client_metadata value must be a JSON string".to_string(),
+                )
+            })?;
+            let mut tm = parse_turn_metadata_object(turn_meta_str)?;
+            let tm_map = tm
+                .as_object_mut()
+                .expect("parse_turn_metadata_object returned a non-object");
 
-                        if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
-                            let mut sanitized_workspaces = serde_json::Map::new();
-                            for (ws_path, ws_info) in workspaces.iter_mut() {
-                                if let Some(ws_map) = ws_info.as_object_mut() {
-                                    // Strip associated_remote_urls (git remote)
-                                    ws_map.remove("associated_remote_urls");
-                                }
-                                let clean_path = sanitize_workspace_path(ws_path, identity);
-                                sanitized_workspaces.insert(clean_path, ws_info.clone());
-                            }
-                            *workspaces = sanitized_workspaces;
-                        }
-                    }
-                    if let Ok(sanitized_str) = serde_json::to_string(&tm) {
-                        *turn_meta_val = json!(sanitized_str);
+            if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
+                if let Some(ref fsess) = flat_session {
+                    if tm_sess != fsess {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata session_id '{tm_sess}' diverges from flat session_id '{fsess}'"
+                        )));
                     }
                 }
             }
+            if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
+                if let Some(ref fth) = flat_thread {
+                    if tm_th != fth {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata thread_id '{tm_th}' diverges from flat thread_id '{fth}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_inst) = tm_map.get("installation_id").and_then(|v| v.as_str()) {
+                if let Some(ref finst) = flat_install {
+                    if tm_inst != finst {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata installation_id '{tm_inst}' diverges from flat installation_id '{finst}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
+                if let Some(ref fparent) = flat_parent_thread {
+                    if tm_parent != fparent {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata parent_thread_id '{tm_parent}' diverges from flat parent_thread_id '{fparent}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
+                if let Some(ref fsub) = flat_subagent {
+                    if tm_sub != fsub {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata subagent_header '{tm_sub}' diverges from flat subagent '{fsub}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
+                if let Some(ref fwin) = flat_win_id {
+                    if tm_win != fwin {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata window_id '{tm_win}' diverges from flat window_id '{fwin}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_wnum_value) = tm_map.get("window_number") {
+                let tm_wnum = parse_wire_u64(tm_wnum_value).ok_or_else(|| {
+                    MimicError::ForbiddenDivergingFingerprint(
+                        "turn_metadata window_number is not an unsigned integer".to_string(),
+                    )
+                })?;
+                if let Some(fwnum) = flat_win_num {
+                    if tm_wnum != fwnum {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "turn_metadata window_number '{tm_wnum}' diverges from flat window_number '{fwnum}'"
+                        )));
+                    }
+                }
+                if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
+                    if tm_wnum == 0 {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(
+                            "turn_metadata previous_window_id cannot exist when window_number is 0"
+                                .to_string(),
+                        ));
+                    }
+                    let tm_th = tm_map
+                        .get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .or(flat_thread.as_deref())
+                        .unwrap_or("");
+                    if !tm_th.is_empty() {
+                        let exp_prev = format!("{}:{}", tm_th, tm_wnum - 1);
+                        if tm_prev != exp_prev {
+                            return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                                "turn_metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
+                let mut sanitized_workspaces = serde_json::Map::new();
+                for (ws_path, ws_info) in workspaces.iter_mut() {
+                    if let Some(ws_map) = ws_info.as_object_mut() {
+                        // Strip associated_remote_urls (git remote)
+                        ws_map.remove("associated_remote_urls");
+                    }
+                    let clean_path = sanitize_workspace_path(ws_path, identity);
+                    sanitized_workspaces.insert(clean_path, ws_info.clone());
+                }
+                *workspaces = sanitized_workspaces;
+            }
+
+            let sanitized_str = serde_json::to_string(&tm)
+                .map_err(|error| MimicError::InvalidJson(error.to_string()))?;
+            *turn_meta_val = json!(sanitized_str);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_identity() -> ConvergedIdentity {
+        ConvergedIdentity::new("seed", Some("session"), None, "salt", Some("0.1.183"), 2)
+    }
+
+    #[test]
+    fn rejects_malformed_nested_turn_metadata() {
+        let mut metadata = json!({"x-codex-turn-metadata": "{"});
+        let err = sanitize_client_metadata(
+            &mut metadata,
+            &test_identity(),
+            UnknownFieldPolicy::Forbidden,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MimicError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn validates_string_encoded_nested_window_number() {
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        let window_id = format!("{thread_id}:2");
+        let turn_metadata = json!({
+            "thread_id": thread_id,
+            "window_id": window_id.clone(),
+            "window_number": "3"
+        })
+        .to_string();
+        let mut metadata = json!({
+            "thread_id": thread_id,
+            "window_id": window_id,
+            "window_number": "2",
+            "x-codex-turn-metadata": turn_metadata
+        });
+
+        let err = sanitize_client_metadata(
+            &mut metadata,
+            &test_identity(),
+            UnknownFieldPolicy::Forbidden,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MimicError::ForbiddenDivergingFingerprint(_)));
+    }
+
+    #[test]
+    fn accepts_matching_string_encoded_nested_window_number() {
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        let window_id = format!("{thread_id}:2");
+        let turn_metadata = json!({
+            "thread_id": thread_id,
+            "window_id": window_id.clone(),
+            "window_number": "2"
+        })
+        .to_string();
+        let mut metadata = json!({
+            "thread_id": thread_id,
+            "window_id": window_id,
+            "window_number": "2",
+            "x-codex-turn-metadata": turn_metadata
+        });
+
+        sanitize_client_metadata(
+            &mut metadata,
+            &test_identity(),
+            UnknownFieldPolicy::Forbidden,
+        )
+        .unwrap();
+    }
 }

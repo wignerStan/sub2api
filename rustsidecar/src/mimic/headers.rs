@@ -1,9 +1,9 @@
 //! HTTP and WebSocket request headers sanitization, normalization, and fingerprint verification.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use serde_json::Value;
 
 use super::identity::sanitize_workspace_path;
+use super::metadata::{parse_turn_metadata_object, parse_wire_u64};
 use super::types::{
     ConvergedIdentity, MimicError, UnknownFieldPolicy, ALLOWED_ACCOUNT_X_HEADERS,
     ALLOWED_RESPONSES_X_HEADERS, EXPLICITLY_STRIPPED_ATTESTATION_NAMES,
@@ -93,9 +93,15 @@ pub fn sanitize_and_inject_headers_for_request(
     }
 
     let (allowed_x_headers, stripped_x_headers) = if is_responses_path {
-        (ALLOWED_RESPONSES_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS)
+        (
+            ALLOWED_RESPONSES_X_HEADERS,
+            UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS,
+        )
     } else {
-        (ALLOWED_ACCOUNT_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS)
+        (
+            ALLOWED_ACCOUNT_X_HEADERS,
+            UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,
+        )
     };
 
     let mut keys_to_remove: Vec<HeaderName> = Vec::new();
@@ -133,7 +139,11 @@ pub fn sanitize_and_inject_headers_for_request(
     }
 
     // 2. Normalize or inject User-Agent header to strictly match simulated OS/arch
-    let os_display = if identity.os == "darwin" { "Darwin" } else { "Linux" };
+    let os_display = if identity.os == "darwin" {
+        "Darwin"
+    } else {
+        "Linux"
+    };
     let arch_display = &identity.arch;
     let ver = &identity.client_version;
 
@@ -246,7 +256,10 @@ pub fn sanitize_and_inject_headers_for_request(
         }
 
         // Ensure originator and version headers
-        headers.insert(HeaderName::from_static("originator"), HeaderValue::from_static("codex_cli_rs"));
+        headers.insert(
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("codex_cli_rs"),
+        );
         if let Ok(v) = HeaderValue::from_str(&identity.client_version) {
             headers.insert(HeaderName::from_static("version"), v);
         }
@@ -268,7 +281,10 @@ pub fn sanitize_and_inject_headers_for_request(
             .map(|s| s.trim().to_string());
 
         // Validate or generate valid UUID for x-client-request-id
-        let needs_client_req_id = match headers.get("x-client-request-id").and_then(|v| v.to_str().ok()) {
+        let needs_client_req_id = match headers
+            .get("x-client-request-id")
+            .and_then(|v| v.to_str().ok())
+        {
             Some(s) => uuid::Uuid::parse_str(s).is_err(),
             None => true,
         };
@@ -281,90 +297,172 @@ pub fn sanitize_and_inject_headers_for_request(
 
         // Check divergence in x-codex-turn-metadata if present
         if let Some(turn_meta_val) = headers.get_mut("x-codex-turn-metadata") {
-            if let Ok(turn_meta_str) = turn_meta_val.to_str() {
-                if let Ok(mut tm) = serde_json::from_str::<Value>(turn_meta_str) {
-                    if let Some(tm_map) = tm.as_object_mut() {
-                        if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
-                            if tm_sess != session_val {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                    "x-codex-turn-metadata session_id '{tm_sess}' diverges from session-id header '{session_val}'"
-                                )));
-                            }
-                        }
-                        if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
-                            if tm_th != win_tid {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                    "x-codex-turn-metadata thread_id '{tm_th}' diverges from x-codex-window-id prefix '{win_tid}'"
-                                )));
-                            }
-                        }
-                        if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
-                            if let Some(ref hp) = hdr_parent_thread {
-                                if tm_parent != hp {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "x-codex-turn-metadata parent_thread_id '{tm_parent}' diverges from header '{hp}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
-                            if let Some(ref hs) = hdr_subagent {
-                                if tm_sub != hs {
-                                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                        "x-codex-turn-metadata subagent_header '{tm_sub}' diverges from header '{hs}'"
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
-                            if tm_win != win_val {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                    "x-codex-turn-metadata window_id '{tm_win}' diverges from x-codex-window-id header '{win_val}'"
-                                )));
-                            }
-                        }
-                        if let Some(tm_wnum) = tm_map.get("window_number").and_then(|v| v.as_u64()) {
-                            if tm_wnum != win_num {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                    "x-codex-turn-metadata window_number '{tm_wnum}' diverges from x-codex-window-id suffix '{win_num}'"
-                                )));
-                            }
-                        }
-                        if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
-                            if win_num == 0 {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(
-                                    "x-codex-turn-metadata previous_window_id cannot exist when window_number is 0".to_string(),
-                                ));
-                            }
-                            let exp_prev = format!("{}:{}", win_tid, win_num - 1);
-                            if tm_prev != exp_prev {
-                                return Err(MimicError::ForbiddenDivergingFingerprint(format!(
-                                    "x-codex-turn-metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
-                                )));
-                            }
-                        }
+            let turn_meta_str = turn_meta_val.to_str().map_err(|_| {
+                MimicError::InvalidJson(
+                    "x-codex-turn-metadata header must contain UTF-8 JSON".to_string(),
+                )
+            })?;
+            let mut tm = parse_turn_metadata_object(turn_meta_str)?;
+            let tm_map = tm
+                .as_object_mut()
+                .expect("parse_turn_metadata_object returned a non-object");
 
-                        if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
-                            let mut sanitized_workspaces = serde_json::Map::new();
-                            for (ws_path, ws_info) in workspaces.iter_mut() {
-                                if let Some(ws_map) = ws_info.as_object_mut() {
-                                    ws_map.remove("associated_remote_urls");
-                                }
-                                let clean_path = sanitize_workspace_path(ws_path, &identity);
-                                sanitized_workspaces.insert(clean_path, ws_info.clone());
-                            }
-                            *workspaces = sanitized_workspaces;
-                        }
-                    }
-                    if let Ok(sanitized_str) = serde_json::to_string(&tm) {
-                        if let Ok(v) = HeaderValue::from_str(&sanitized_str) {
-                            *turn_meta_val = v;
-                        }
+            if let Some(tm_sess) = tm_map.get("session_id").and_then(|v| v.as_str()) {
+                if tm_sess != session_val {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-turn-metadata session_id '{tm_sess}' diverges from session-id header '{session_val}'"
+                    )));
+                }
+            }
+            if let Some(tm_th) = tm_map.get("thread_id").and_then(|v| v.as_str()) {
+                if tm_th != win_tid {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-turn-metadata thread_id '{tm_th}' diverges from x-codex-window-id prefix '{win_tid}'"
+                    )));
+                }
+            }
+            if let Some(tm_parent) = tm_map.get("parent_thread_id").and_then(|v| v.as_str()) {
+                if let Some(ref hp) = hdr_parent_thread {
+                    if tm_parent != hp {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "x-codex-turn-metadata parent_thread_id '{tm_parent}' diverges from header '{hp}'"
+                        )));
                     }
                 }
             }
+            if let Some(tm_sub) = tm_map.get("subagent_header").and_then(|v| v.as_str()) {
+                if let Some(ref hs) = hdr_subagent {
+                    if tm_sub != hs {
+                        return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                            "x-codex-turn-metadata subagent_header '{tm_sub}' diverges from header '{hs}'"
+                        )));
+                    }
+                }
+            }
+            if let Some(tm_win) = tm_map.get("window_id").and_then(|v| v.as_str()) {
+                if tm_win != win_val {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-turn-metadata window_id '{tm_win}' diverges from x-codex-window-id header '{win_val}'"
+                    )));
+                }
+            }
+            if let Some(tm_wnum_value) = tm_map.get("window_number") {
+                let tm_wnum = parse_wire_u64(tm_wnum_value).ok_or_else(|| {
+                    MimicError::ForbiddenDivergingFingerprint(
+                        "x-codex-turn-metadata window_number is not an unsigned integer"
+                            .to_string(),
+                    )
+                })?;
+                if tm_wnum != win_num {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-turn-metadata window_number '{tm_wnum}' diverges from x-codex-window-id suffix '{win_num}'"
+                    )));
+                }
+            }
+            if let Some(tm_prev) = tm_map.get("previous_window_id").and_then(|v| v.as_str()) {
+                if win_num == 0 {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(
+                        "x-codex-turn-metadata previous_window_id cannot exist when window_number is 0"
+                            .to_string(),
+                    ));
+                }
+                let exp_prev = format!("{}:{}", win_tid, win_num - 1);
+                if tm_prev != exp_prev {
+                    return Err(MimicError::ForbiddenDivergingFingerprint(format!(
+                        "x-codex-turn-metadata previous_window_id '{tm_prev}' diverges from expected '{exp_prev}'"
+                    )));
+                }
+            }
+
+            if let Some(workspaces) = tm_map.get_mut("workspaces").and_then(|w| w.as_object_mut()) {
+                let mut sanitized_workspaces = serde_json::Map::new();
+                for (ws_path, ws_info) in workspaces.iter_mut() {
+                    if let Some(ws_map) = ws_info.as_object_mut() {
+                        ws_map.remove("associated_remote_urls");
+                    }
+                    let clean_path = sanitize_workspace_path(ws_path, &identity);
+                    sanitized_workspaces.insert(clean_path, ws_info.clone());
+                }
+                *workspaces = sanitized_workspaces;
+            }
+
+            let sanitized_str = serde_json::to_string(&tm)
+                .map_err(|error| MimicError::InvalidJson(error.to_string()))?;
+            *turn_meta_val =
+                HeaderValue::from_bytes(sanitized_str.as_bytes()).map_err(|error| {
+                    MimicError::InvalidJson(format!(
+                        "x-codex-turn-metadata cannot be encoded as an HTTP header: {error}"
+                    ))
+                })?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    const THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn response_headers(turn_metadata: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", HeaderValue::from_static("session-1"));
+        headers.insert(
+            "x-codex-window-id",
+            HeaderValue::from_static("11111111-1111-4111-8111-111111111111:2"),
+        );
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_str(turn_metadata).expect("valid test header"),
+        );
+        headers
+    }
+
+    fn sanitize(headers: &mut HeaderMap) -> Result<(), MimicError> {
+        sanitize_and_inject_headers_for_request(
+            headers,
+            "seed",
+            Some("session-1"),
+            None,
+            "salt",
+            Some("0.1.183"),
+            2,
+            true,
+            false,
+            UnknownFieldPolicy::Forbidden,
+        )
+    }
+
+    #[test]
+    fn rejects_malformed_turn_metadata_header() {
+        let mut headers = response_headers("{");
+        let err = sanitize(&mut headers).unwrap_err();
+        assert!(matches!(err, MimicError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn validates_string_encoded_turn_metadata_window_number() {
+        let mismatch = serde_json::json!({
+            "session_id": "session-1",
+            "thread_id": THREAD_ID,
+            "window_id": format!("{THREAD_ID}:2"),
+            "window_number": "3"
+        })
+        .to_string();
+        let mut headers = response_headers(&mismatch);
+        let err = sanitize(&mut headers).unwrap_err();
+        assert!(matches!(err, MimicError::ForbiddenDivergingFingerprint(_)));
+
+        let matching = serde_json::json!({
+            "session_id": "session-1",
+            "thread_id": THREAD_ID,
+            "window_id": format!("{THREAD_ID}:2"),
+            "window_number": "2"
+        })
+        .to_string();
+        let mut headers = response_headers(&matching);
+        sanitize(&mut headers).unwrap();
+    }
 }

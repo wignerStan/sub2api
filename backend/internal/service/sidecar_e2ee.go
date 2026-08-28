@@ -34,15 +34,18 @@ const (
 	sidecarE2EESalt         = "sub2api-e2ee-v1"
 	sidecarE2EEAAD          = "sub2api-e2ee"
 	maxSidecarRecordPayload = 64 * 1024 * 1024 // 64 MB guard against unbounded memory allocation
+	minSidecarRecordPayload = sidecarE2EENonce + sidecarE2EETag
 )
 
 var (
-	errSidecarE2EEShort    = errors.New("e2ee record too short")
-	errSidecarE2EEHeader   = errors.New("unsupported e2ee record header")
-	errSidecarE2EETooLarge = errors.New("e2ee record payload too large")
-	errSidecarE2EETrunc    = errors.New("e2ee record truncated")
-	errSidecarE2EEAuth     = errors.New("e2ee record authentication failed")
-	errSidecarE2EEKeyInfo  = errors.New("invalid e2ee key info")
+	errSidecarE2EEShort        = errors.New("e2ee record too short")
+	errSidecarE2EEHeader       = errors.New("unsupported e2ee record header")
+	errSidecarE2EEPayloadShort = errors.New("e2ee record payload too short")
+	errSidecarE2EETooLarge     = errors.New("e2ee record payload too large")
+	errSidecarE2EETrunc        = errors.New("e2ee record truncated")
+	errSidecarE2EETrailing     = errors.New("e2ee record has trailing bytes")
+	errSidecarE2EEAuth         = errors.New("e2ee record authentication failed")
+	errSidecarE2EEKeyInfo      = errors.New("invalid e2ee key info")
 )
 
 func sidecarE2EEDerive(ikm []byte, info string) ([32]byte, error) {
@@ -82,6 +85,9 @@ func sidecarE2EECipher(key []byte) (cipher.AEAD, error) {
 
 // SealSidecarRecord seals plaintext into one framed record with a random nonce.
 func SealSidecarRecord(key [32]byte, plaintext []byte) ([]byte, error) {
+	if len(plaintext) > maxSidecarRecordPayload-minSidecarRecordPayload {
+		return nil, errSidecarE2EETooLarge
+	}
 	aead, err := sidecarE2EECipher(key[:])
 	if err != nil {
 		return nil, err
@@ -91,10 +97,14 @@ func SealSidecarRecord(key [32]byte, plaintext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("read nonce: %w", err)
 	}
 	sealed := aead.Seal(nil, nonce, plaintext, []byte(sidecarE2EEAAD))
-	out := make([]byte, 0, sidecarE2EEHeader+len(nonce)+len(sealed))
+	payloadLen := len(nonce) + len(sealed)
+	if payloadLen > maxSidecarRecordPayload {
+		return nil, errSidecarE2EETooLarge
+	}
+	out := make([]byte, 0, sidecarE2EEHeader+payloadLen)
 	out = append(out, sidecarE2EEMagic, sidecarE2EEVersion)
 	var lenBE [4]byte
-	binary.BigEndian.PutUint32(lenBE[:], uint32(len(nonce)+len(sealed)))
+	binary.BigEndian.PutUint32(lenBE[:], uint32(payloadLen))
 	out = append(out, lenBE[:]...)
 	out = append(out, nonce...)
 	out = append(out, sealed...)
@@ -103,25 +113,32 @@ func SealSidecarRecord(key [32]byte, plaintext []byte) ([]byte, error) {
 
 // OpenSidecarRecord opens one complete framed record.
 func OpenSidecarRecord(key [32]byte, record []byte) ([]byte, error) {
-	if len(record) < sidecarE2EEHeader+sidecarE2EENonce+sidecarE2EETag {
+	if len(record) < sidecarE2EEHeader+minSidecarRecordPayload {
 		return nil, errSidecarE2EEShort
 	}
 	if record[0] != sidecarE2EEMagic || record[1] != sidecarE2EEVersion {
 		return nil, errSidecarE2EEHeader
 	}
 	payloadLen := binary.BigEndian.Uint32(record[2:6])
+	if payloadLen < minSidecarRecordPayload {
+		return nil, errSidecarE2EEPayloadShort
+	}
 	if payloadLen > maxSidecarRecordPayload {
 		return nil, errSidecarE2EETooLarge
 	}
-	if uint32(len(record)-sidecarE2EEHeader) < payloadLen {
+	total := sidecarE2EEHeader + int(payloadLen)
+	if len(record) < total {
 		return nil, errSidecarE2EETrunc
+	}
+	if len(record) > total {
+		return nil, errSidecarE2EETrailing
 	}
 	aead, err := sidecarE2EECipher(key[:])
 	if err != nil {
 		return nil, err
 	}
 	nonce := record[sidecarE2EEHeader : sidecarE2EEHeader+sidecarE2EENonce]
-	sealed := record[sidecarE2EEHeader+sidecarE2EENonce : sidecarE2EEHeader+payloadLen]
+	sealed := record[sidecarE2EEHeader+sidecarE2EENonce : total]
 	plain, err := aead.Open(nil, nonce, sealed, []byte(sidecarE2EEAAD))
 	if err != nil {
 		return nil, errSidecarE2EEAuth
@@ -156,6 +173,9 @@ func (d *SidecarRecordDecoder) Push(key [32]byte, sealed []byte) ([]byte, error)
 			return out, errSidecarE2EEHeader
 		}
 		payloadLen := binary.BigEndian.Uint32(d.buf[2:6])
+		if payloadLen < minSidecarRecordPayload {
+			return out, errSidecarE2EEPayloadShort
+		}
 		if payloadLen > maxSidecarRecordPayload {
 			return out, errSidecarE2EETooLarge
 		}

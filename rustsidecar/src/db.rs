@@ -6,9 +6,10 @@
 //! 3. Automatic installation of non-intrusive DB notification triggers on startup.
 //! 4. Background auto-reconnecting listener loop.
 
+use moka::future::Cache;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use moka::future::Cache;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -17,6 +18,46 @@ pub struct AccountProfile {
     pub proxy_url: Option<String>,
     pub fingerprint_seed: String,
     pub custom_installation_id: Option<String>,
+}
+
+fn build_proxy_url(
+    protocol: &str,
+    host: &str,
+    port: i32,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Option<String> {
+    let scheme = protocol.trim().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+        return None;
+    }
+
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
+
+    let mut url = reqwest::Url::parse(&format!("{scheme}://localhost")).ok()?;
+    let unbracketed_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed_host.parse::<IpAddr>() {
+        url.set_ip_host(ip).ok()?;
+    } else {
+        url.set_host(Some(host)).ok()?;
+    }
+    url.set_port(Some(port)).ok()?;
+
+    if let Some(username) = username.filter(|value| !value.is_empty()) {
+        url.set_username(username).ok()?;
+        if let Some(password) = password.filter(|value| !value.is_empty()) {
+            url.set_password(Some(password)).ok()?;
+        }
+    }
+
+    Some(url.to_string())
 }
 
 #[derive(Clone)]
@@ -65,7 +106,10 @@ impl DbProxyResolver {
     }
 
     /// Resolve the account profile (proxy + fingerprint settings) for the given account_id.
-    pub async fn resolve_account_profile(&self, account_id: i64) -> Result<Option<AccountProfile>, String> {
+    pub async fn resolve_account_profile(
+        &self,
+        account_id: i64,
+    ) -> Result<Option<AccountProfile>, String> {
         if self.db_url.is_none() {
             return Ok(None);
         }
@@ -116,7 +160,9 @@ impl DbProxyResolver {
 
             if let Some(extra) = extra_val {
                 if let Some(obj) = extra.as_object() {
-                    if let Some(seed_str) = obj.get("codex_fingerprint_seed").and_then(|v| v.as_str()) {
+                    if let Some(seed_str) =
+                        obj.get("codex_fingerprint_seed").and_then(|v| v.as_str())
+                    {
                         if !seed_str.trim().is_empty() {
                             fingerprint_seed = seed_str.trim().to_string();
                         }
@@ -144,15 +190,14 @@ impl DbProxyResolver {
             let username_opt: Option<String> = row.get(5);
             let password_opt: Option<String> = row.get(6);
 
-            let proxy_url = match (protocol_opt, host_opt, port_opt) {
-                (Some(proto), Some(host), Some(port)) => {
-                    let auth = match (username_opt, password_opt) {
-                        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => format!("{u}:{p}@"),
-                        (Some(u), _) if !u.is_empty() => format!("{u}@"),
-                        _ => String::new(),
-                    };
-                    Some(format!("{proto}://{auth}{host}:{port}"))
-                }
+            let proxy_url = match (protocol_opt.as_deref(), host_opt.as_deref(), port_opt) {
+                (Some(protocol), Some(host), Some(port)) => build_proxy_url(
+                    protocol,
+                    host,
+                    port,
+                    username_opt.as_deref(),
+                    password_opt.as_deref(),
+                ),
                 _ => None,
             };
 
@@ -172,7 +217,10 @@ impl DbProxyResolver {
 
     /// Resolve only the proxy URL for the given account_id.
     #[allow(dead_code)]
-    pub async fn resolve_proxy_for_account(&self, account_id: i64) -> Result<Option<String>, String> {
+    pub async fn resolve_proxy_for_account(
+        &self,
+        account_id: i64,
+    ) -> Result<Option<String>, String> {
         let profile_opt = self.resolve_account_profile(account_id).await?;
         Ok(profile_opt.and_then(|p| p.proxy_url))
     }
@@ -187,7 +235,8 @@ impl DbProxyResolver {
                     // Drive connection network I/O in the background so client calls don't deadlock
                     let conn_handle = tokio::spawn(async move {
                         use futures::StreamExt;
-                        let stream = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
+                        let stream =
+                            futures::stream::poll_fn(move |cx| connection.poll_message(cx));
                         tokio::pin!(stream);
                         while let Some(msg_res) = stream.next().await {
                             match msg_res {
@@ -248,7 +297,9 @@ impl DbProxyResolver {
                     "#;
 
                     if let Err(e) = client.batch_execute(setup_triggers_sql).await {
-                        tracing::debug!("skipping auto-trigger setup (may lack DDL permissions): {e}");
+                        tracing::debug!(
+                            "skipping auto-trigger setup (may lack DDL permissions): {e}"
+                        );
                     }
 
                     if let Err(e) = client.execute("LISTEN sub2api_account_events", &[]).await {
@@ -257,7 +308,9 @@ impl DbProxyResolver {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     }
-                    tracing::info!("listening for real-time account cache invalidations on 'sub2api_account_events'");
+                    tracing::info!(
+                        "listening for real-time account cache invalidations on 'sub2api_account_events'"
+                    );
 
                     let cache_ref = self.cache.clone();
                     while let Some(notif) = rx.recv().await {
@@ -266,13 +319,17 @@ impl DbProxyResolver {
                             if let Some(event) = val.get("event").and_then(|v| v.as_str()) {
                                 match event {
                                     "update" | "delete" => {
-                                        if let Some(acc_id) = val.get("account_id").and_then(|v| v.as_i64()) {
+                                        if let Some(acc_id) =
+                                            val.get("account_id").and_then(|v| v.as_i64())
+                                        {
                                             tracing::info!(account_id = acc_id, event, "invalidating moka account cache via DB notification");
                                             cache_ref.invalidate(&acc_id).await;
                                         }
                                     }
                                     "reload" => {
-                                        tracing::info!("reloading all account moka caches via DB proxy reload notification");
+                                        tracing::info!(
+                                            "reloading all account moka caches via DB proxy reload notification"
+                                        );
                                         cache_ref.invalidate_all();
                                     }
                                     _ => {}
@@ -331,5 +388,32 @@ mod tests {
         // Invalidate key in Moka cache
         resolver.cache.invalidate(&42).await;
         assert!(resolver.cache.get(&42).await.is_none());
+    }
+
+    #[test]
+    fn proxy_url_builder_handles_ipv6_and_reserved_credentials() {
+        let raw = build_proxy_url(
+            "socks5h",
+            "::1",
+            1080,
+            Some("user@name"),
+            Some("p/a:ss@word"),
+        )
+        .expect("valid proxy URL");
+        let parsed = reqwest::Url::parse(&raw).expect("parse proxy URL");
+
+        assert_eq!(parsed.scheme(), "socks5h");
+        assert_eq!(parsed.port(), Some(1080));
+        assert!(raw.contains("@[::1]:1080"), "{raw}");
+        assert!(raw.contains("user%40name"), "{raw}");
+        assert!(!raw.contains("user@name"), "{raw}");
+    }
+
+    #[test]
+    fn proxy_url_builder_rejects_invalid_fields() {
+        assert!(build_proxy_url("ftp", "127.0.0.1", 21, None, None).is_none());
+        assert!(build_proxy_url("http", "", 8080, None, None).is_none());
+        assert!(build_proxy_url("http", "127.0.0.1", 0, None, None).is_none());
+        assert!(build_proxy_url("http", "127.0.0.1", 70_000, None, None).is_none());
     }
 }
