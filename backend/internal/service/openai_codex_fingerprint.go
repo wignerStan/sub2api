@@ -1046,6 +1046,7 @@ func sanitizeCodexOutboundAssociationHeaders(h http.Header) {
 		"request-timeout",
 		"grpc-timeout",
 		"x-codex-beta-features",
+		"x-codex-routing-hint",
 		openAICodexTurnStateHeader,
 	} {
 		deleteHeaderAllForms(h, key)
