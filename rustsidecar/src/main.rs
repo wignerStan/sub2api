@@ -604,12 +604,11 @@ fn websocket_connect_error_response(error: TsError) -> Response {
 #[cfg(test)]
 mod websocket_connect_error_tests {
     use super::*;
-    use tokio_tungstenite::tungstenite::handshake::client::Response as TsResponse;
 
     #[tokio::test]
     async fn forwards_quota_handshake_rejection() {
         let body = br#"{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}"#.to_vec();
-        let upstream = TsResponse::builder()
+        let upstream = axum::http::Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "application/json")
             .header("retry-after", "18000")
@@ -620,7 +619,7 @@ mod websocket_connect_error_tests {
             .body(Some(body.clone()))
             .expect("valid upstream rejection");
 
-        let response = websocket_connect_error_response(TsError::Http(upstream));
+        let response = websocket_connect_error_response(TsError::Http(Box::new(upstream)));
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
