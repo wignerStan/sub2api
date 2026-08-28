@@ -1,0 +1,379 @@
+name: Apply latest sync-183 review fixes
+
+on:
+  push:
+    branches:
+      - automation/sync-183-latest-review
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply reviewed fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          main = Path("rustsidecar/src/main.rs")
+          text = main.read_text()
+
+          constants_old = dedent('''\
+          const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
+          const ACCOUNT_ID_HEADER: &str = "x-account-id";
+
+          fn is_hop_by_hop''')
+          constants_new = dedent('''\
+          const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
+          const ACCOUNT_ID_HEADER: &str = "x-account-id";
+          const WS_CLOSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+          const WS_CLOSE_REASON_MAX_BYTES: usize = 123;
+
+          fn is_hop_by_hop''')
+          if text.count(constants_old) != 1:
+              raise SystemExit("main.rs: constants anchor changed")
+          text = text.replace(constants_old, constants_new, 1)
+
+          helper_marker = "\nasync fn pump_ws("
+          if text.count(helper_marker) != 1:
+              raise SystemExit("main.rs: pump marker changed")
+          helpers = dedent(r'''
+          fn truncate_ws_close_reason(reason: &str) -> String {
+              if reason.len() <= WS_CLOSE_REASON_MAX_BYTES {
+                  return reason.to_string();
+              }
+              let mut end = WS_CLOSE_REASON_MAX_BYTES;
+              while end > 0 && !reason.is_char_boundary(end) {
+                  end -= 1;
+              }
+              reason[..end].to_string()
+          }
+
+          fn ws_policy_close(reason: &str) -> TsMessage {
+              TsMessage::Close(Some(
+                  tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                      code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                      reason: truncate_ws_close_reason(reason).into(),
+                  },
+              ))
+          }
+
+          fn transform_and_classify_ws_message<F>(
+              message: TsMessage,
+              transform: F,
+          ) -> (TsMessage, bool)
+          where
+              F: FnOnce(TsMessage) -> TsMessage,
+          {
+              let message = transform(message);
+              let is_close = matches!(message, TsMessage::Close(_));
+              (message, is_close)
+          }
+
+          #[cfg(test)]
+          mod ws_close_state_tests {
+              use super::*;
+
+              #[test]
+              fn transformed_close_is_terminal_and_wire_safe() {
+                  let reason = "禁止".repeat(100);
+                  let (message, is_close) = transform_and_classify_ws_message(
+                      TsMessage::text("request"),
+                      |_| ws_policy_close(&reason),
+                  );
+                  assert!(is_close);
+                  let TsMessage::Close(Some(frame)) = message else {
+                      panic!("expected a close frame");
+                  };
+                  assert!(frame.reason.len() <= WS_CLOSE_REASON_MAX_BYTES);
+                  assert!(std::str::from_utf8(frame.reason.as_bytes()).is_ok());
+
+                  let (_, is_close) = transform_and_classify_ws_message(
+                      TsMessage::text("request"),
+                      |message| message,
+                  );
+                  assert!(!is_close);
+              }
+          }
+          ''').strip()
+          text = text.replace(helper_marker, "\n" + helpers + helper_marker, 1)
+
+          encryption_close = dedent('''\
+          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                          code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                          reason: "e2ee frame encryption failed".into(),
+                      }))''')
+          if text.count(encryption_close) != 2:
+              raise SystemExit(f"main.rs: expected two encryption close blocks, found {text.count(encryption_close)}")
+          text = text.replace(encryption_close, 'ws_policy_close("e2ee frame encryption failed")')
+
+          authentication_close = dedent('''\
+          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                          code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                          reason: "invalid encrypted websocket frame".into(),
+                      }))''')
+          if text.count(authentication_close) != 2:
+              raise SystemExit(f"main.rs: expected two authentication close blocks, found {text.count(authentication_close)}")
+          text = text.replace(authentication_close, 'ws_policy_close("invalid encrypted websocket frame")')
+
+          policy_close = dedent('''\
+          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                              code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                              reason: err.to_string().into(),
+                          }))''')
+          if text.count(policy_close) != 1:
+              raise SystemExit(f"main.rs: expected one policy close block, found {text.count(policy_close)}")
+          text = text.replace(policy_close, 'ws_policy_close(&err.to_string())', 1)
+
+          start = text.index("    let to_upstream = async {")
+          end_marker = "\n}\n\nasync fn ws_tunnel("
+          end = text.index(end_marker, start)
+          new_pump_tail = dedent(r'''
+              let to_upstream = async {
+                  while let Some(message) = client_stream.next().await {
+                      match message {
+                          Ok(message) => {
+                              let Some(ts) = axum_to_ts(message) else { continue };
+                              let (ts, is_close) =
+                                  transform_and_classify_ws_message(ts, &open_and_transform_ts);
+                              if upstream_sink.send(ts).await.is_err() {
+                                  break;
+                              }
+                              if is_close {
+                                  break;
+                              }
+                          }
+                          Err(_) => break,
+                      }
+                  }
+                  if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, upstream_sink.close())
+                      .await
+                      .is_err()
+                  {
+                      tracing::debug!("timed out closing upstream websocket sink");
+                  }
+              };
+              let to_client = async {
+                  while let Some(message) = upstream_stream.next().await {
+                      match message {
+                          Ok(message) => {
+                              let (message, is_close) =
+                                  transform_and_classify_ws_message(message, &seal_ts);
+                              if let Some(message) = ts_to_axum(message) {
+                                  if client_sink.send(message).await.is_err() {
+                                      break;
+                                  }
+                                  if is_close {
+                                      break;
+                                  }
+                              }
+                          }
+                          Err(_) => break,
+                      }
+                  }
+                  if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, client_sink.close())
+                      .await
+                      .is_err()
+                  {
+                      tracing::debug!("timed out closing downstream websocket sink");
+                  }
+              };
+
+              tokio::pin!(to_upstream);
+              tokio::pin!(to_client);
+
+              tokio::select! {
+                  _ = &mut to_client => {
+                      // Upstream finished producing responses/errors and closed the stream.
+                  }
+                  _ = &mut to_upstream => {
+                      // Closing the client write half must terminate the upstream request side.
+                      // Give the upstream a bounded window to return its final response/close.
+                      if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, to_client.as_mut())
+                          .await
+                          .is_err()
+                      {
+                          tracing::debug!("timed out draining upstream websocket after client close");
+                      }
+                  }
+              }
+          ''').rstrip()
+          text = text[:start] + new_pump_tail + text[end:]
+          main.write_text(text)
+
+          types = Path("rustsidecar/src/mimic/types.rs")
+          text = types.read_text()
+          routing_line = '    "x-codex-routing-hint",\n'
+          if text.count(routing_line) != 2:
+              raise SystemExit(f"types.rs: expected two allowed routing-hint entries, found {text.count(routing_line)}")
+          text = text.replace(routing_line, "")
+          stripped_old = dedent('''\
+          pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
+              "x-oai-attestation",
+          ];''')
+          stripped_new = dedent('''\
+          pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
+              "x-codex-routing-hint",
+              "x-oai-attestation",
+          ];''')
+          if text.count(stripped_old) != 1:
+              raise SystemExit("types.rs: stripped response header block changed")
+          types.write_text(text.replace(stripped_old, stripped_new, 1))
+
+          headers = Path("rustsidecar/src/mimic/headers.rs")
+          text = headers.read_text()
+          if "mod routing_hint_tests" in text:
+              raise SystemExit("headers.rs: routing-hint test already exists")
+          text = text.rstrip() + dedent(r'''
+
+          #[cfg(test)]
+          mod routing_hint_tests {
+              use super::*;
+
+              #[test]
+              fn strips_routing_hint_before_sidecar_egress() {
+                  const THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+                  let mut headers = HeaderMap::new();
+                  headers.insert("session-id", HeaderValue::from_static("session-1"));
+                  headers.insert("thread-id", HeaderValue::from_static(THREAD_ID));
+                  headers.insert(
+                      "x-codex-window-id",
+                      HeaderValue::from_static("11111111-1111-4111-8111-111111111111:0"),
+                  );
+                  headers.insert(
+                      "x-codex-routing-hint",
+                      HeaderValue::from_static("client-controlled-route"),
+                  );
+
+                  sanitize_and_inject_headers_for_request(
+                      &mut headers,
+                      "seed",
+                      Some("session-1"),
+                      None,
+                      "salt",
+                      Some("0.1.183"),
+                      0,
+                      true,
+                      false,
+                      UnknownFieldPolicy::Forbidden,
+                  )
+                  .expect("routing hint is explicitly stripped, not rejected");
+
+                  assert!(headers.get("x-codex-routing-hint").is_none());
+              }
+          }
+          ''')
+          headers.write_text(text)
+
+          handler = Path("backend/internal/handler/openai_gateway_handler.go")
+          text = handler.read_text()
+          if '\t"unicode/utf8"\n' not in text:
+              import_anchor = '\t"time"\n'
+              if text.count(import_anchor) != 1:
+                  raise SystemExit("openai_gateway_handler.go: time import anchor changed")
+              text = text.replace(import_anchor, import_anchor + '\t"unicode/utf8"\n', 1)
+
+          close_start = text.index("func closeOpenAIClientWS(")
+          close_end_marker = "\n}\n\nfunc openAIWSNextAttemptMessage"
+          close_end = text.index(close_end_marker, close_start) + 2
+          close_new = dedent('''\
+          const openAIWSCloseReasonMaxBytes = 120
+
+          func truncateOpenAIWSCloseReason(reason string) string {
+              reason = strings.ToValidUTF8(strings.TrimSpace(reason), "�")
+              if len(reason) <= openAIWSCloseReasonMaxBytes {
+                  return reason
+              }
+              end := openAIWSCloseReasonMaxBytes
+              for end > 0 && !utf8.RuneStart(reason[end]) {
+                  end--
+              }
+              return reason[:end]
+          }
+
+          func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason string) {
+              if conn == nil {
+                  return
+              }
+              // coder/websocket Close already owns and bounds the close handshake.
+              // A CloseNow timer scheduled after Close returns cannot shorten it.
+              _ = conn.Close(status, truncateOpenAIWSCloseReason(reason))
+          }''')
+          handler.write_text(text[:close_start] + close_new + text[close_end:])
+
+          Path("backend/internal/handler/openai_gateway_ws_close_reason_test.go").write_text(dedent(r'''
+          package handler
+
+          import (
+              "strings"
+              "testing"
+              "unicode/utf8"
+
+              "github.com/stretchr/testify/require"
+          )
+
+          func TestTruncateOpenAIWSCloseReason(t *testing.T) {
+              t.Run("ascii", func(t *testing.T) {
+                  got := truncateOpenAIWSCloseReason(strings.Repeat("a", openAIWSCloseReasonMaxBytes+10))
+                  require.Len(t, got, openAIWSCloseReasonMaxBytes)
+              })
+
+              t.Run("utf8", func(t *testing.T) {
+                  got := truncateOpenAIWSCloseReason(strings.Repeat("🙂", 40))
+                  require.LessOrEqual(t, len(got), openAIWSCloseReasonMaxBytes)
+                  require.True(t, utf8.ValidString(got))
+                  require.Equal(t, 30, utf8.RuneCountInString(got))
+              })
+
+              t.Run("invalid utf8", func(t *testing.T) {
+                  got := truncateOpenAIWSCloseReason(string([]byte{'a', 0xff, 'b'}))
+                  require.True(t, utf8.ValidString(got))
+                  require.Equal(t, "a�b", got)
+              })
+
+              t.Run("trim", func(t *testing.T) {
+                  require.Equal(t, "close reason", truncateOpenAIWSCloseReason("  close reason  "))
+              })
+          }
+          ''').lstrip())
+          PY
+
+          gofmt -w backend/internal/handler/openai_gateway_handler.go \
+            backend/internal/handler/openai_gateway_ws_close_reason_test.go
+          cargo fmt --manifest-path rustsidecar/Cargo.toml
+          git diff --check
+
+      - name: Run focused Go test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/handler -run '^TestTruncateOpenAIWSCloseReason$' -count=1
+
+      - name: Run Rust sidecar tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path rustsidecar/Cargo.toml
+
+      - name: Commit exact tested tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/apply-latest-review-fixes.yml
+          git config user.name "Jacob"
+          git config user.email "240170694+wignerStan@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(sidecar): make websocket shutdown terminal"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
