@@ -673,23 +673,34 @@ async fn pump_ws(
         while let Some(message) = client_stream.next().await {
             match message {
                 Ok(message) => {
+                    let is_close = matches!(&message, AxumMessage::Close(_));
                     let Some(ts) = axum_to_ts(message) else { continue };
                     let ts = open_and_transform_ts(ts);
                     if upstream_sink.send(ts).await.is_err() {
+                        break;
+                    }
+                    if is_close {
+                        let _ = upstream_sink.close().await;
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
+        let _ = upstream_sink.flush().await;
     };
     let to_client = async {
         while let Some(message) = upstream_stream.next().await {
             match message {
                 Ok(message) => {
+                    let is_close = matches!(&message, TsMessage::Close(_));
                     let message = seal_ts(message);
                     if let Some(message) = ts_to_axum(message) {
                         if client_sink.send(message).await.is_err() {
+                            break;
+                        }
+                        if is_close {
+                            let _ = client_sink.close().await;
                             break;
                         }
                     }
@@ -697,10 +708,20 @@ async fn pump_ws(
                 Err(_) => break,
             }
         }
+        let _ = client_sink.close().await;
     };
+
+    tokio::pin!(to_upstream);
+    tokio::pin!(to_client);
+
     tokio::select! {
-        _ = to_upstream => {}
-        _ = to_client => {}
+        _ = &mut to_client => {
+            // Upstream finished producing responses/errors and closed the stream.
+        }
+        _ = &mut to_upstream => {
+            // Client finished sending request(s); wait for upstream to complete response stream.
+            to_client.await;
+        }
     }
 }
 
