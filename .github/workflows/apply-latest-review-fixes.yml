@@ -25,28 +25,31 @@ jobs:
           from pathlib import Path
           from textwrap import dedent
 
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
           main = Path("rustsidecar/src/main.rs")
           text = main.read_text()
+          text = replace_once(
+              text,
+              dedent('''\
+              const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
+              const ACCOUNT_ID_HEADER: &str = "x-account-id";
 
-          constants_old = dedent('''\
-          const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
-          const ACCOUNT_ID_HEADER: &str = "x-account-id";
+              fn is_hop_by_hop'''),
+              dedent('''\
+              const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
+              const ACCOUNT_ID_HEADER: &str = "x-account-id";
+              const WS_CLOSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+              const WS_CLOSE_REASON_MAX_BYTES: usize = 123;
 
-          fn is_hop_by_hop''')
-          constants_new = dedent('''\
-          const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
-          const ACCOUNT_ID_HEADER: &str = "x-account-id";
-          const WS_CLOSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-          const WS_CLOSE_REASON_MAX_BYTES: usize = 123;
+              fn is_hop_by_hop'''),
+              "main.rs constants",
+          )
 
-          fn is_hop_by_hop''')
-          if text.count(constants_old) != 1:
-              raise SystemExit("main.rs: constants anchor changed")
-          text = text.replace(constants_old, constants_new, 1)
-
-          helper_marker = "\nasync fn pump_ws("
-          if text.count(helper_marker) != 1:
-              raise SystemExit("main.rs: pump marker changed")
           helpers = dedent(r'''
           fn truncate_ws_close_reason(reason: &str) -> String {
               if reason.len() <= WS_CLOSE_REASON_MAX_BYTES {
@@ -57,15 +60,6 @@ jobs:
                   end -= 1;
               }
               reason[..end].to_string()
-          }
-
-          fn ws_policy_close(reason: &str) -> TsMessage {
-              TsMessage::Close(Some(
-                  tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                      code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                      reason: truncate_ws_close_reason(reason).into(),
-                  },
-              ))
           }
 
           fn transform_and_classify_ws_message<F>(
@@ -86,10 +80,16 @@ jobs:
 
               #[test]
               fn transformed_close_is_terminal_and_wire_safe() {
-                  let reason = "禁止".repeat(100);
+                  let reason = truncate_ws_close_reason(&"禁止".repeat(100));
+                  let close = TsMessage::Close(Some(
+                      tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+                          code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                          reason: reason.into(),
+                      },
+                  ));
                   let (message, is_close) = transform_and_classify_ws_message(
                       TsMessage::text("request"),
-                      |_| ws_policy_close(&reason),
+                      |_| close,
                   );
                   assert!(is_close);
                   let TsMessage::Close(Some(frame)) = message else {
@@ -106,37 +106,26 @@ jobs:
               }
           }
           ''').strip()
-          text = text.replace(helper_marker, "\n" + helpers + helper_marker, 1)
+          text = replace_once(
+              text,
+              "\nasync fn pump_ws(",
+              "\n" + helpers + "\n\nasync fn pump_ws(",
+              "main.rs pump helper insertion",
+          )
+          text = replace_once(
+              text,
+              "reason: err.to_string().into(),",
+              "reason: truncate_ws_close_reason(&err.to_string()).into(),",
+              "main.rs dynamic policy close reason",
+          )
 
-          encryption_close = dedent('''\
-          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                          code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                          reason: "e2ee frame encryption failed".into(),
-                      }))''')
-          if text.count(encryption_close) != 2:
-              raise SystemExit(f"main.rs: expected two encryption close blocks, found {text.count(encryption_close)}")
-          text = text.replace(encryption_close, 'ws_policy_close("e2ee frame encryption failed")')
-
-          authentication_close = dedent('''\
-          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                          code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                          reason: "invalid encrypted websocket frame".into(),
-                      }))''')
-          if text.count(authentication_close) != 2:
-              raise SystemExit(f"main.rs: expected two authentication close blocks, found {text.count(authentication_close)}")
-          text = text.replace(authentication_close, 'ws_policy_close("invalid encrypted websocket frame")')
-
-          policy_close = dedent('''\
-          TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                              code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                              reason: err.to_string().into(),
-                          }))''')
-          if text.count(policy_close) != 1:
-              raise SystemExit(f"main.rs: expected one policy close block, found {text.count(policy_close)}")
-          text = text.replace(policy_close, 'ws_policy_close(&err.to_string())', 1)
-
-          start = text.index("    let to_upstream = async {")
+          pump_start = "    let to_upstream = async {"
+          if text.count(pump_start) != 1:
+              raise SystemExit(f"main.rs pump start: expected one match, found {text.count(pump_start)}")
+          start = text.index(pump_start)
           end_marker = "\n}\n\nasync fn ws_tunnel("
+          if text.count(end_marker) != 1:
+              raise SystemExit(f"main.rs pump end: expected one match, found {text.count(end_marker)}")
           end = text.index(end_marker, start)
           new_pump_tail = dedent(r'''
               let to_upstream = async {
@@ -208,34 +197,36 @@ jobs:
                   }
               }
           ''').rstrip()
-          text = text[:start] + new_pump_tail + text[end:]
-          main.write_text(text)
+          main.write_text(text[:start] + new_pump_tail + text[end:])
 
           types = Path("rustsidecar/src/mimic/types.rs")
           text = types.read_text()
           routing_line = '    "x-codex-routing-hint",\n'
           if text.count(routing_line) != 2:
-              raise SystemExit(f"types.rs: expected two allowed routing-hint entries, found {text.count(routing_line)}")
+              raise SystemExit(
+                  f"types.rs routing allowlists: expected two matches, found {text.count(routing_line)}"
+              )
           text = text.replace(routing_line, "")
-          stripped_old = dedent('''\
-          pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
-              "x-oai-attestation",
-          ];''')
-          stripped_new = dedent('''\
-          pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
-              "x-codex-routing-hint",
-              "x-oai-attestation",
-          ];''')
-          if text.count(stripped_old) != 1:
-              raise SystemExit("types.rs: stripped response header block changed")
-          types.write_text(text.replace(stripped_old, stripped_new, 1))
+          text = replace_once(
+              text,
+              dedent('''\
+              pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
+                  "x-oai-attestation",
+              ];'''),
+              dedent('''\
+              pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
+                  "x-codex-routing-hint",
+                  "x-oai-attestation",
+              ];'''),
+              "types.rs explicit response strips",
+          )
+          types.write_text(text)
 
           headers = Path("rustsidecar/src/mimic/headers.rs")
           text = headers.read_text()
           if "mod routing_hint_tests" in text:
-              raise SystemExit("headers.rs: routing-hint test already exists")
-          text = text.rstrip() + dedent(r'''
-
+              raise SystemExit("headers.rs routing-hint test already exists")
+          text = text.rstrip() + "\n\n" + dedent(r'''
           #[cfg(test)]
           mod routing_hint_tests {
               use super::*;
@@ -278,11 +269,12 @@ jobs:
           handler = Path("backend/internal/handler/openai_gateway_handler.go")
           text = handler.read_text()
           if '\t"unicode/utf8"\n' not in text:
-              import_anchor = '\t"time"\n'
-              if text.count(import_anchor) != 1:
-                  raise SystemExit("openai_gateway_handler.go: time import anchor changed")
-              text = text.replace(import_anchor, import_anchor + '\t"unicode/utf8"\n', 1)
-
+              text = replace_once(
+                  text,
+                  '\t"time"\n',
+                  '\t"time"\n\t"unicode/utf8"\n',
+                  "openai_gateway_handler.go imports",
+              )
           close_start = text.index("func closeOpenAIClientWS(")
           close_end_marker = "\n}\n\nfunc openAIWSNextAttemptMessage"
           close_end = text.index(close_end_marker, close_start) + 2
@@ -305,47 +297,49 @@ jobs:
               if conn == nil {
                   return
               }
-              // coder/websocket Close already owns and bounds the close handshake.
-              // A CloseNow timer scheduled after Close returns cannot shorten it.
+              // coder/websocket Close already waits for the peer and bounds the handshake.
+              // Calling CloseNow only after it returns cannot make shutdown faster.
               _ = conn.Close(status, truncateOpenAIWSCloseReason(reason))
           }''')
           handler.write_text(text[:close_start] + close_new + text[close_end:])
 
-          Path("backend/internal/handler/openai_gateway_ws_close_reason_test.go").write_text(dedent(r'''
-          package handler
+          Path("backend/internal/handler/openai_gateway_ws_close_reason_test.go").write_text(
+              dedent(r'''
+              package handler
 
-          import (
-              "strings"
-              "testing"
-              "unicode/utf8"
+              import (
+                  "strings"
+                  "testing"
+                  "unicode/utf8"
 
-              "github.com/stretchr/testify/require"
+                  "github.com/stretchr/testify/require"
+              )
+
+              func TestTruncateOpenAIWSCloseReason(t *testing.T) {
+                  t.Run("ascii", func(t *testing.T) {
+                      got := truncateOpenAIWSCloseReason(strings.Repeat("a", openAIWSCloseReasonMaxBytes+10))
+                      require.Len(t, got, openAIWSCloseReasonMaxBytes)
+                  })
+
+                  t.Run("utf8", func(t *testing.T) {
+                      got := truncateOpenAIWSCloseReason(strings.Repeat("🙂", 40))
+                      require.LessOrEqual(t, len(got), openAIWSCloseReasonMaxBytes)
+                      require.True(t, utf8.ValidString(got))
+                      require.Equal(t, 30, utf8.RuneCountInString(got))
+                  })
+
+                  t.Run("invalid utf8", func(t *testing.T) {
+                      got := truncateOpenAIWSCloseReason(string([]byte{'a', 0xff, 'b'}))
+                      require.True(t, utf8.ValidString(got))
+                      require.Equal(t, "a�b", got)
+                  })
+
+                  t.Run("trim", func(t *testing.T) {
+                      require.Equal(t, "close reason", truncateOpenAIWSCloseReason("  close reason  "))
+                  })
+              }
+              ''').lstrip()
           )
-
-          func TestTruncateOpenAIWSCloseReason(t *testing.T) {
-              t.Run("ascii", func(t *testing.T) {
-                  got := truncateOpenAIWSCloseReason(strings.Repeat("a", openAIWSCloseReasonMaxBytes+10))
-                  require.Len(t, got, openAIWSCloseReasonMaxBytes)
-              })
-
-              t.Run("utf8", func(t *testing.T) {
-                  got := truncateOpenAIWSCloseReason(strings.Repeat("🙂", 40))
-                  require.LessOrEqual(t, len(got), openAIWSCloseReasonMaxBytes)
-                  require.True(t, utf8.ValidString(got))
-                  require.Equal(t, 30, utf8.RuneCountInString(got))
-              })
-
-              t.Run("invalid utf8", func(t *testing.T) {
-                  got := truncateOpenAIWSCloseReason(string([]byte{'a', 0xff, 'b'}))
-                  require.True(t, utf8.ValidString(got))
-                  require.Equal(t, "a�b", got)
-              })
-
-              t.Run("trim", func(t *testing.T) {
-                  require.Equal(t, "close reason", truncateOpenAIWSCloseReason("  close reason  "))
-              })
-          }
-          ''').lstrip())
           PY
 
           gofmt -w backend/internal/handler/openai_gateway_handler.go \
@@ -370,9 +364,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm .github/workflows/apply-latest-review-fixes.yml
+          rm -f .github/workflows/apply-latest-review-fixes.yml
+          rm -f .github/.sync-183-review-trigger
           git config user.name "Jacob"
-          git config user.email "240170694+wignerStan@users.noreply.github.com"
+          git config user.email "24017069+wignerStan@users.noreply.github.com"
           git add -A
           git diff --cached --check
           git commit -m "fix(sidecar): make websocket shutdown terminal"
