@@ -357,6 +357,8 @@ async fn http_tunnel(
         }
     }
 
+    builder = builder.body(transformed_body);
+
     let response = match builder.send().await {
         Ok(response) => {
             if state.debug {
@@ -488,6 +490,8 @@ async fn http_tunnel_e2ee(
             tracing::info!(body = %body_str, "sidecar http_tunnel_e2ee transformed request body");
         }
     }
+
+    builder = builder.body(transformed_body);
 
     let response = match builder.send().await {
         Ok(response) => {
