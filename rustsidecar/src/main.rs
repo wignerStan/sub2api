@@ -25,6 +25,7 @@ use codex_http_client::{HttpClient, HttpClientBuilder};
 use codex_websocket_client::{WebSocketConnector, WebSocketTlsMode};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::Error as TsError;
 use tokio_tungstenite::tungstenite::Message as TsMessage;
 use tokio_tungstenite::tungstenite::handshake::client::Request as TsRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -570,6 +571,89 @@ fn axum_to_ts(message: AxumMessage) -> Option<TsMessage> {
     }
 }
 
+fn websocket_connect_error_response(error: TsError) -> Response {
+    match error {
+        TsError::Http(upstream) => {
+            let status = upstream.status();
+            let mut response_headers = upstream.headers().clone();
+            strip_response_encoding(&mut response_headers);
+            let body = upstream.into_body().unwrap_or_default();
+            let mut response_builder = Response::builder().status(status);
+            for (name, value) in &response_headers {
+                if is_hop_by_hop(name)
+                    || name.as_str().starts_with("sec-websocket-")
+                    || name.as_str().starts_with(CONTROL_PREFIX)
+                    || name.as_str().starts_with("x-s2s-")
+                {
+                    continue;
+                }
+                response_builder = response_builder.header(name, value);
+            }
+            response_builder
+                .body(Body::from(body))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            "upstream websocket handshake failed",
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod websocket_connect_error_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::handshake::client::Response as TsResponse;
+
+    #[tokio::test]
+    async fn forwards_quota_handshake_rejection() {
+        let body = br#"{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}"#.to_vec();
+        let upstream = TsResponse::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("content-type", "application/json")
+            .header("retry-after", "18000")
+            .header("x-request-id", "req_quota")
+            .header(CONNECTION, "close")
+            .header("sec-websocket-accept", "must-not-leak")
+            .header("x-s2s-token", "must-not-leak")
+            .body(Some(body.clone()))
+            .expect("valid upstream rejection");
+
+        let response = websocket_connect_error_response(TsError::Http(upstream));
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("18000")
+        );
+        assert_eq!(
+            response.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("req_quota")
+        );
+        assert!(response.headers().get(CONNECTION).is_none());
+        assert!(response.headers().get("sec-websocket-accept").is_none());
+        assert!(response.headers().get("x-s2s-token").is_none());
+        let actual = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(actual.as_ref(), body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn sanitizes_non_http_connect_failure() {
+        let response = websocket_connect_error_response(TsError::Io(std::io::Error::other(
+            "proxy credential detail",
+        )));
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let actual = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(actual.as_ref(), b"upstream websocket handshake failed");
+    }
+}
+
 async fn pump_ws(
     client: WebSocket,
     upstream: codex_websocket_client::WebSocketConnection,
@@ -775,58 +859,74 @@ async fn ws_tunnel(
             "sidecar ws_tunnel connecting upstream"
         );
     }
+
+    // Complete the upstream handshake before accepting the local WebSocket.
+    // Otherwise a quota/rate-limit HTTP rejection is converted into an
+    // upgraded loopback socket that immediately disappears without a close
+    // frame, which Codex misclassifies as a retryable transport reset.
+    let connector = match WebSocketConnector::new_with_tls_mode(
+        &codex_http_client::HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        WebSocketTlsMode::ExplicitCodexTls,
+    ) {
+        Ok(connector) => connector,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to build WS TLS config");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "upstream websocket connector unavailable",
+            )
+                .into_response();
+        }
+    };
+    let mut request = TsRequest::new(());
+    *request.method_mut() = Method::GET;
+    *request.uri_mut() = all_target.clone();
+    if let Some(authority) = all_target.authority() {
+        let Ok(host) = HeaderValue::from_str(authority.as_str()) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        request.headers_mut().insert(HOST, host);
+    }
+    request.headers_mut().insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    request.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
+    for (name, value) in &forwarded {
+        let Some(name) = HeaderName::from_bytes(name.as_str().as_bytes()).ok() else {
+            continue;
+        };
+        let Ok(value) = value.to_str().map(|v| HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static(""))) else {
+            continue;
+        };
+        request.headers_mut().insert(name, value);
+    }
+    let (connection, _) = match connector
+        .connect_via(request, WebSocketConfig::default(), proxy)
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::warn!(error = %error, "upstream WS connect failed");
+            return websocket_connect_error_response(error);
+        }
+    };
+    if state.debug {
+        tracing::info!("sidecar ws_tunnel upstream connected successfully");
+    }
+
     let profile_for_ws = profile.clone();
     let salt_for_ws = state.deployment_salt.clone();
     let policy_for_ws = state.unknown_field_policy;
-    let is_debug_for_ws = state.debug;
-
     let mut response = ws.on_upgrade(move |socket| async move {
-        let connector = match WebSocketConnector::new_with_tls_mode(
-            &codex_http_client::HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-            WebSocketTlsMode::ExplicitCodexTls,
-        ) {
-            Ok(connector) => connector,
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to build WS TLS config");
-                return;
-            }
-        };
-        let mut request = TsRequest::new(());
-        *request.method_mut() = Method::GET;
-        *request.uri_mut() = all_target.clone();
-        if let Some(authority) = all_target.authority() {
-            let Ok(host) = HeaderValue::from_str(authority.as_str()) else {
-                return;
-            };
-            request.headers_mut().insert(HOST, host);
-        }
-        request.headers_mut().insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-        request.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
-        for (name, value) in &forwarded {
-            let Some(name) = HeaderName::from_bytes(name.as_str().as_bytes()).ok() else {
-                continue;
-            };
-            let Ok(value) = value.to_str().map(|v| HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static(""))) else {
-                continue;
-            };
-            request.headers_mut().insert(name, value);
-        }
-        let (connection, _) = match connector
-            .connect_via(request, WebSocketConfig::default(), proxy)
-            .await
-        {
-            Ok(connection) => {
-                if is_debug_for_ws {
-                    tracing::info!("sidecar ws_tunnel upstream connected successfully");
-                }
-                connection
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "upstream WS connect failed");
-                return;
-            }
-        };
-        pump_ws(socket, connection, e2ee_key, profile_for_ws, salt_for_ws, agent_version, Some(window_number), policy_for_ws).await;
+        pump_ws(
+            socket,
+            connection,
+            e2ee_key,
+            profile_for_ws,
+            salt_for_ws,
+            agent_version,
+            Some(window_number),
+            policy_for_ws,
+        )
+        .await;
     }).into_response();
 
     if is_e2ee {
