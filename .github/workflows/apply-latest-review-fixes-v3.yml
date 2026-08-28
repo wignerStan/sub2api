@@ -1,0 +1,153 @@
+name: Apply latest sync-183 review fixes v3
+
+on:
+  push:
+    branches:
+      - automation/sync-183-latest-review
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-183-latest-review-v3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply reviewed source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path(".github/workflows/apply-latest-review-fixes.yml")
+          lines = workflow.read_text().splitlines()
+          step = next(i for i, line in enumerate(lines) if line == "      - name: Apply reviewed fixes")
+          run = next(i for i in range(step + 1, len(lines)) if lines[i] == "        run: |")
+          body: list[str] = []
+          for line in lines[run + 1:]:
+              if line.startswith("      - name:"):
+                  break
+              if line.startswith("          "):
+                  body.append(line[10:])
+              elif not line:
+                  body.append("")
+              else:
+                  raise SystemExit(f"unexpected indentation in source workflow: {line!r}")
+          if not body or body[0] != "set -euo pipefail":
+              raise SystemExit("failed to extract reviewed patch script")
+          Path("/tmp/apply-reviewed-fixes.sh").write_text("\n".join(body) + "\n")
+          PY
+          bash /tmp/apply-reviewed-fixes.sh
+
+      - name: Register routing-control strip category
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          types = Path("rustsidecar/src/mimic/types.rs")
+          text = types.read_text()
+          marker = "/// Explicitly stripped APM tracing / tracking / cookie header & field names.\n"
+          category = (
+              "/// Explicitly stripped routing-control header and field names.\n"
+              "pub const EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES: &[&str] = &[\n"
+              "    \"x-codex-routing-hint\",\n"
+              "];\n\n"
+          )
+          types.write_text(replace_once(text, marker, category + marker, "types.rs routing category"))
+
+          headers = Path("rustsidecar/src/mimic/headers.rs")
+          text = headers.read_text()
+          text = replace_once(
+              text,
+              "    ALLOWED_RESPONSES_X_HEADERS, EXPLICITLY_STRIPPED_ATTESTATION_NAMES,\n"
+              "    EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES, UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,\n",
+              "    ALLOWED_RESPONSES_X_HEADERS, EXPLICITLY_STRIPPED_ATTESTATION_NAMES,\n"
+              "    EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES, EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES,\n"
+              "    UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,\n",
+              "headers.rs routing category import",
+          )
+          text = replace_once(
+              text,
+              "                || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key)\n"
+              "                || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)\n",
+              "                || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key)\n"
+              "                || EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES.contains(&key)\n"
+              "                || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)\n",
+              "headers.rs routing category enforcement",
+          )
+          headers.write_text(text)
+
+          tests = Path("rustsidecar/src/mimic/tests.rs")
+          text = tests.read_text()
+          text = replace_once(
+              text,
+              "EXPLICITLY_STRIPPED_ATTESTATION_NAMES, EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES,\n",
+              "EXPLICITLY_STRIPPED_ATTESTATION_NAMES, EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES,\n"
+              "    EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES,\n",
+              "tests.rs routing category import",
+          )
+          pattern = re.compile(
+              r"(?m)^(?P<i>[ \t]*)EXPLICITLY_STRIPPED_ATTESTATION_NAMES\.contains\(stripped\)\n"
+              r"(?P=i)    \|\| EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES\.contains\(stripped\),$"
+          )
+          def add_routing_category(match: re.Match[str]) -> str:
+              indent = match.group("i")
+              return (
+                  f"{indent}EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(stripped)\n"
+                  f"{indent}    || EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES.contains(stripped)\n"
+                  f"{indent}    || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(stripped),"
+              )
+          text, count = pattern.subn(add_routing_category, text, count=1)
+          if count != 1:
+              raise SystemExit(f"tests.rs routing category assertion: expected one match, found {count}")
+          tests.write_text(text)
+          PY
+
+          cargo fmt --manifest-path rustsidecar/Cargo.toml
+          git diff --check
+
+      - name: Run focused Go regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/handler -run '^TestTruncateOpenAIWSCloseReason$' -count=1
+
+      - name: Run full Rust sidecar suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path rustsidecar/Cargo.toml
+
+      - name: Commit exact tested tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/apply-latest-review-fixes.yml
+          rm -f .github/workflows/apply-latest-review-fixes-v2.yml
+          rm -f .github/workflows/apply-latest-review-fixes-v3.yml
+          rm -f .github/.sync-183-review-trigger
+          git config user.name "Jacob"
+          git config user.email "240170694+wignerStan@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(sidecar): make websocket shutdown terminal"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
