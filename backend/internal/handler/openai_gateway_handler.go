@@ -1968,10 +1968,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
 	if err != nil {
 		reqLog.Warn("openai.websocket_user_slot_acquire_failed", zap.Error(err))
+		writeOpenAIWSErrorFrame(ctx, wsConn, "api_error", "user_slot_acquire_failed", "failed to acquire user concurrency slot")
 		closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to acquire user concurrency slot")
 		return
 	}
 	if !userAcquired {
+		writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "too_many_concurrent_requests", "too many concurrent requests, please retry later")
 		closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "too many concurrent requests, please retry later")
 		return
 	}
@@ -1983,10 +1985,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		userReleaseFunc, userAcquired, err := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
 		if err != nil {
 			reqLog.Warn("openai.websocket_user_slot_reacquire_failed", zap.Error(err))
+			writeOpenAIWSErrorFrame(ctx, wsConn, "api_error", "user_slot_acquire_failed", "failed to acquire user concurrency slot")
 			closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to acquire user concurrency slot")
 			return false
 		}
 		if !userAcquired {
+			writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "too_many_concurrent_requests", "too many concurrent requests, please retry later")
 			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "too many concurrent requests, please retry later")
 			return false
 		}
@@ -2002,6 +2006,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 	if err := h.billingCacheService.CheckBillingEligibility(ctx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
 		reqLog.Info("openai.websocket_billing_eligibility_check_failed", zap.Error(err))
+		writeOpenAIWSErrorFrame(ctx, wsConn, "billing_error", "billing_check_failed", "billing check failed")
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 		return
 	}
@@ -2125,7 +2130,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			if lastFailoverErr != nil {
 				closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
 			} else {
-				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "no available account")
+				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
+				cls = classifySelectionFailureError(err, cls)
+				writeOpenAIWSErrorFrame(ctx, wsConn, cls.ErrType, cls.ErrType, cls.Message)
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, cls.Message)
 			}
 			return
 		}
@@ -2133,7 +2141,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			if lastFailoverErr != nil {
 				closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
 			} else {
-				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "no available account")
+				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
+				writeOpenAIWSErrorFrame(ctx, wsConn, cls.ErrType, cls.ErrType, cls.Message)
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, cls.Message)
 			}
 			return
 		}
@@ -2157,6 +2167,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				reqLog.Debug("openai.websocket_account_slot_profit_vetoed", zap.Int64("account_id", account.ID), zap.String("reason", reason))
 				if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
 					reqLog.Warn("openai.websocket_profit_veto_attempts_exhausted", zap.Int("profit_veto_count", profitVetoCount))
+					writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "profit_control_limited", "no available account")
 					closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "no available account")
 					return
 				}
@@ -2167,6 +2178,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		if !selection.Acquired {
 			if selection.WaitPlan == nil {
+				writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "account_busy", "account is busy, please retry later")
 				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
 				return
 			}
@@ -2177,10 +2189,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			)
 			if err != nil {
 				reqLog.Warn("openai.websocket_account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				writeOpenAIWSErrorFrame(ctx, wsConn, "api_error", "concurrency_acquire_failed", "failed to acquire account concurrency slot")
 				closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to acquire account concurrency slot")
 				return
 			}
 			if !fastAcquired {
+				writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "account_busy", "account is busy, please retry later")
 				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
 				return
 			}
@@ -2194,6 +2208,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				reqLog.Debug("openai.websocket_account_slot_profit_vetoed", zap.Int64("account_id", account.ID), zap.String("reason", reason))
 				if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
 					reqLog.Warn("openai.websocket_profit_veto_attempts_exhausted", zap.Int("profit_veto_count", profitVetoCount))
+					writeOpenAIWSErrorFrame(ctx, wsConn, "rate_limit_error", "profit_control_limited", "no available account")
 					closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "no available account")
 					return
 				}
@@ -2226,6 +2241,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				}
 				return
 			}
+			writeOpenAIWSErrorFrame(ctx, wsConn, "authentication_error", "token_retrieval_failed", "failed to get access token")
 			closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "failed to get access token")
 			return
 		}
@@ -3177,6 +3193,42 @@ func isOpenAIWSUpgradeRequest(r *http.Request) bool {
 	return strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Connection"))), "upgrade")
 }
 
+func writeOpenAIWSErrorFrame(ctx context.Context, conn *coderws.Conn, errorType, errorCode, message string) {
+	if conn == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	errorType = strings.TrimSpace(errorType)
+	if errorType == "" {
+		errorType = "api_error"
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if errorCode == "" {
+		errorCode = "server_error"
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "An error occurred while processing your request"
+	}
+	payload, err := json.Marshal(gin.H{
+		"event_id": fmt.Sprintf("evt_err_%x", time.Now().UnixNano()),
+		"type":     "error",
+		"error": gin.H{
+			"type":    errorType,
+			"code":    errorCode,
+			"message": message,
+		},
+	})
+	if err != nil {
+		payload = []byte(`{"type":"error","error":{"type":"api_error","code":"server_error","message":"An error occurred"}}`)
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	_ = conn.Write(writeCtx, coderws.MessageText, payload)
+}
+
 func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason string) {
 	if conn == nil {
 		return
@@ -3186,7 +3238,9 @@ func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason s
 		reason = reason[:120]
 	}
 	_ = conn.Close(status, reason)
-	_ = conn.CloseNow()
+	time.AfterFunc(1*time.Second, func() {
+		_ = conn.CloseNow()
+	})
 }
 
 func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn bool) ([]byte, bool) {
@@ -3220,6 +3274,7 @@ func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failover
 			case http.StatusTooManyRequests:
 				intendedStatus = http.StatusTooManyRequests
 				errorType = "rate_limit_error"
+				errorCode = "rate_limit_exceeded"
 				message = "upstream rate limit exceeded, please retry later"
 				closeStatus = coderws.StatusTryAgainLater
 			case 529, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -3236,6 +3291,7 @@ func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failover
 	}
 
 	service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
+	writeOpenAIWSErrorFrame(c.Request.Context(), conn, errorType, errorCode, message)
 	closeOpenAIClientWS(conn, closeStatus, message)
 }
 
