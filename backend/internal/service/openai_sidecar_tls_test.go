@@ -24,9 +24,13 @@ func TestShouldUseSidecarTLSURL(t *testing.T) {
 		"wss://chatgpt.com/backend-api/codex/responses",
 		"https://chatgpt.com/backend-api/codex/models",
 		"https://chatgpt.com/backend-api/wham/usage",
+		"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+		"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
 		"https://ab.chatgpt.com/backend-api/wham/usage",
 		"https://chat.openai.com/backend-api/codex/responses",
 		"https://auth.openai.com/oauth/token",
+		"https://auth.openai.com/api/v1/oauth/token",
+		"https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami",
 		"https://auth.openai.com/api/accounts/v1/agent/runtime/task/register",
 	}
 	for _, raw := range yes {
