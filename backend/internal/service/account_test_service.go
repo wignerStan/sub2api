@@ -2636,7 +2636,7 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 			"session_id":    sessionID,
 			"thread_id":     sessionID,
 			"window_id":     windowID,
-			"window_number": float64(0),
+			"window_number": "0",
 		}
 	}
 

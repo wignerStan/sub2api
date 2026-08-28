@@ -108,7 +108,8 @@ pub fn extract_window_number(window_id_str: Option<&str>, metadata: Option<&Valu
 /// Sanitize workspace root path to ensure consistency with simulated workstation OS
 /// while eliminating private physical paths and usernames.
 pub fn sanitize_workspace_path(raw_path: &str, identity: &ConvergedIdentity) -> String {
-    let proj_name = raw_path
+    let normalized = raw_path.replace('\\', "/");
+    let proj_name = normalized
         .trim_end_matches('/')
         .rsplit('/')
         .next()

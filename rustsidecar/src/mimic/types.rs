@@ -18,6 +18,21 @@ pub const REALISTIC_PROJECTS: &[&str] = &[
     "controller",
 ];
 
+pub const REALISTIC_GIT_BRANCHES: &[&str] = &[
+    "main",
+    "master",
+    "develop",
+    "testing",
+    "docs",
+    "codex-audit",
+    "feature/api-v2",
+    "fix/cache-sync",
+    "refactor/core",
+    "chore/deps",
+    "staging",
+    "dev",
+];
+
 /// Identity metadata generated for a turn, including realistic organic workstation simulation
 /// and precise compaction window number preservation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,12 +103,10 @@ impl ConvergedIdentity {
             }
         };
 
-        let git_branch = match h[4] % 4 {
-            0 => "main".to_string(),
-            1 => "master".to_string(),
-            2 => "develop".to_string(),
-            _ => "testing".to_string(),
-        };
+        let day_bucket = (chrono::Utc::now().timestamp().max(0) / 86400) as u64;
+        let branch_jitter = h[4] as u64;
+        let branch_idx = ((day_bucket + branch_jitter) as usize) % REALISTIC_GIT_BRANCHES.len();
+        let git_branch = REALISTIC_GIT_BRANCHES[branch_idx].to_string();
 
         let terminal = if os == "darwin" {
             match h[5] % 4 {

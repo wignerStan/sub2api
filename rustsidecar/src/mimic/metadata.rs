@@ -55,7 +55,9 @@ pub fn sanitize_client_metadata(
         let flat_parent_thread = map.get("x-codex-parent-thread-id").or_else(|| map.get("parent_thread_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
         let flat_subagent = map.get("x-openai-subagent").or_else(|| map.get("subagent_header")).and_then(|v| v.as_str()).map(|s| s.to_string());
         let flat_win_id = map.get("window_id").or_else(|| map.get("x-codex-window-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let flat_win_num = map.get("window_number").and_then(|v| v.as_u64());
+        let flat_win_num = map.get("window_number").and_then(|v| {
+            v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        });
         let flat_prev_win = map.get("previous_window_id").or_else(|| map.get("context_window_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
 
         // Validate parent_thread_id UUID format if present

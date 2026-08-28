@@ -859,7 +859,7 @@ func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *code
 	existing["turn_id"] = ids.turnID
 	existing["x-codex-window-id"] = ids.windowID
 	existing["window_id"] = ids.windowID
-	existing["window_number"] = float64(ids.windowNumber)
+	existing["window_number"] = strconv.FormatUint(ids.windowNumber, 10)
 	if ids.mode == codexFingerprintSession && ids.parentThreadID != "" {
 		if _, exists := existing["x-codex-parent-thread-id"]; exists {
 			existing["x-codex-parent-thread-id"] = ids.parentThreadID

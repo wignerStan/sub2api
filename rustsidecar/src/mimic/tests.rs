@@ -14,10 +14,10 @@ use serde_json::{json, Value};
         ConvergedIdentity, MimicError, UnknownFieldPolicy, ALLOWED_ACCOUNT_X_HEADERS,
         ALLOWED_FLAT_CLIENT_METADATA_KEYS, ALLOWED_RESPONSES_X_HEADERS,
         EXPLICITLY_STRIPPED_ATTESTATION_NAMES, EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES,
-        SUB2API_EXTENDED_ACCOUNT_X_HEADERS, SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS,
-        SUB2API_EXTENDED_RESPONSES_X_HEADERS, UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS,
-        UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS, UPSTREAM_ALLOWED_RESPONSES_X_HEADERS,
-        UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,
+        REALISTIC_GIT_BRANCHES, SUB2API_EXTENDED_ACCOUNT_X_HEADERS,
+        SUB2API_EXTENDED_FLAT_CLIENT_METADATA_KEYS, SUB2API_EXTENDED_RESPONSES_X_HEADERS,
+        UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS, UPSTREAM_ALLOWED_FLAT_CLIENT_METADATA_KEYS,
+        UPSTREAM_ALLOWED_RESPONSES_X_HEADERS, UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,
         UPSTREAM_EXPLICITLY_STRIPPED_FLAT_CLIENT_METADATA_KEYS,
         UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS,
     };
@@ -629,8 +629,8 @@ use serde_json::{json, Value};
         for seed_idx in 0..20 {
             let identity = ConvergedIdentity::new(&format!("seed_{seed_idx}"), None, None, "salt", None, 0);
             assert!(
-                matches!(identity.git_branch.as_str(), "main" | "master" | "develop" | "testing"),
-                "git_branch '{}' must be one of standard normal branches",
+                REALISTIC_GIT_BRANCHES.contains(&identity.git_branch.as_str()),
+                "git_branch '{}' must be one of REALISTIC_GIT_BRANCHES",
                 identity.git_branch
             );
         }
@@ -644,10 +644,15 @@ use serde_json::{json, Value};
 
             // Workspace path
             let ws_path = sanitize_workspace_path("/Users/raw_user/private_dir/my_tool", &identity);
+            let win_path = sanitize_workspace_path(r"C:\Users\raw_user\private_dir\my_tool", &identity);
             if identity.os == "darwin" {
                 assert!(ws_path.starts_with("/Users/"), "Darwin must produce /Users/ path: {}", ws_path);
+                assert!(win_path.starts_with("/Users/"), "Darwin must produce /Users/ path from Windows path: {}", win_path);
+                assert!(win_path.ends_with("/my_tool"), "Windows path must extract project name: {}", win_path);
             } else {
                 assert!(ws_path.starts_with("/home/"), "Linux must produce /home/ path: {}", ws_path);
+                assert!(win_path.starts_with("/home/"), "Linux must produce /home/ path from Windows path: {}", win_path);
+                assert!(win_path.ends_with("/my_tool"), "Windows path must extract project name: {}", win_path);
             }
 
             // User-Agent
