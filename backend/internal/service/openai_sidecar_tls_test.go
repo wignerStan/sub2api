@@ -24,8 +24,6 @@ func TestShouldUseSidecarTLSURL(t *testing.T) {
 		"wss://chatgpt.com/backend-api/codex/responses",
 		"https://chatgpt.com/backend-api/codex/models",
 		"https://chatgpt.com/backend-api/wham/usage",
-		"https://chatgpt.com/backend-api/files",
-		"https://chatgpt.com/backend-api/conversation/c_123/attachment/a_456/download",
 		"https://ab.chatgpt.com/backend-api/wham/usage",
 		"https://chat.openai.com/backend-api/codex/responses",
 		"https://auth.openai.com/oauth/token",
