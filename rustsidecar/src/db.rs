@@ -182,6 +182,29 @@ impl DbProxyResolver {
         loop {
             match tokio_postgres::connect(&db_url, tokio_postgres::NoTls).await {
                 Ok((client, mut connection)) => {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+                    // Drive connection network I/O in the background so client calls don't deadlock
+                    let conn_handle = tokio::spawn(async move {
+                        use futures::StreamExt;
+                        let stream = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
+                        tokio::pin!(stream);
+                        while let Some(msg_res) = stream.next().await {
+                            match msg_res {
+                                Ok(tokio_postgres::AsyncMessage::Notification(notif)) => {
+                                    if tx.send(notif).is_err() {
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!("postgres connection stream error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
                     // Try setting up notification triggers if DB permissions allow
                     let setup_triggers_sql = r#"
                     CREATE OR REPLACE FUNCTION notify_sub2api_account_change() RETURNS trigger AS $$
@@ -230,45 +253,34 @@ impl DbProxyResolver {
 
                     if let Err(e) = client.execute("LISTEN sub2api_account_events", &[]).await {
                         tracing::warn!("failed to listen on sub2api_account_events: {e}");
+                        conn_handle.abort();
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     }
                     tracing::info!("listening for real-time account cache invalidations on 'sub2api_account_events'");
 
                     let cache_ref = self.cache.clone();
-                    let stream = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
-                    tokio::pin!(stream);
-
-                    use futures::StreamExt;
-                    while let Some(msg_res) = stream.next().await {
-                        match msg_res {
-                            Ok(tokio_postgres::AsyncMessage::Notification(notif)) => {
-                                let payload = notif.payload();
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
-                                    if let Some(event) = val.get("event").and_then(|v| v.as_str()) {
-                                        match event {
-                                            "update" | "delete" => {
-                                                if let Some(acc_id) = val.get("account_id").and_then(|v| v.as_i64()) {
-                                                    tracing::debug!(account_id = acc_id, event, "invalidating moka account cache");
-                                                    cache_ref.invalidate(&acc_id).await;
-                                                }
-                                            }
-                                            "reload" => {
-                                                tracing::info!("reloading all account moka caches");
-                                                cache_ref.invalidate_all();
-                                            }
-                                            _ => {}
+                    while let Some(notif) = rx.recv().await {
+                        let payload = notif.payload();
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) {
+                            if let Some(event) = val.get("event").and_then(|v| v.as_str()) {
+                                match event {
+                                    "update" | "delete" => {
+                                        if let Some(acc_id) = val.get("account_id").and_then(|v| v.as_i64()) {
+                                            tracing::info!(account_id = acc_id, event, "invalidating moka account cache via DB notification");
+                                            cache_ref.invalidate(&acc_id).await;
                                         }
                                     }
+                                    "reload" => {
+                                        tracing::info!("reloading all account moka caches via DB proxy reload notification");
+                                        cache_ref.invalidate_all();
+                                    }
+                                    _ => {}
                                 }
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!("postgres notification connection dropped: {e}");
-                                break;
                             }
                         }
                     }
+                    conn_handle.abort();
                 }
                 Err(e) => {
                     tracing::warn!("notification listener connect failed: {e}");
