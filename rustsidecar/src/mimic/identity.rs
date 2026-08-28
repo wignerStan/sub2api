@@ -35,7 +35,10 @@ pub fn derive_converged_thread_id(seed: &str, client_session_id: &str, salt: &st
 
 /// Extract exact client version from agent / User-Agent headers.
 pub fn extract_client_version_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get("x-codex-client-version").or_else(|| headers.get("x-client-version")) {
+    if let Some(v) = headers
+        .get("x-codex-client-version")
+        .or_else(|| headers.get("x-client-version"))
+    {
         if let Ok(s) = v.to_str() {
             let trimmed = s.trim();
             if !trimmed.is_empty() {
@@ -80,7 +83,11 @@ pub fn extract_window_number(window_id_str: Option<&str>, metadata: Option<&Valu
         if let Some(num) = meta.get("window_number").and_then(|v| v.as_u64()) {
             return num;
         }
-        if let Some(w_val) = meta.get("window_id").or_else(|| meta.get("x-codex-window-id")).and_then(|v| v.as_str()) {
+        if let Some(w_val) = meta
+            .get("window_id")
+            .or_else(|| meta.get("x-codex-window-id"))
+            .and_then(|v| v.as_str())
+        {
             if let Some(pos) = w_val.rfind(':') {
                 if let Ok(num) = w_val[pos + 1..].trim().parse::<u64>() {
                     return num;

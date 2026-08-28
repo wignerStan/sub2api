@@ -7,7 +7,8 @@ use super::metadata::{parse_turn_metadata_object, parse_wire_u64};
 use super::types::{
     ConvergedIdentity, MimicError, UnknownFieldPolicy, ALLOWED_ACCOUNT_X_HEADERS,
     ALLOWED_RESPONSES_X_HEADERS, EXPLICITLY_STRIPPED_ATTESTATION_NAMES,
-    EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES, UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,
+    EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES, EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES,
+    UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS,
     UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS,
 };
 
@@ -113,6 +114,7 @@ pub fn sanitize_and_inject_headers_for_request(
                 // In allowlist -> keep
             } else if stripped_x_headers.contains(&key)
                 || EXPLICITLY_STRIPPED_ATTESTATION_NAMES.contains(&key)
+                || EXPLICITLY_STRIPPED_ROUTING_CONTROL_NAMES.contains(&key)
                 || EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES.contains(&key)
             {
                 // In explicit strip list -> strip normally
@@ -464,5 +466,42 @@ mod hardening_tests {
         .to_string();
         let mut headers = response_headers(&matching);
         sanitize(&mut headers).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod routing_hint_tests {
+    use super::*;
+
+    #[test]
+    fn strips_routing_hint_before_sidecar_egress() {
+        const THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", HeaderValue::from_static("session-1"));
+        headers.insert("thread-id", HeaderValue::from_static(THREAD_ID));
+        headers.insert(
+            "x-codex-window-id",
+            HeaderValue::from_static("11111111-1111-4111-8111-111111111111:0"),
+        );
+        headers.insert(
+            "x-codex-routing-hint",
+            HeaderValue::from_static("client-controlled-route"),
+        );
+
+        sanitize_and_inject_headers_for_request(
+            &mut headers,
+            "seed",
+            Some("session-1"),
+            None,
+            "salt",
+            Some("0.1.183"),
+            0,
+            true,
+            false,
+            UnknownFieldPolicy::Forbidden,
+        )
+        .expect("routing hint is explicitly stripped, not rejected");
+
+        assert!(headers.get("x-codex-routing-hint").is_none());
     }
 }

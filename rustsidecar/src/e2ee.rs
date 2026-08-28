@@ -46,8 +46,7 @@ pub fn derive_key_from_token(token: &[u8]) -> Result<[u8; 32], String> {
 
 fn random_nonce() -> Result<[u8; NONCE_LEN], String> {
     let mut n = [0u8; NONCE_LEN];
-    aws_lc_rs::rand::fill(&mut n)
-        .map_err(|_| "failed to generate e2ee nonce".to_string())?;
+    aws_lc_rs::rand::fill(&mut n).map_err(|_| "failed to generate e2ee nonce".to_string())?;
     Ok(n)
 }
 
@@ -167,7 +166,8 @@ impl RecordDecoder {
             if self.buf[0] != RECORD_MAGIC || self.buf[1] != RECORD_VERSION {
                 return Err("unsupported e2ee record header".into());
             }
-            let payload_len = u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]) as usize;
+            let payload_len =
+                u32::from_be_bytes([self.buf[2], self.buf[3], self.buf[4], self.buf[5]]) as usize;
             if payload_len < NONCE_LEN + TAG_LEN {
                 return Err("e2ee record payload too short".into());
             }
