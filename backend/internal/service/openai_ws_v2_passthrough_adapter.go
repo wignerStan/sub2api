@@ -899,8 +899,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		)
 		s.handleOpenAIWSDialTransientFailure(ctx, account, capturedSessionModel, dialErr)
 		if statusCode == http.StatusTooManyRequests {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
-			return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, nil, err.Error())
+			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
+			return s.newOpenAIWSDialRateLimitFailoverError(account, dialErr, err.Error())
 		}
 		return s.mapOpenAIWSPassthroughDialError(err, statusCode, handshakeHeaders)
 	}
