@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -3177,16 +3178,25 @@ func isOpenAIWSUpgradeRequest(r *http.Request) bool {
 	return strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Connection"))), "upgrade")
 }
 
+const openAIWSCloseReasonMaxBytes = 120
+
+func truncateOpenAIWSCloseReason(reason string) string {
+	reason = strings.ToValidUTF8(strings.TrimSpace(reason), "�")
+	if len(reason) <= openAIWSCloseReasonMaxBytes {
+		return reason
+	}
+	end := openAIWSCloseReasonMaxBytes
+	for end > 0 && !utf8.RuneStart(reason[end]) {
+		end--
+	}
+	return reason[:end]
+}
+
 func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason string) {
 	if conn == nil {
 		return
 	}
-	reason = strings.TrimSpace(reason)
-	if len(reason) > 120 {
-		reason = reason[:120]
-	}
-	_ = conn.Close(status, reason)
-	_ = conn.CloseNow()
+	_ = conn.Close(status, truncateOpenAIWSCloseReason(reason))
 }
 
 func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn bool) ([]byte, bool) {

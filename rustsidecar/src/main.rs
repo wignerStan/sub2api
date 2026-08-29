@@ -13,23 +13,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{
+    CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade,
+};
 use axum::extract::{Request, State};
-use axum::http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE};
+use axum::http::header::{
+    ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
+use base64::Engine;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::{HttpClient, HttpClientBuilder};
 use codex_websocket_client::{WebSocketConnector, WebSocketTlsMode};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::Error as TsError;
-use tokio_tungstenite::tungstenite::Message as TsMessage;
 use tokio_tungstenite::tungstenite::handshake::client::Request as TsRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use base64::Engine;
+use tokio_tungstenite::tungstenite::Error as TsError;
+use tokio_tungstenite::tungstenite::Message as TsMessage;
 
 mod db;
 mod e2ee;
@@ -46,6 +50,8 @@ const TOKEN_HEADER: &str = "x-s2s-token";
 const UPSTREAM_URL_HEADER: &str = "x-upstream-url";
 const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
 const ACCOUNT_ID_HEADER: &str = "x-account-id";
+const WS_CLOSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WS_CLOSE_REASON_MAX_BYTES: usize = 123;
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     let name = name.as_str().to_ascii_lowercase();
@@ -107,7 +113,10 @@ async fn resolve_account_and_proxy(
     let mut resolved_profile = None;
     let mut resolved_proxy = None;
 
-    if let Some(val) = headers.get(ACCOUNT_ID_HEADER).or_else(|| headers.get("x-upstream-account-id")) {
+    if let Some(val) = headers
+        .get(ACCOUNT_ID_HEADER)
+        .or_else(|| headers.get("x-upstream-account-id"))
+    {
         if let Ok(account_id_str) = val.to_str() {
             if let Ok(account_id) = account_id_str.trim().parse::<i64>() {
                 if state.db.is_configured() {
@@ -160,13 +169,14 @@ fn decode_proxy(headers: &HeaderMap) -> Result<Option<String>, Response> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value_str)
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
-    let proxy_url = String::from_utf8(decoded)
-        .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    let proxy_url =
+        String::from_utf8(decoded).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     normalize_proxy_url(proxy_url).map(Some)
 }
 
 fn normalize_proxy_url(proxy_url: String) -> Result<String, Response> {
-    let parsed = reqwest::Url::parse(&proxy_url).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    let parsed =
+        reqwest::Url::parse(&proxy_url).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         _ => return Err(StatusCode::BAD_REQUEST.into_response()),
@@ -208,8 +218,7 @@ fn classify_upstream_target(target: &str) -> (bool, bool) {
         .ok()
         .map(|url| url.path().trim_end_matches('/').to_ascii_lowercase())
         .unwrap_or_default();
-    let is_compact_path =
-        path.ends_with("/responses/compact") || path.ends_with("/codex/compact");
+    let is_compact_path = path.ends_with("/responses/compact") || path.ends_with("/codex/compact");
     let is_responses_path = is_compact_path
         || path.contains("/responses")
         || path.contains("/completions")
@@ -228,7 +237,9 @@ fn forwarded_headers(
     let mut out = HeaderMap::new();
     let mut client_session_id = None;
     let agent_version = mimic::extract_client_version_from_headers(headers);
-    let raw_window_id = headers.get("x-codex-window-id").and_then(|v| v.to_str().ok());
+    let raw_window_id = headers
+        .get("x-codex-window-id")
+        .and_then(|v| v.to_str().ok());
     let window_number = mimic::extract_window_number(raw_window_id, None);
 
     for (name, value) in headers {
@@ -290,7 +301,10 @@ async fn http_tunnel(
     if let Err(response) = check_token(&state, &headers) {
         return response;
     }
-    let Some(target) = headers.get(UPSTREAM_URL_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(target) = headers
+        .get(UPSTREAM_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !allowed_codex_upstream_url(target) {
@@ -306,8 +320,14 @@ async fn http_tunnel(
         Err(response) => return response,
     };
     let (is_responses_path, is_compact_path) = classify_upstream_target(target);
-    let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
+    let (forwarded, agent_version, window_number) = match forwarded_headers(
+        &headers,
+        &profile,
+        &state.deployment_salt,
+        is_responses_path,
+        is_compact_path,
+        state.unknown_field_policy,
+    ) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };
@@ -391,9 +411,11 @@ async fn http_tunnel(
     for (name, value) in &response_headers {
         response_builder = response_builder.header(name, value);
     }
-    let out_body = Body::from_stream(response.bytes_stream().map(|result| {
-        result.map_err(|error| std::io::Error::other(error))
-    }));
+    let out_body = Body::from_stream(
+        response
+            .bytes_stream()
+            .map(|result| result.map_err(|error| std::io::Error::other(error))),
+    );
     response_builder
         .body(out_body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -414,7 +436,10 @@ async fn http_tunnel_e2ee(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let Some(target) = headers.get(UPSTREAM_URL_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(target) = headers
+        .get(UPSTREAM_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !allowed_codex_upstream_url(target) {
@@ -429,8 +454,14 @@ async fn http_tunnel_e2ee(
         Err(response) => return response,
     };
     let (is_responses_path, is_compact_path) = classify_upstream_target(target);
-    let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
+    let (forwarded, agent_version, window_number) = match forwarded_headers(
+        &headers,
+        &profile,
+        &state.deployment_salt,
+        is_responses_path,
+        is_compact_path,
+        state.unknown_field_policy,
+    ) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };
@@ -448,7 +479,8 @@ async fn http_tunnel_e2ee(
 
     // Read sealed E2EE request body and decrypt. HTTP bodies are complete
     // record streams; leftover bytes therefore indicate a truncated request.
-    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await {
+    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await
+    {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -607,7 +639,8 @@ mod websocket_connect_error_tests {
 
     #[tokio::test]
     async fn forwards_quota_handshake_rejection() {
-        let body = br#"{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}"#.to_vec();
+        let body =
+            br#"{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}"#.to_vec();
         let upstream = axum::http::Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "application/json")
@@ -623,11 +656,17 @@ mod websocket_connect_error_tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("18000")
         );
         assert_eq!(
-            response.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
             Some("req_quota")
         );
         assert!(response.headers().get(CONNECTION).is_none());
@@ -637,6 +676,8 @@ mod websocket_connect_error_tests {
             .await
             .expect("read response body");
         assert_eq!(actual.as_ref(), body.as_slice());
+        serde_json::from_slice::<serde_json::Value>(actual.as_ref())
+            .expect("forwarded quota body must remain valid JSON");
     }
 
     #[tokio::test]
@@ -650,6 +691,59 @@ mod websocket_connect_error_tests {
             .await
             .expect("read response body");
         assert_eq!(actual.as_ref(), b"upstream websocket handshake failed");
+    }
+}
+
+fn truncate_ws_close_reason(reason: &str) -> String {
+    if reason.len() <= WS_CLOSE_REASON_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = WS_CLOSE_REASON_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
+fn ws_policy_close(reason: &str) -> TsMessage {
+    TsMessage::Close(Some(
+        tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: truncate_ws_close_reason(reason).into(),
+        },
+    ))
+}
+
+fn transform_and_classify_ws_message<F>(message: TsMessage, transform: F) -> (TsMessage, bool)
+where
+    F: FnOnce(TsMessage) -> TsMessage,
+{
+    let message = transform(message);
+    let is_close = matches!(message, TsMessage::Close(_));
+    (message, is_close)
+}
+
+#[cfg(test)]
+mod ws_close_state_tests {
+    use super::*;
+
+    #[test]
+    fn transformed_close_is_terminal_and_wire_safe() {
+        let reason = "禁止".repeat(100);
+        let (message, is_close) =
+            transform_and_classify_ws_message(TsMessage::text("request"), |_| {
+                ws_policy_close(&reason)
+            });
+        assert!(is_close);
+        let TsMessage::Close(Some(frame)) = message else {
+            panic!("expected a close frame");
+        };
+        assert!(frame.reason.len() <= WS_CLOSE_REASON_MAX_BYTES);
+        assert!(std::str::from_utf8(frame.reason.as_bytes()).is_ok());
+
+        let (_, is_close) =
+            transform_and_classify_ws_message(TsMessage::text("request"), |message| message);
+        assert!(!is_close);
     }
 }
 
@@ -669,20 +763,14 @@ async fn pump_ws(
                 Ok(sealed) => TsMessage::Binary(sealed.into()),
                 Err(err) => {
                     tracing::warn!(error = %err, "e2ee server WS frame encryption failed");
-                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                        reason: "e2ee frame encryption failed".into(),
-                    }))
+                    ws_policy_close("e2ee frame encryption failed")
                 }
             },
             (Some(key), TsMessage::Binary(bytes)) => match e2ee::seal(key, &bytes) {
                 Ok(sealed) => TsMessage::Binary(sealed.into()),
                 Err(err) => {
                     tracing::warn!(error = %err, "e2ee server WS frame encryption failed");
-                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                        reason: "e2ee frame encryption failed".into(),
-                    }))
+                    ws_policy_close("e2ee frame encryption failed")
                 }
             },
             (_, message) => message,
@@ -701,10 +789,7 @@ async fn pump_ws(
                 },
                 Err(err) => {
                     tracing::warn!(error = %err, "e2ee client WS frame authentication failed");
-                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                        reason: "invalid encrypted websocket frame".into(),
-                    }))
+                    ws_policy_close("invalid encrypted websocket frame")
                 }
             },
             (Some(key), TsMessage::Binary(bytes)) => match e2ee::open(key, &bytes) {
@@ -714,16 +799,12 @@ async fn pump_ws(
                 },
                 Err(err) => {
                     tracing::warn!(error = %err, "e2ee client WS frame authentication failed");
-                    TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                        reason: "invalid encrypted websocket frame".into(),
-                    }))
+                    ws_policy_close("invalid encrypted websocket frame")
                 }
             },
             (_, message) => message,
         };
 
-        // Apply metadata sanitization and convergence on client WS frame with exact agent version & window number
         match plain_msg {
             TsMessage::Text(text) => {
                 match mimic::transform_ws_frame(
@@ -739,10 +820,7 @@ async fn pump_ws(
                     Ok(None) => TsMessage::Text(text),
                     Err(err) => {
                         tracing::warn!(error = %err, "forbidden client WS frame payload");
-                        TsMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
-                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                            reason: err.to_string().into(),
-                        }))
+                        ws_policy_close(&err.to_string())
                     }
                 }
             }
@@ -757,34 +835,39 @@ async fn pump_ws(
         while let Some(message) = client_stream.next().await {
             match message {
                 Ok(message) => {
-                    let is_close = matches!(&message, AxumMessage::Close(_));
-                    let Some(ts) = axum_to_ts(message) else { continue };
-                    let ts = open_and_transform_ts(ts);
+                    let Some(ts) = axum_to_ts(message) else {
+                        continue;
+                    };
+                    let (ts, is_close) =
+                        transform_and_classify_ws_message(ts, &open_and_transform_ts);
                     if upstream_sink.send(ts).await.is_err() {
                         break;
                     }
                     if is_close {
-                        let _ = upstream_sink.close().await;
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        let _ = upstream_sink.flush().await;
+        if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, upstream_sink.close())
+            .await
+            .is_err()
+        {
+            tracing::debug!("timed out closing upstream websocket sink");
+        }
     };
+
     let to_client = async {
         while let Some(message) = upstream_stream.next().await {
             match message {
                 Ok(message) => {
-                    let is_close = matches!(&message, TsMessage::Close(_));
-                    let message = seal_ts(message);
+                    let (message, is_close) = transform_and_classify_ws_message(message, &seal_ts);
                     if let Some(message) = ts_to_axum(message) {
                         if client_sink.send(message).await.is_err() {
                             break;
                         }
                         if is_close {
-                            let _ = client_sink.close().await;
                             break;
                         }
                     }
@@ -792,7 +875,12 @@ async fn pump_ws(
                 Err(_) => break,
             }
         }
-        let _ = client_sink.close().await;
+        if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, client_sink.close())
+            .await
+            .is_err()
+        {
+            tracing::debug!("timed out closing downstream websocket sink");
+        }
     };
 
     tokio::pin!(to_upstream);
@@ -803,8 +891,14 @@ async fn pump_ws(
             // Upstream finished producing responses/errors and closed the stream.
         }
         _ = &mut to_upstream => {
-            // Client finished sending request(s); wait for upstream to complete response stream.
-            to_client.await;
+            // Closing the client write half must terminate the upstream request side.
+            // Give the upstream a bounded window to return its final response/close.
+            if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, to_client.as_mut())
+                .await
+                .is_err()
+            {
+                tracing::debug!("timed out draining upstream websocket after client close");
+            }
         }
     }
 }
@@ -817,7 +911,10 @@ async fn ws_tunnel(
     if let Err(response) = check_token(&state, &headers) {
         return response;
     }
-    let Some(target) = headers.get(UPSTREAM_URL_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(target) = headers
+        .get(UPSTREAM_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !allowed_codex_upstream_url(target) {
@@ -832,8 +929,14 @@ async fn ws_tunnel(
     };
     let is_responses_path = true;
     let is_compact_path = false;
-    let (forwarded, agent_version, window_number) =
-        match forwarded_headers(&headers, &profile, &state.deployment_salt, is_responses_path, is_compact_path, state.unknown_field_policy) {
+    let (forwarded, agent_version, window_number) = match forwarded_headers(
+        &headers,
+        &profile,
+        &state.deployment_salt,
+        is_responses_path,
+        is_compact_path,
+        state.unknown_field_policy,
+    ) {
             Ok(res) => res,
             Err(err) => return err.into_response(),
         };
@@ -886,13 +989,20 @@ async fn ws_tunnel(
         };
         request.headers_mut().insert(HOST, host);
     }
-    request.headers_mut().insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-    request.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
+    request
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    request
+        .headers_mut()
+        .insert(UPGRADE, HeaderValue::from_static("websocket"));
     for (name, value) in &forwarded {
         let Some(name) = HeaderName::from_bytes(name.as_str().as_bytes()).ok() else {
             continue;
         };
-        let Ok(value) = value.to_str().map(|v| HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static(""))) else {
+        let Ok(value) = value
+            .to_str()
+            .map(|v| HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")))
+        else {
             continue;
         };
         request.headers_mut().insert(name, value);
@@ -914,7 +1024,8 @@ async fn ws_tunnel(
     let profile_for_ws = profile.clone();
     let salt_for_ws = state.deployment_salt.clone();
     let policy_for_ws = state.unknown_field_policy;
-    let mut response = ws.on_upgrade(move |socket| async move {
+    let mut response = ws
+        .on_upgrade(move |socket| async move {
         pump_ws(
             socket,
             connection,
@@ -926,7 +1037,8 @@ async fn ws_tunnel(
             policy_for_ws,
         )
         .await;
-    }).into_response();
+        })
+        .into_response();
 
     if is_e2ee {
         if let Ok(val) = HeaderValue::from_str("1") {
@@ -955,8 +1067,8 @@ async fn main() {
         tracing::error!("SUB2API_SIDECAR_TOKEN must be set");
         std::process::exit(1);
     }
-    let addr = std::env::var("SUB2API_SIDECAR_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:21333".to_string());
+    let addr =
+        std::env::var("SUB2API_SIDECAR_ADDR").unwrap_or_else(|_| "127.0.0.1:21333".to_string());
     let addr: std::net::SocketAddr = addr
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:21333".parse().unwrap());
@@ -974,12 +1086,21 @@ async fn main() {
     }
 
     let deployment_salt = std::env::var("SUB2API_DEPLOYMENT_SALT").unwrap_or_else(|_| {
-        let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, format!("salt:{token}").as_bytes());
-        d.as_ref().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        let d = aws_lc_rs::digest::digest(
+            &aws_lc_rs::digest::SHA256,
+            format!("salt:{token}").as_bytes(),
+        );
+        d.as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
     });
 
     let unknown_field_policy = UnknownFieldPolicy::from_env();
-    tracing::info!(?unknown_field_policy, "unknown wire field policy configured");
+    tracing::info!(
+        ?unknown_field_policy,
+        "unknown wire field policy configured"
+    );
 
     let db_url = std::env::var("DATABASE_URL")
         .ok()
@@ -1010,13 +1131,15 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route(
             "/v1/http",
-            any(|state: State<AppState>, headers: HeaderMap, req: Request<Body>| async move {
+            any(
+                |state: State<AppState>, headers: HeaderMap, req: Request<Body>| async move {
                 if headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) == Some("1") {
                     http_tunnel_e2ee(state, headers, req).await
                 } else {
                     http_tunnel(state, headers, req).await
                 }
-            }),
+                },
+            ),
         )
         .route("/v1/ws", get(ws_tunnel))
         .with_state(state);

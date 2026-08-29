@@ -11,10 +11,35 @@ pub const REALISTIC_USERNAMES: &[&str] = &[
 ];
 
 pub const REALISTIC_PROJECTS: &[&str] = &[
-    "backend", "core-api", "frontend", "platform", "infra", "gateway", "services", "web-app",
-    "microservices", "pipeline", "auth-service", "engine", "hub", "client", "agent-runner",
-    "dashboard", "worker", "storage", "connector", "runtime", "data-pipeline", "server",
-    "sdk", "toolkit", "dispatcher", "streamer", "proxy-service", "indexer", "scheduler",
+    "backend",
+    "core-api",
+    "frontend",
+    "platform",
+    "infra",
+    "gateway",
+    "services",
+    "web-app",
+    "microservices",
+    "pipeline",
+    "auth-service",
+    "engine",
+    "hub",
+    "client",
+    "agent-runner",
+    "dashboard",
+    "worker",
+    "storage",
+    "connector",
+    "runtime",
+    "data-pipeline",
+    "server",
+    "sdk",
+    "toolkit",
+    "dispatcher",
+    "streamer",
+    "proxy-service",
+    "indexer",
+    "scheduler",
     "controller",
 ];
 
@@ -63,7 +88,8 @@ impl ConvergedIdentity {
     ) -> Self {
         use crate::mimic::identity::{derive_converged_thread_id, derive_converged_uuid_v4};
 
-        let installation_id = if let Some(dev_id) = custom_device_id.filter(|s| !s.trim().is_empty()) {
+        let installation_id =
+            if let Some(dev_id) = custom_device_id.filter(|s| !s.trim().is_empty()) {
             derive_converged_uuid_v4(dev_id.trim(), "codex-device-pseudonym", salt)
         } else {
             derive_converged_uuid_v4(seed, "codex-install-id", salt)
@@ -263,9 +289,7 @@ impl IntoResponse for MimicError {
 
 /// Upstream-audited allowed account x- headers.
 #[cfg(test)]
-pub const UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &[
-    "x-openai-fedramp",
-];
+pub const UPSTREAM_ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &["x-openai-fedramp"];
 
 /// Upstream-audited explicitly stripped account x- headers.
 pub const UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS: &[&str] = &[];
@@ -275,9 +299,7 @@ pub const UPSTREAM_EXPLICITLY_STRIPPED_ACCOUNT_X_HEADERS: &[&str] = &[];
 pub const SUB2API_EXTENDED_ACCOUNT_X_HEADERS: &[&str] = &[];
 
 /// Allowed account x- headers (Strict Whitelist).
-pub const ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &[
-    "x-openai-fedramp",
-];
+pub const ALLOWED_ACCOUNT_X_HEADERS: &[&str] = &["x-openai-fedramp"];
 
 /// Upstream-audited allowed responses x- headers.
 #[cfg(test)]
@@ -285,7 +307,6 @@ pub const UPSTREAM_ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-codex-beta-features",
     "x-codex-parent-thread-id",
-    "x-codex-routing-hint",
     "x-codex-turn-metadata",
     "x-codex-turn-state",
     "x-codex-window-id",
@@ -298,9 +319,8 @@ pub const UPSTREAM_ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
 ];
 
 /// Upstream-audited explicitly stripped responses x- headers.
-pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] = &[
-    "x-oai-attestation",
-];
+pub const UPSTREAM_EXPLICITLY_STRIPPED_RESPONSES_X_HEADERS: &[&str] =
+    &["x-codex-routing-hint", "x-oai-attestation"];
 
 /// sub2api extended responses x- headers.
 #[cfg(test)]
@@ -315,7 +335,6 @@ pub const ALLOWED_RESPONSES_X_HEADERS: &[&str] = &[
     "x-codex-beta-features",
     "x-codex-installation-id",
     "x-codex-parent-thread-id",
-    "x-codex-routing-hint",
     "x-codex-turn-metadata",
     "x-codex-turn-state",
     "x-codex-window-id",
@@ -346,4 +365,5 @@ pub const EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES: &[&str] = &[
     "baggage",
     "cookie",
     "set-cookie",
+    "x-codex-routing-hint",
 ];

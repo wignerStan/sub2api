@@ -466,3 +466,40 @@ mod hardening_tests {
         sanitize(&mut headers).unwrap();
     }
 }
+
+#[cfg(test)]
+mod routing_hint_tests {
+    use super::*;
+
+    #[test]
+    fn strips_routing_hint_before_sidecar_egress() {
+        const THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", HeaderValue::from_static("session-1"));
+        headers.insert("thread-id", HeaderValue::from_static(THREAD_ID));
+        headers.insert(
+            "x-codex-window-id",
+            HeaderValue::from_static("11111111-1111-4111-8111-111111111111:0"),
+        );
+        headers.insert(
+            "x-codex-routing-hint",
+            HeaderValue::from_static("client-controlled-route"),
+        );
+
+        sanitize_and_inject_headers_for_request(
+            &mut headers,
+            "seed",
+            Some("session-1"),
+            None,
+            "salt",
+            Some("0.1.183"),
+            0,
+            true,
+            false,
+            UnknownFieldPolicy::Forbidden,
+        )
+        .expect("routing hint is explicitly stripped, not rejected");
+
+        assert!(headers.get("x-codex-routing-hint").is_none());
+    }
+}
