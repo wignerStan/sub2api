@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Fetch latest openai/codex source and audit Codex wire identity metadata.
+"""Fetch latest openai/codex source and audit Codex wire metadata.
 
 The report is split into:
-  1) account/status check (accounts/check)
-  2) Responses over HTTP
-  3) Responses over WebSocket (upgrade + response.create)
+  1) account/status check requests (accounts/check)
+  2) Responses over HTTP requests
+  3) Responses over WebSocket requests (upgrade + response.create)
+  4) response-side HTTP headers and dynamic header families consumed by Codex
+  5) the full x-codex-turn-metadata schema
 
-It reports Codex-explicit/auth/provider HTTP headers, flat client_metadata keys,
-and the full x-codex-turn-metadata schema parsed from Rust source. One GitHub ref
-is resolved to an immutable SHA before files are fetched, so a report never mixes
-revisions while main is moving.
+Request-side entries describe headers Codex constructs or injects. Response-side
+entries describe headers the Codex client parser knows how to consume; they are
+*not* claims that the production server currently emits every listed header.
+One GitHub ref is resolved to an immutable SHA before files are fetched, so a
+report never mixes revisions while main is moving.
 
 Standard-library only.
 """
@@ -45,6 +48,12 @@ FILES = {
     "provider": "codex-rs/codex-api/src/provider.rs",
     "request": "codex-rs/http-client/src/request.rs",
     "attestation": "codex-rs/core/src/attestation.rs",
+    "rate_limits": "codex-rs/codex-api/src/rate_limits.rs",
+    "api_bridge": "codex-rs/codex-api/src/api_bridge.rs",
+    "sse": "codex-rs/codex-api/src/sse/responses.rs",
+    "safety_buffering": "codex-rs/codex-api/src/safety_buffering.rs",
+    "models": "codex-rs/codex-api/src/endpoint/models.rs",
+    "realtime_call": "codex-rs/codex-api/src/endpoint/realtime_call.rs",
 }
 
 STANDARD_CONSTS = {
@@ -223,6 +232,12 @@ def header(name: str, condition: str, text: str, path: str, anchor: str, value: 
     }
 
 
+def response_header(name: str, condition: str, text: str, path: str, anchor: str) -> dict[str, Any]:
+    item = header(name, condition, text, path, anchor, layer="response-parser")
+    item["evidence"] = "parser_supported_not_server_observed"
+    return item
+
+
 def discover_header_candidates(sources: dict[str, str]) -> list[str]:
     cmap = consts(sources)
     found: set[str] = set()
@@ -234,6 +249,60 @@ def discover_header_candidates(sources: dict[str, str]) -> list[str]:
             if token in cmap:
                 found.add(cmap[token])
     return sorted(found, key=str.lower)
+
+
+def response_header_schema(s: dict[str, str]) -> dict[str, Any]:
+    rate_limits = s["rate_limits"]
+    api_bridge = s["api_bridge"]
+    sse = s["sse"]
+    safety = s["safety_buffering"]
+    models = s["models"]
+    realtime_call = s["realtime_call"]
+
+    exact = [
+        response_header("x-reasoning-included", "successful Responses/SSE or WS handshake metadata", sse, FILES["sse"], '"x-reasoning-included"'),
+        response_header("x-codex-turn-state", "successful Responses/SSE or WS continuation state", sse, FILES["sse"], '"x-codex-turn-state"'),
+        response_header("openai-model", "server-selected model", sse, FILES["sse"], '"openai-model"'),
+        response_header("x-models-etag", "model manifest cache validator", sse, FILES["sse"], '"X-Models-Etag"'),
+        response_header("x-request-id", "upstream request tracking and retry errors", sse, FILES["sse"], '"x-request-id"'),
+        response_header("etag", "model manifest cache validator on GET /models", models, FILES["models"], "get(ETAG)"),
+        response_header("location", "created realtime call resource URI", realtime_call, FILES["realtime_call"], "get(LOCATION)"),
+        response_header("x-codex-safety-buffering-enabled", "safety buffering treatment metadata", safety, FILES["safety_buffering"], '"x-codex-safety-buffering-enabled"'),
+        response_header("x-codex-safety-buffering-faster-model", "safety buffering fallback model", safety, FILES["safety_buffering"], '"x-codex-safety-buffering-faster-model"'),
+        response_header("x-codex-active-limit", "429 usage_limit_reached selects the active quota family", api_bridge, FILES["api_bridge"], '"x-codex-active-limit"'),
+        response_header("x-codex-promo-message", "429 usage_limit_reached promotional message", rate_limits, FILES["rate_limits"], '"x-codex-promo-message"'),
+        response_header("x-codex-rate-limit-reached-type", "429 usage_limit_reached classification", rate_limits, FILES["rate_limits"], '"x-codex-rate-limit-reached-type"'),
+        response_header("x-codex-credits-has-credits", "Codex credits snapshot", rate_limits, FILES["rate_limits"], '"x-codex-credits-has-credits"'),
+        response_header("x-codex-credits-unlimited", "Codex credits snapshot", rate_limits, FILES["rate_limits"], '"x-codex-credits-unlimited"'),
+        response_header("x-codex-credits-balance", "Codex credits snapshot", rate_limits, FILES["rate_limits"], '"x-codex-credits-balance"'),
+        response_header("x-oai-request-id", "fallback upstream request tracking on errors", api_bridge, FILES["api_bridge"], '"x-oai-request-id"'),
+        response_header("cf-ray", "fallback request tracking and unexpected-status diagnostics", api_bridge, FILES["api_bridge"], '"cf-ray"'),
+        response_header("x-openai-authorization-error", "unexpected-status identity authorization diagnostics", api_bridge, FILES["api_bridge"], '"x-openai-authorization-error"'),
+        response_header("x-error-json", "unexpected-status structured error diagnostics", api_bridge, FILES["api_bridge"], '"x-error-json"'),
+    ]
+
+    dynamic = [
+        response_header("x-<limit-id>-primary-used-percent", "discovers and parses a metered quota family", rate_limits, FILES["rate_limits"], 'format!("{prefix}-primary-used-percent")'),
+        response_header("x-<limit-id>-primary-window-minutes", "primary quota window length", rate_limits, FILES["rate_limits"], 'format!("{prefix}-primary-window-minutes")'),
+        response_header("x-<limit-id>-primary-reset-at", "primary quota reset epoch", rate_limits, FILES["rate_limits"], 'format!("{prefix}-primary-reset-at")'),
+        response_header("x-<limit-id>-secondary-used-percent", "secondary quota usage", rate_limits, FILES["rate_limits"], 'format!("{prefix}-secondary-used-percent")'),
+        response_header("x-<limit-id>-secondary-window-minutes", "secondary quota window length", rate_limits, FILES["rate_limits"], 'format!("{prefix}-secondary-window-minutes")'),
+        response_header("x-<limit-id>-secondary-reset-at", "secondary quota reset epoch", rate_limits, FILES["rate_limits"], 'format!("{prefix}-secondary-reset-at")'),
+        response_header("x-<limit-id>-limit-name", "display name for a dynamically discovered quota family", rate_limits, FILES["rate_limits"], 'format!("{prefix}-limit-name")'),
+    ]
+
+    return {
+        "evidence": "client_parser_schema; not proof of production server emission",
+        "exact_headers": exact,
+        "dynamic_header_patterns": dynamic,
+        "websocket_events": [
+            {
+                "type": "codex.rate_limits",
+                "effect": "converted to the same RateLimitSnapshot used by HTTP response headers",
+                "source": src(rate_limits, FILES["rate_limits"], 'event.kind != "codex.rate_limits"', "parse_rate_limit_event"),
+            }
+        ],
+    }
 
 
 def build_report(repo: str, ref: str, commit: dict[str, Any], s: dict[str, str]) -> dict[str, Any]:
@@ -300,13 +369,16 @@ def build_report(repo: str, ref: str, commit: dict[str, Any], s: dict[str, str])
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "source": {"repo": repo, "ref": ref, "commit": commit, "files": list(FILES.values())},
         "scope": {
-            "http_headers": "Codex-explicit + auth/provider/request-preparation headers. Runtime transport-generated values are not guessed.",
+            "request_http_headers": "Codex-explicit + auth/provider/request-preparation headers. Runtime transport-generated values are not guessed.",
+            "response_http_headers": "Headers statically consumed by Codex response/error parsers. Parser support is not evidence that production currently emits each header.",
             "runtime_transport_headers": [
                 "Host", "Content-Length/Transfer-Encoding", "Accept-Encoding",
                 "Connection/Upgrade", "Sec-WebSocket-*", "proxy-added headers",
                 "runtime Cloudflare Cookie values",
             ],
-            "all_discovered_header_candidates": discover_header_candidates(s),
+            "all_discovered_request_header_candidates": discover_header_candidates({
+                k: v for k, v in s.items() if k not in {"rate_limits", "api_bridge", "sse", "safety_buffering"}
+            }),
         },
         "account_status_check": {
             "request": "GET accounts/check",
@@ -348,6 +420,7 @@ def build_report(repo: str, ref: str, commit: dict[str, Any], s: dict[str, str])
                 "Connection/Upgrade/Sec-WebSocket-* are generated by the WebSocket stack, not hard-coded protocol identity fields.",
             ],
         },
+        "response_headers": response_header_schema(s),
         "turn_metadata_schema": {
             "fixed_fields": fixed,
             "flattened_extra": extra,
@@ -374,7 +447,8 @@ def fmt_source(s: dict[str, Any]) -> str:
 def print_headers(items: list[dict[str, Any]]) -> None:
     for h in items:
         value = f"; value={h['value_shape']}" if h.get("value_shape") else ""
-        print(f"  - {h['name']}: {h['condition']}{value}")
+        evidence = f"; evidence={h['evidence']}" if h.get("evidence") else ""
+        print(f"  - {h['name']}: {h['condition']}{value}{evidence}")
         print(f"      source: {fmt_source(h['source'])}")
 
 
@@ -391,7 +465,7 @@ def print_text(r: dict[str, Any]) -> None:
     print(f"commit date: {c.get('date')}")
     print(f"commit: {c.get('message')}\n")
 
-    print("=== 1. ACCOUNT / STATUS CHECK ===")
+    print("=== 1. ACCOUNT / STATUS CHECK REQUEST ===")
     print("Endpoints:")
     for x in r["account_status_check"]["endpoints"]:
         print(f"  - {x}")
@@ -400,7 +474,7 @@ def print_text(r: dict[str, Any]) -> None:
     print("client_metadata: none")
     print("turn_metadata: none")
 
-    print("\n=== 2. RESPONSES / HTTP ===")
+    print("\n=== 2. RESPONSES / HTTP REQUEST ===")
     print("HTTP headers:")
     print_headers(r["responses_http"]["http_headers"])
     print("client_metadata:")
@@ -409,7 +483,7 @@ def print_text(r: dict[str, Any]) -> None:
     print(f"  canonical: {r['responses_http']['turn_metadata']['canonical']}")
     print(f"  compatibility: {r['responses_http']['turn_metadata']['compatibility_header']}")
 
-    print("\n=== 3. RESPONSES / WEBSOCKET ===")
+    print("\n=== 3. RESPONSES / WEBSOCKET REQUEST ===")
     print("Handshake HTTP headers:")
     print_headers(r["responses_websocket"]["handshake_http_headers"])
     print("Base response.create client_metadata:")
@@ -417,7 +491,17 @@ def print_text(r: dict[str, Any]) -> None:
     print("WS-only/additional response.create client_metadata:")
     print_cm(r["responses_websocket"]["client_metadata_ws_additions"])
 
-    print("\n=== 4. FULL x-codex-turn-metadata SCHEMA ===")
+    print("\n=== 4. RESPONSE HEADERS CONSUMED BY CODEX ===")
+    print("Exact response headers:")
+    print_headers(r["response_headers"]["exact_headers"])
+    print("Dynamic response header patterns:")
+    print_headers(r["response_headers"]["dynamic_header_patterns"])
+    print("WebSocket response-side events:")
+    for event in r["response_headers"]["websocket_events"]:
+        print(f"  - {event['type']}: {event['effect']}")
+        print(f"      source: {fmt_source(event['source'])}")
+
+    print("\n=== 5. FULL x-codex-turn-metadata SCHEMA ===")
     for f in r["turn_metadata_schema"]["fixed_fields"]:
         print(f"  - {f['name']}: {f['type']}")
     if r["turn_metadata_schema"]["flattened_extra"]:
@@ -439,6 +523,9 @@ def self_test() -> None:
     f = struct_fields(demo, "demo.rs", "Demo")
     assert [x["name"] for x in f] == ["a", "b", "extra"]
     assert f[-1]["flattened"]
+
+    dynamic_demo = 'let name = format!("{prefix}-limit-name");'
+    assert src(dynamic_demo, "demo.rs", 'format!("{prefix}-limit-name")')["line"] == 1
     print("self-test: ok")
 
 

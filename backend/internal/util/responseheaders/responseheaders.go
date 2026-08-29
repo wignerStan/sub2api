@@ -44,6 +44,64 @@ var hopByHopHeaders = map[string]struct{}{
 	"connection":        {},
 }
 
+var codexQuotaHeaderSuffixes = []string{
+	"-primary-used-percent",
+	"-primary-window-minutes",
+	"-primary-reset-at",
+	"-primary-reset-after-seconds",
+	"-secondary-used-percent",
+	"-secondary-window-minutes",
+	"-secondary-reset-at",
+	"-secondary-reset-after-seconds",
+	"-primary-over-secondary-limit-percent",
+	"-limit-name",
+}
+
+// IsCodexQuotaHeader reports whether a response header carries an upstream
+// Codex quota snapshot. Codex discovers named limit families dynamically from
+// x-<family>-primary-used-percent, so the guard intentionally covers custom
+// provider families as well as the default x-codex family.
+func IsCodexQuotaHeader(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if !strings.HasPrefix(name, "x-") {
+		return false
+	}
+
+	switch name {
+	case "x-codex-active-limit",
+		"x-codex-limit-name",
+		"x-codex-credits-has-credits",
+		"x-codex-credits-unlimited",
+		"x-codex-credits-balance",
+		"x-codex-promo-message",
+		"x-codex-rate-limit-reached-type":
+		return true
+	}
+
+	for _, suffix := range codexQuotaHeaderSuffixes {
+		if !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		family := strings.TrimSuffix(name, suffix)
+		if !strings.HasPrefix(family, "x-") {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(family, "x-")) != ""
+	}
+	return false
+}
+
+// StripCodexQuotaHeaders removes provider-account quota metadata at the final
+// client egress boundary. Internal callers should retain the original upstream
+// headers for scheduling and account-health updates.
+func StripCodexQuotaHeaders(headers http.Header) {
+	for key := range headers {
+		if IsCodexQuotaHeader(key) {
+			headers.Del(key)
+		}
+	}
+}
+
 type CompiledHeaderFilter struct {
 	allowed     map[string]struct{}
 	forceRemove map[string]struct{}
@@ -92,7 +150,13 @@ func FilterHeaders(src http.Header, filter *CompiledHeaderFilter) http.Header {
 
 	filtered := make(http.Header, len(src))
 	for key, values := range src {
-		lower := strings.ToLower(key)
+		lower := strings.ToLower(strings.TrimSpace(key))
+		// Upstream account quota must never become the downstream Codex
+		// client's authoritative status, even when an administrator adds a
+		// matching header to AdditionalAllowed.
+		if IsCodexQuotaHeader(lower) {
+			continue
+		}
 		if _, blocked := filter.forceRemove[lower]; blocked {
 			continue
 		}
@@ -111,6 +175,7 @@ func FilterHeaders(src http.Header, filter *CompiledHeaderFilter) http.Header {
 }
 
 func WriteFilteredHeaders(dst http.Header, src http.Header, filter *CompiledHeaderFilter) {
+	StripCodexQuotaHeaders(dst)
 	filtered := FilterHeaders(src, filter)
 	for key, values := range filtered {
 		for _, value := range values {
