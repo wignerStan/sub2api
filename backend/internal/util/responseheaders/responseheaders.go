@@ -54,6 +54,7 @@ var codexQuotaHeaderSuffixes = []string{
 	"-secondary-reset-at",
 	"-secondary-reset-after-seconds",
 	"-primary-over-secondary-limit-percent",
+	"-limit-name",
 }
 
 // IsCodexQuotaHeader reports whether a response header carries an upstream

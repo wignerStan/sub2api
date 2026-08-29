@@ -280,7 +280,7 @@ fn forwarded_headers(
     Ok((out, agent_version, window_number))
 }
 
-const ALLOWED_CLIENT_RESPONSE_HEADERS: &[&str] = &[
+const ALLOWED_TUNNEL_RESPONSE_HEADERS: &[&str] = &[
     "content-type",
     "content-language",
     "cache-control",
@@ -308,21 +308,36 @@ const ALLOWED_CLIENT_RESPONSE_HEADERS: &[&str] = &[
     "x-codex-safety-buffering-faster-model",
 ];
 
-const EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS: &[&str] = &[
-    "set-cookie",
-    "cf-ray",
-    "cf-cache-status",
-    "x-envoy-upstream-service-time",
-    "x-openai-backend",
-    "x-codex-routing-hint",
+// These headers are trusted metadata for the Rust->Go loopback hop.
+// They may be needed for scheduler/failover/error classification, but
+// the public Go egress must not expose provider-account quota state.
+const INTERNAL_ONLY_TUNNEL_RESPONSE_HEADERS: &[&str] = &[
     "x-codex-active-limit",
     "x-codex-credits-has-credits",
     "x-codex-credits-unlimited",
     "x-codex-credits-balance",
     "x-codex-promo-message",
     "x-codex-rate-limit-reached-type",
+    "cf-ray",
     "x-openai-authorization-error",
     "x-error-json",
+];
+
+const EXPLICITLY_STRIPPED_TUNNEL_RESPONSE_HEADERS: &[&str] = &[
+    "set-cookie",
+    "cf-cache-status",
+    "x-envoy-upstream-service-time",
+    "x-openai-backend",
+    "x-codex-routing-hint",
+];
+
+const EXACT_CODEX_QUOTA_RESPONSE_HEADERS: &[&str] = &[
+    "x-codex-active-limit",
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+    "x-codex-credits-balance",
+    "x-codex-promo-message",
+    "x-codex-rate-limit-reached-type",
 ];
 
 const CODEX_QUOTA_RESPONSE_HEADER_SUFFIXES: &[&str] = &[
@@ -348,11 +363,11 @@ const CODEX_QUOTA_RESPONSE_HEADER_PATTERNS: &[&str] = &[
 
 fn is_codex_quota_response_header(name: &str) -> bool {
     let name = name.trim().to_ascii_lowercase();
+    if EXACT_CODEX_QUOTA_RESPONSE_HEADERS.contains(&name.as_str()) {
+        return true;
+    }
     if !name.starts_with("x-") {
         return false;
-    }
-    if EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS.contains(&name.as_str()) {
-        return true;
     }
     CODEX_QUOTA_RESPONSE_HEADER_SUFFIXES.iter().any(|suffix| {
         name.strip_suffix(suffix)
@@ -360,12 +375,17 @@ fn is_codex_quota_response_header(name: &str) -> bool {
     })
 }
 
-fn is_allowed_client_response_header(name: &str) -> bool {
-    ALLOWED_CLIENT_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+fn is_allowed_tunnel_response_header(name: &str) -> bool {
+    ALLOWED_TUNNEL_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
-fn is_explicitly_stripped_client_response_header(name: &str) -> bool {
-    EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+fn is_internal_only_tunnel_response_header(name: &str) -> bool {
+    INTERNAL_ONLY_TUNNEL_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+        || is_codex_quota_response_header(name)
+}
+
+fn is_explicitly_stripped_tunnel_response_header(name: &str) -> bool {
+    EXPLICITLY_STRIPPED_TUNNEL_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
 }
 
 fn strip_response_encoding(headers: &mut HeaderMap) {
@@ -377,9 +397,9 @@ fn strip_response_encoding(headers: &mut HeaderMap) {
                 || key.starts_with("sec-websocket-")
                 || key.starts_with(CONTROL_PREFIX)
                 || key.starts_with("x-s2s-")
-                || is_explicitly_stripped_client_response_header(key)
-                || is_codex_quota_response_header(key)
-                || !is_allowed_client_response_header(key)
+                || is_explicitly_stripped_tunnel_response_header(key)
+                || !(is_allowed_tunnel_response_header(key)
+                    || is_internal_only_tunnel_response_header(key))
         })
         .cloned()
         .collect();
@@ -394,7 +414,7 @@ mod response_header_policy_tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn response_headers_fail_closed_and_preserve_transport_errors() {
+    fn response_headers_fail_closed_but_keep_trusted_internal_signals() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         headers.insert("retry-after", HeaderValue::from_static("18000"));
@@ -410,11 +430,19 @@ mod response_header_policy_tests {
             HeaderValue::from_static("89"),
         );
         headers.insert(
+            "x-codex-bengalfox-limit-name",
+            HeaderValue::from_static("sonic"),
+        );
+        headers.insert(
             "x-bengalfox-primary-used-percent",
             HeaderValue::from_static("42"),
         );
         headers.insert("x-codex-credits-balance", HeaderValue::from_static("9.99"));
         headers.insert("x-codex-active-limit", HeaderValue::from_static("codex"));
+        headers.insert("cf-ray", HeaderValue::from_static("ray-id"));
+        headers.insert("x-error-json", HeaderValue::from_static("e30="));
+        headers.insert("set-cookie", HeaderValue::from_static("private=1"));
+        headers.insert("x-codex-routing-hint", HeaderValue::from_static("private"));
         headers.insert(
             "x-future-upstream-header",
             HeaderValue::from_static("must-drop"),
@@ -423,24 +451,29 @@ mod response_header_policy_tests {
 
         strip_response_encoding(&mut headers);
 
-        for allowed in [
+        for kept in [
             "content-type",
             "retry-after",
             "x-request-id",
             "x-ratelimit-remaining-requests",
             "openai-model",
             "x-codex-turn-state",
-        ] {
-            assert!(
-                headers.contains_key(allowed),
-                "expected {allowed} to survive"
-            );
-        }
-        for blocked in [
             "x-codex-primary-used-percent",
+            "x-codex-bengalfox-limit-name",
             "x-bengalfox-primary-used-percent",
             "x-codex-credits-balance",
             "x-codex-active-limit",
+            "cf-ray",
+            "x-error-json",
+        ] {
+            assert!(
+                headers.contains_key(kept),
+                "expected trusted-hop header {kept} to survive"
+            );
+        }
+        for blocked in [
+            "set-cookie",
+            "x-codex-routing-hint",
             "x-future-upstream-header",
             "server",
         ] {
@@ -468,9 +501,9 @@ mod response_header_policy_tests {
                 .expect("response header name")
                 .to_ascii_lowercase();
             assert!(
-                is_allowed_client_response_header(&name)
-                    || is_explicitly_stripped_client_response_header(&name)
-                    || is_codex_quota_response_header(&name),
+                is_allowed_tunnel_response_header(&name)
+                    || is_internal_only_tunnel_response_header(&name)
+                    || is_explicitly_stripped_tunnel_response_header(&name),
                 "audited Codex response header '{name}' is not explicitly classified"
             );
         }

@@ -103,6 +103,8 @@ func TestIsCodexQuotaHeader(t *testing.T) {
 		"X-Codex-Active-Limit",
 		"X-Codex-Limit-Name",
 		"X-Codex-Bengalfox-Primary-Used-Percent",
+		"X-Codex-Bengalfox-Limit-Name",
+		"X-Bengalfox-Limit-Name",
 		"X-Bengalfox-Primary-Used-Percent",
 		"X-Codex-Credits-Has-Credits",
 		"X-Codex-Credits-Unlimited",
@@ -124,8 +126,7 @@ func TestIsCodexQuotaHeader(t *testing.T) {
 		"X-Reasoning-Included",
 		"X-Request-Id",
 		"X-RateLimit-Remaining-Requests",
-		"X-Bengalfox-Limit-Name",
-		"X-Trace-Limit-Name",
+		"X-Trace-Label",
 		"Primary-Used-Percent",
 		"X-Primary-Used-Percent",
 	}
@@ -172,20 +173,6 @@ func TestFilterHeadersCodexQuotaCannotBeAllowlisted(t *testing.T) {
 	}
 	if got := filtered.Get("X-Reasoning-Included"); got != "1" {
 		t.Fatalf("expected X-Reasoning-Included passthrough, got %q", got)
-	}
-}
-
-func TestFilterHeadersAllowsUnrelatedLimitName(t *testing.T) {
-	src := http.Header{}
-	src.Set("X-Bengalfox-Limit-Name", "Bengalfox")
-
-	filtered := FilterHeaders(src, CompileHeaderFilter(config.ResponseHeaderConfig{
-		Enabled:           true,
-		AdditionalAllowed: []string{"x-bengalfox-limit-name"},
-	}))
-
-	if got := filtered.Get("X-Bengalfox-Limit-Name"); got != "Bengalfox" {
-		t.Fatalf("expected unrelated limit-name passthrough, got %q", got)
 	}
 }
 

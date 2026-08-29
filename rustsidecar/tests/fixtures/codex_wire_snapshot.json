@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-29T06:23:55.506719+00:00",
+  "generated_at": "2026-08-29T06:42:06.007119+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
@@ -25,7 +25,9 @@
       "codex-rs/codex-api/src/rate_limits.rs",
       "codex-rs/codex-api/src/api_bridge.rs",
       "codex-rs/codex-api/src/sse/responses.rs",
-      "codex-rs/codex-api/src/safety_buffering.rs"
+      "codex-rs/codex-api/src/safety_buffering.rs",
+      "codex-rs/codex-api/src/endpoint/models.rs",
+      "codex-rs/codex-api/src/endpoint/realtime_call.rs"
     ]
   },
   "scope": {
@@ -897,6 +899,30 @@
           "path": "codex-rs/codex-api/src/sse/responses.rs",
           "line": 33,
           "symbol": "x-request-id"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "etag",
+        "condition": "model manifest cache validator on GET /models",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/endpoint/models.rs",
+          "line": 66,
+          "symbol": "etag"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "location",
+        "condition": "created realtime call resource URI",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/endpoint/realtime_call.rs",
+          "line": 261,
+          "symbol": "location"
         },
         "evidence": "parser_supported_not_server_observed"
       },

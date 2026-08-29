@@ -52,6 +52,8 @@ FILES = {
     "api_bridge": "codex-rs/codex-api/src/api_bridge.rs",
     "sse": "codex-rs/codex-api/src/sse/responses.rs",
     "safety_buffering": "codex-rs/codex-api/src/safety_buffering.rs",
+    "models": "codex-rs/codex-api/src/endpoint/models.rs",
+    "realtime_call": "codex-rs/codex-api/src/endpoint/realtime_call.rs",
 }
 
 STANDARD_CONSTS = {
@@ -254,6 +256,8 @@ def response_header_schema(s: dict[str, str]) -> dict[str, Any]:
     api_bridge = s["api_bridge"]
     sse = s["sse"]
     safety = s["safety_buffering"]
+    models = s["models"]
+    realtime_call = s["realtime_call"]
 
     exact = [
         response_header("x-reasoning-included", "successful Responses/SSE or WS handshake metadata", sse, FILES["sse"], '"x-reasoning-included"'),
@@ -261,6 +265,8 @@ def response_header_schema(s: dict[str, str]) -> dict[str, Any]:
         response_header("openai-model", "server-selected model", sse, FILES["sse"], '"openai-model"'),
         response_header("x-models-etag", "model manifest cache validator", sse, FILES["sse"], '"X-Models-Etag"'),
         response_header("x-request-id", "upstream request tracking and retry errors", sse, FILES["sse"], '"x-request-id"'),
+        response_header("etag", "model manifest cache validator on GET /models", models, FILES["models"], "get(ETAG)"),
+        response_header("location", "created realtime call resource URI", realtime_call, FILES["realtime_call"], "get(LOCATION)"),
         response_header("x-codex-safety-buffering-enabled", "safety buffering treatment metadata", safety, FILES["safety_buffering"], '"x-codex-safety-buffering-enabled"'),
         response_header("x-codex-safety-buffering-faster-model", "safety buffering fallback model", safety, FILES["safety_buffering"], '"x-codex-safety-buffering-faster-model"'),
         response_header("x-codex-active-limit", "429 usage_limit_reached selects the active quota family", api_bridge, FILES["api_bridge"], '"x-codex-active-limit"'),
