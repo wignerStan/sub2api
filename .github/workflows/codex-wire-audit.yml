@@ -49,6 +49,9 @@ jobs:
           mkdir -p rustsidecar/tests/fixtures
           cp scripts/codex_wire_snapshot.json rustsidecar/tests/fixtures/codex_wire_snapshot.json
 
+      # Rust tests consume the generated response-header schema too: every
+      # parser-supported response header/pattern must be explicitly classified
+      # as safe tunnel metadata, internal-only metadata, or stripped.
       - name: Test sidecar exact snapshot fidelity against updated schema
         working-directory: rustsidecar
         run: |
