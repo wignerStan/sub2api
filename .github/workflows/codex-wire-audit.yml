@@ -2,8 +2,8 @@ name: codex-wire-audit
 
 on:
   schedule:
-    # GitHub evaluates cron only from the repository default branch. A copy of
-    # this workflow also lives there and deliberately audits AUDIT_BRANCH.
+    # GitHub evaluates scheduled workflows only from the repository default
+    # branch. The default-branch bootstrap copy checks out AUDIT_BRANCH below.
     - cron: '0 4 * * *'
   workflow_dispatch:
 
