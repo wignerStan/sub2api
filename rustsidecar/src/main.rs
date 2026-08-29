@@ -280,17 +280,222 @@ fn forwarded_headers(
     Ok((out, agent_version, window_number))
 }
 
+const ALLOWED_CLIENT_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-language",
+    "cache-control",
+    "etag",
+    "last-modified",
+    "expires",
+    "vary",
+    "date",
+    "retry-after",
+    "location",
+    "www-authenticate",
+    "x-request-id",
+    "x-oai-request-id",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "x-reasoning-included",
+    "openai-model",
+    "x-models-etag",
+    "x-codex-turn-state",
+    "x-codex-safety-buffering-enabled",
+    "x-codex-safety-buffering-faster-model",
+];
+
+const EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS: &[&str] = &[
+    "set-cookie",
+    "cf-ray",
+    "cf-cache-status",
+    "x-envoy-upstream-service-time",
+    "x-openai-backend",
+    "x-codex-routing-hint",
+    "x-codex-active-limit",
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+    "x-codex-credits-balance",
+    "x-codex-promo-message",
+    "x-codex-rate-limit-reached-type",
+    "x-openai-authorization-error",
+    "x-error-json",
+];
+
+const CODEX_QUOTA_RESPONSE_HEADER_SUFFIXES: &[&str] = &[
+    "-primary-used-percent",
+    "-primary-window-minutes",
+    "-primary-reset-at",
+    "-secondary-used-percent",
+    "-secondary-window-minutes",
+    "-secondary-reset-at",
+    "-limit-name",
+];
+
+#[cfg(test)]
+const CODEX_QUOTA_RESPONSE_HEADER_PATTERNS: &[&str] = &[
+    "x-<limit-id>-primary-used-percent",
+    "x-<limit-id>-primary-window-minutes",
+    "x-<limit-id>-primary-reset-at",
+    "x-<limit-id>-secondary-used-percent",
+    "x-<limit-id>-secondary-window-minutes",
+    "x-<limit-id>-secondary-reset-at",
+    "x-<limit-id>-limit-name",
+];
+
+fn is_codex_quota_response_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    if !name.starts_with("x-") {
+        return false;
+    }
+    if EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS.contains(&name.as_str()) {
+        return true;
+    }
+    CODEX_QUOTA_RESPONSE_HEADER_SUFFIXES.iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .is_some_and(|family| family.len() > 2 && family.starts_with("x-"))
+    })
+}
+
+fn is_allowed_client_response_header(name: &str) -> bool {
+    ALLOWED_CLIENT_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+}
+
+fn is_explicitly_stripped_client_response_header(name: &str) -> bool {
+    EXPLICITLY_STRIPPED_CLIENT_RESPONSE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+}
+
 fn strip_response_encoding(headers: &mut HeaderMap) {
-    headers.remove(CONTENT_ENCODING);
-    headers.remove(CONTENT_LENGTH);
-    headers.remove(TRANSFER_ENCODING);
-    // Strip upstream tracking/cookie/routing headers from egress response to prevent downstream leakage
-    headers.remove(axum::http::header::SET_COOKIE);
-    headers.remove(HeaderName::from_static("cf-ray"));
-    headers.remove(HeaderName::from_static("cf-cache-status"));
-    headers.remove(HeaderName::from_static("x-envoy-upstream-service-time"));
-    headers.remove(HeaderName::from_static("x-openai-backend"));
-    headers.remove(HeaderName::from_static("x-codex-routing-hint"));
+    let keys_to_remove: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let key = name.as_str();
+            is_hop_by_hop(name)
+                || key.starts_with("sec-websocket-")
+                || key.starts_with(CONTROL_PREFIX)
+                || key.starts_with("x-s2s-")
+                || is_explicitly_stripped_client_response_header(key)
+                || is_codex_quota_response_header(key)
+                || !is_allowed_client_response_header(key)
+        })
+        .cloned()
+        .collect();
+    for key in keys_to_remove {
+        headers.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod response_header_policy_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn response_headers_fail_closed_and_preserve_transport_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("retry-after", HeaderValue::from_static("18000"));
+        headers.insert("x-request-id", HeaderValue::from_static("req_123"));
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("7"),
+        );
+        headers.insert("openai-model", HeaderValue::from_static("gpt-5"));
+        headers.insert("x-codex-turn-state", HeaderValue::from_static("turn-state"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("89"),
+        );
+        headers.insert(
+            "x-bengalfox-primary-used-percent",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert("x-codex-credits-balance", HeaderValue::from_static("9.99"));
+        headers.insert("x-codex-active-limit", HeaderValue::from_static("codex"));
+        headers.insert(
+            "x-future-upstream-header",
+            HeaderValue::from_static("must-drop"),
+        );
+        headers.insert("server", HeaderValue::from_static("must-drop"));
+
+        strip_response_encoding(&mut headers);
+
+        for allowed in [
+            "content-type",
+            "retry-after",
+            "x-request-id",
+            "x-ratelimit-remaining-requests",
+            "openai-model",
+            "x-codex-turn-state",
+        ] {
+            assert!(
+                headers.contains_key(allowed),
+                "expected {allowed} to survive"
+            );
+        }
+        for blocked in [
+            "x-codex-primary-used-percent",
+            "x-bengalfox-primary-used-percent",
+            "x-codex-credits-balance",
+            "x-codex-active-limit",
+            "x-future-upstream-header",
+            "server",
+        ] {
+            assert!(
+                !headers.contains_key(blocked),
+                "expected {blocked} to be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn audited_codex_response_header_schema_is_fully_classified() {
+        let snapshot_raw = include_str!("../tests/fixtures/codex_wire_snapshot.json");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(snapshot_raw).expect("valid codex wire snapshot");
+
+        let exact = snapshot
+            .pointer("/response_headers/exact_headers")
+            .and_then(|value| value.as_array())
+            .expect("response_headers.exact_headers");
+        for item in exact {
+            let name = item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .expect("response header name")
+                .to_ascii_lowercase();
+            assert!(
+                is_allowed_client_response_header(&name)
+                    || is_explicitly_stripped_client_response_header(&name)
+                    || is_codex_quota_response_header(&name),
+                "audited Codex response header '{name}' is not explicitly classified"
+            );
+        }
+
+        let snapshot_patterns: BTreeSet<String> = snapshot
+            .pointer("/response_headers/dynamic_header_patterns")
+            .and_then(|value| value.as_array())
+            .expect("response_headers.dynamic_header_patterns")
+            .iter()
+            .map(|item| {
+                item.get("name")
+                    .and_then(|value| value.as_str())
+                    .expect("response pattern name")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let code_patterns: BTreeSet<String> = CODEX_QUOTA_RESPONSE_HEADER_PATTERNS
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        assert_eq!(
+            code_patterns, snapshot_patterns,
+            "Codex dynamic response-header patterns changed upstream; classify them before forwarding"
+        );
+    }
 }
 
 async fn http_tunnel(
@@ -328,9 +533,9 @@ async fn http_tunnel(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -462,9 +667,9 @@ async fn http_tunnel_e2ee(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -937,9 +1142,9 @@ async fn ws_tunnel(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let e2ee_key = match headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) {
         Some("1") => match e2ee::derive_key_from_token(state.token.as_bytes()) {
             Ok(key) => Some(key),
@@ -1026,17 +1231,17 @@ async fn ws_tunnel(
     let policy_for_ws = state.unknown_field_policy;
     let mut response = ws
         .on_upgrade(move |socket| async move {
-        pump_ws(
-            socket,
-            connection,
-            e2ee_key,
-            profile_for_ws,
-            salt_for_ws,
-            agent_version,
-            Some(window_number),
-            policy_for_ws,
-        )
-        .await;
+            pump_ws(
+                socket,
+                connection,
+                e2ee_key,
+                profile_for_ws,
+                salt_for_ws,
+                agent_version,
+                Some(window_number),
+                policy_for_ws,
+            )
+            .await;
         })
         .into_response();
 
@@ -1133,11 +1338,11 @@ async fn main() {
             "/v1/http",
             any(
                 |state: State<AppState>, headers: HeaderMap, req: Request<Body>| async move {
-                if headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) == Some("1") {
-                    http_tunnel_e2ee(state, headers, req).await
-                } else {
-                    http_tunnel(state, headers, req).await
-                }
+                    if headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) == Some("1") {
+                        http_tunnel_e2ee(state, headers, req).await
+                    } else {
+                        http_tunnel(state, headers, req).await
+                    }
                 },
             ),
         )

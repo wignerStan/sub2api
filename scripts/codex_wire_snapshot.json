@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-08-27T14:56:25.441183+00:00",
+  "generated_at": "2026-08-29T06:23:55.506719+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "bce96bcb43c1aeea69fa0aa230809fa9e4eba80e",
-      "date": "2026-08-27T14:54:13Z",
-      "message": "Reject oversized reviewed terminal input (#41159)",
-      "html_url": "https://github.com/openai/codex/commit/bce96bcb43c1aeea69fa0aa230809fa9e4eba80e"
+      "sha": "6478a751fde8884b2fdc76486fe23175a8e795d4",
+      "date": "2026-08-29T06:05:28Z",
+      "message": "Organize bundled Rust resources under asset directories (#41477)",
+      "html_url": "https://github.com/openai/codex/commit/6478a751fde8884b2fdc76486fe23175a8e795d4"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
@@ -21,11 +21,16 @@
       "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
       "codex-rs/codex-api/src/provider.rs",
       "codex-rs/http-client/src/request.rs",
-      "codex-rs/core/src/attestation.rs"
+      "codex-rs/core/src/attestation.rs",
+      "codex-rs/codex-api/src/rate_limits.rs",
+      "codex-rs/codex-api/src/api_bridge.rs",
+      "codex-rs/codex-api/src/sse/responses.rs",
+      "codex-rs/codex-api/src/safety_buffering.rs"
     ]
   },
   "scope": {
-    "http_headers": "Codex-explicit + auth/provider/request-preparation headers. Runtime transport-generated values are not guessed.",
+    "request_http_headers": "Codex-explicit + auth/provider/request-preparation headers. Runtime transport-generated values are not guessed.",
+    "response_http_headers": "Headers statically consumed by Codex response/error parsers. Parser support is not evidence that production currently emits each header.",
     "runtime_transport_headers": [
       "Host",
       "Content-Length/Transfer-Encoding",
@@ -35,7 +40,7 @@
       "proxy-added headers",
       "runtime Cloudflare Cookie values"
     ],
-    "all_discovered_header_candidates": [
+    "all_discovered_request_header_candidates": [
       "Accept",
       "Authorization",
       "ChatGPT-Account-ID",
@@ -107,7 +112,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 235,
+          "line": 251,
           "symbol": "ChatGPT-Account-ID"
         }
       },
@@ -118,7 +123,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 241,
+          "line": 257,
           "symbol": "X-OpenAI-Fedramp"
         }
       }
@@ -283,7 +288,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 2078,
+          "line": 2118,
           "symbol": "x-codex-beta-features"
         }
       },
@@ -294,7 +299,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 150,
+          "line": 154,
           "symbol": "x-codex-routing-hint"
         }
       },
@@ -316,7 +321,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 155,
+          "line": 159,
           "symbol": "x-openai-memgen-request"
         }
       },
@@ -327,7 +332,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 164,
+          "line": 168,
           "symbol": "x-openai-internal-codex-responses-lite"
         }
       },
@@ -338,7 +343,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 151,
+          "line": 155,
           "symbol": "x-codex-turn-state"
         }
       },
@@ -627,7 +632,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 2078,
+          "line": 2118,
           "symbol": "x-codex-beta-features"
         }
       },
@@ -638,7 +643,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 150,
+          "line": 154,
           "symbol": "x-codex-routing-hint"
         }
       },
@@ -660,7 +665,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 155,
+          "line": 159,
           "symbol": "x-openai-memgen-request"
         }
       },
@@ -671,7 +676,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 164,
+          "line": 168,
           "symbol": "x-openai-internal-codex-responses-lite"
         }
       },
@@ -682,7 +687,7 @@
         "layer": "ws-handshake",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 148,
+          "line": 152,
           "symbol": "OpenAI-Beta"
         }
       },
@@ -693,7 +698,7 @@
         "layer": "ws-handshake",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 157,
+          "line": 161,
           "symbol": "x-responsesapi-include-timing-metrics"
         }
       }
@@ -802,7 +807,7 @@
         "name": "ws_request_header_x_openai_internal_codex_responses_lite",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 162,
+          "line": 166,
           "symbol": "WS client_metadata"
         }
       },
@@ -818,7 +823,7 @@
         "name": "x-codex-ws-stream-request-start-ms",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 160,
+          "line": 164,
           "symbol": "WS client_metadata"
         }
       }
@@ -830,6 +835,312 @@
     "notes": [
       "x-codex-turn-state is carried in response.create client_metadata for per-message WS continuation state.",
       "Connection/Upgrade/Sec-WebSocket-* are generated by the WebSocket stack, not hard-coded protocol identity fields."
+    ]
+  },
+  "response_headers": {
+    "evidence": "client_parser_schema; not proof of production server emission",
+    "exact_headers": [
+      {
+        "name": "x-reasoning-included",
+        "condition": "successful Responses/SSE or WS handshake metadata",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/sse/responses.rs",
+          "line": 30,
+          "symbol": "x-reasoning-included"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-turn-state",
+        "condition": "successful Responses/SSE or WS continuation state",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/sse/responses.rs",
+          "line": 31,
+          "symbol": "x-codex-turn-state"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "openai-model",
+        "condition": "server-selected model",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/sse/responses.rs",
+          "line": 32,
+          "symbol": "openai-model"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-models-etag",
+        "condition": "model manifest cache validator",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/sse/responses.rs",
+          "line": 45,
+          "symbol": "x-models-etag"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-request-id",
+        "condition": "upstream request tracking and retry errors",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/sse/responses.rs",
+          "line": 33,
+          "symbol": "x-request-id"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-safety-buffering-enabled",
+        "condition": "safety buffering treatment metadata",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/safety_buffering.rs",
+          "line": 4,
+          "symbol": "x-codex-safety-buffering-enabled"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-safety-buffering-faster-model",
+        "condition": "safety buffering fallback model",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/safety_buffering.rs",
+          "line": 6,
+          "symbol": "x-codex-safety-buffering-faster-model"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-active-limit",
+        "condition": "429 usage_limit_reached selects the active quota family",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/api_bridge.rs",
+          "line": 199,
+          "symbol": "x-codex-active-limit"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-promo-message",
+        "condition": "429 usage_limit_reached promotional message",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 180,
+          "symbol": "x-codex-promo-message"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-rate-limit-reached-type",
+        "condition": "429 usage_limit_reached classification",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 187,
+          "symbol": "x-codex-rate-limit-reached-type"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-credits-has-credits",
+        "condition": "Codex credits snapshot",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 218,
+          "symbol": "x-codex-credits-has-credits"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-credits-unlimited",
+        "condition": "Codex credits snapshot",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 219,
+          "symbol": "x-codex-credits-unlimited"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-codex-credits-balance",
+        "condition": "Codex credits snapshot",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 220,
+          "symbol": "x-codex-credits-balance"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-oai-request-id",
+        "condition": "fallback upstream request tracking on errors",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/api_bridge.rs",
+          "line": 201,
+          "symbol": "x-oai-request-id"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "cf-ray",
+        "condition": "fallback request tracking and unexpected-status diagnostics",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/api_bridge.rs",
+          "line": 202,
+          "symbol": "cf-ray"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-openai-authorization-error",
+        "condition": "unexpected-status identity authorization diagnostics",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/api_bridge.rs",
+          "line": 203,
+          "symbol": "x-openai-authorization-error"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-error-json",
+        "condition": "unexpected-status structured error diagnostics",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/api_bridge.rs",
+          "line": 204,
+          "symbol": "x-error-json"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      }
+    ],
+    "dynamic_header_patterns": [
+      {
+        "name": "x-<limit-id>-primary-used-percent",
+        "condition": "discovers and parses a metered quota family",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 70,
+          "symbol": "x-<limit-id>-primary-used-percent"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-primary-window-minutes",
+        "condition": "primary quota window length",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 71,
+          "symbol": "x-<limit-id>-primary-window-minutes"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-primary-reset-at",
+        "condition": "primary quota reset epoch",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 72,
+          "symbol": "x-<limit-id>-primary-reset-at"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-secondary-used-percent",
+        "condition": "secondary quota usage",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 77,
+          "symbol": "x-<limit-id>-secondary-used-percent"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-secondary-window-minutes",
+        "condition": "secondary quota window length",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 78,
+          "symbol": "x-<limit-id>-secondary-window-minutes"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-secondary-reset-at",
+        "condition": "secondary quota reset epoch",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 79,
+          "symbol": "x-<limit-id>-secondary-reset-at"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      },
+      {
+        "name": "x-<limit-id>-limit-name",
+        "condition": "display name for a dynamically discovered quota family",
+        "value_shape": null,
+        "layer": "response-parser",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 84,
+          "symbol": "x-<limit-id>-limit-name"
+        },
+        "evidence": "parser_supported_not_server_observed"
+      }
+    ],
+    "websocket_events": [
+      {
+        "type": "codex.rate_limits",
+        "effect": "converted to the same RateLimitSnapshot used by HTTP response headers",
+        "source": {
+          "path": "codex-rs/codex-api/src/rate_limits.rs",
+          "line": 136,
+          "symbol": "parse_rate_limit_event"
+        }
+      }
     ]
   },
   "turn_metadata_schema": {
