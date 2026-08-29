@@ -16,7 +16,7 @@ func RunEntry(input EntryInput) (RelayResult, *RelayExit) {
 	return runCaddyStyleRelay(
 		input.Ctx,
 		input.ClientConn,
-		input.UpstreamConn,
+		withoutCodexQuotaEvents(input.UpstreamConn),
 		input.FirstClientMessage,
 		input.Options,
 	)
