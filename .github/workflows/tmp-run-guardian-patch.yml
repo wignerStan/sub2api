@@ -36,23 +36,23 @@ jobs:
           for line in source[start:end]:
               out.append(line[len(prefix):] if line.startswith(prefix) else line)
           script = '\n'.join(out) + '\n'
-          stale = '''          replace_once(
-              p,
-              '\\t\\t"x-codex-installation-id",\\n\\t\\t"session-id",\\n',
-              '\\t\\t"x-codex-installation-id",\\n'
-              '\\t\\t"x-codex-parent-thread-id",\\n'
-              '\\t\\t"x-openai-subagent",\\n'
-              '\\t\\t"x-openai-internal-codex-responses-lite",\\n'
-              '\\t\\t"session-id",\\n',
-          )'''
-          fixed = '''          replace_once(
-              p,
-              '\\t\\t\\t"x-codex-installation-id",\\n',
-              '\\t\\t\\t"x-codex-installation-id",\\n'
-              '\\t\\t\\t"x-codex-parent-thread-id",\\n'
-              '\\t\\t\\t"x-openai-subagent",\\n'
-              '\\t\\t\\t"x-openai-internal-codex-responses-lite",\\n',
-          )'''
+          stale = '''replace_once(
+    p,
+    '\\t\\t"x-codex-installation-id",\\n\\t\\t"session-id",\\n',
+    '\\t\\t"x-codex-installation-id",\\n'
+    '\\t\\t"x-codex-parent-thread-id",\\n'
+    '\\t\\t"x-openai-subagent",\\n'
+    '\\t\\t"x-openai-internal-codex-responses-lite",\\n'
+    '\\t\\t"session-id",\\n',
+)'''
+          fixed = '''replace_once(
+    p,
+    '\\t\\t\\t"x-codex-installation-id",\\n',
+    '\\t\\t\\t"x-codex-installation-id",\\n'
+    '\\t\\t\\t"x-codex-parent-thread-id",\\n'
+    '\\t\\t\\t"x-openai-subagent",\\n'
+    '\\t\\t\\t"x-openai-internal-codex-responses-lite",\\n',
+)'''
           if stale not in script:
               raise SystemExit('staged script header anchor rewrite not found')
           script = script.replace(stale, fixed, 1)
