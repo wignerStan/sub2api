@@ -228,11 +228,28 @@ fn classify_upstream_target(target: &str) -> (bool, bool) {
         .map(|url| url.path().trim_end_matches('/').to_ascii_lowercase())
         .unwrap_or_default();
     let is_compact_path = path.ends_with("/responses/compact") || path.ends_with("/codex/compact");
+    let is_guardian_path = path.ends_with("/guardian") || path.ends_with("/guardian-classifier");
     let is_responses_path = is_compact_path
+        || is_guardian_path
         || path.contains("/responses")
         || path.contains("/completions")
         || path.contains("/chat/");
     (is_responses_path, is_compact_path)
+}
+
+#[cfg(test)]
+mod upstream_target_classification_tests {
+    use super::classify_upstream_target;
+
+    #[test]
+    fn guardian_routes_are_responses_family_not_compact() {
+        for target in [
+            "https://chatgpt.com/backend-api/codex/guardian",
+            "wss://chatgpt.com/backend-api/codex/guardian-classifier",
+        ] {
+            assert_eq!(classify_upstream_target(target), (true, false), "{target}");
+        }
+    }
 }
 
 fn forwarded_headers(
@@ -337,9 +354,9 @@ async fn http_tunnel(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -471,9 +488,9 @@ async fn http_tunnel_e2ee(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let method = axum_request.method().clone();
 
     let mut builder = match method {
@@ -945,9 +962,9 @@ async fn ws_tunnel(
         is_compact_path,
         state.unknown_field_policy,
     ) {
-            Ok(res) => res,
-            Err(err) => return err.into_response(),
-        };
+        Ok(res) => res,
+        Err(err) => return err.into_response(),
+    };
     let e2ee_key = match headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) {
         Some("1") => match e2ee::derive_key_from_token(state.token.as_bytes()) {
             Ok(key) => Some(key),
@@ -1034,17 +1051,17 @@ async fn ws_tunnel(
     let policy_for_ws = state.unknown_field_policy;
     let mut response = ws
         .on_upgrade(move |socket| async move {
-        pump_ws(
-            socket,
-            connection,
-            e2ee_key,
-            profile_for_ws,
-            salt_for_ws,
-            agent_version,
-            Some(window_number),
-            policy_for_ws,
-        )
-        .await;
+            pump_ws(
+                socket,
+                connection,
+                e2ee_key,
+                profile_for_ws,
+                salt_for_ws,
+                agent_version,
+                Some(window_number),
+                policy_for_ws,
+            )
+            .await;
         })
         .into_response();
 
@@ -1141,11 +1158,11 @@ async fn main() {
             "/v1/http",
             any(
                 |state: State<AppState>, headers: HeaderMap, req: Request<Body>| async move {
-                if headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) == Some("1") {
-                    http_tunnel_e2ee(state, headers, req).await
-                } else {
-                    http_tunnel(state, headers, req).await
-                }
+                    if headers.get(E2EE_HEADER).and_then(|v| v.to_str().ok()) == Some("1") {
+                        http_tunnel_e2ee(state, headers, req).await
+                    } else {
+                        http_tunnel(state, headers, req).await
+                    }
                 },
             ),
         )

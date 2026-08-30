@@ -90,10 +90,10 @@ impl ConvergedIdentity {
 
         let installation_id =
             if let Some(dev_id) = custom_device_id.filter(|s| !s.trim().is_empty()) {
-            derive_converged_uuid_v4(dev_id.trim(), "codex-device-pseudonym", salt)
-        } else {
-            derive_converged_uuid_v4(seed, "codex-install-id", salt)
-        };
+                derive_converged_uuid_v4(dev_id.trim(), "codex-device-pseudonym", salt)
+            } else {
+                derive_converged_uuid_v4(seed, "codex-install-id", salt)
+            };
         let session_id = derive_converged_uuid_v4(seed, "codex-session-id", salt);
         let thread_id = derive_converged_thread_id(seed, client_session_id.unwrap_or(""), salt);
         let turn_id = uuid::Uuid::now_v7().to_string();
