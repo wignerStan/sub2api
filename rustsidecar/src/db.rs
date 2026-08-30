@@ -27,8 +27,11 @@ fn build_proxy_url(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Option<String> {
-    let scheme = protocol.trim().to_ascii_lowercase();
-    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+    let mut scheme = protocol.trim().to_ascii_lowercase();
+    if scheme == "socks5" {
+        scheme = "socks5h".to_string();
+    }
+    if !matches!(scheme.as_str(), "http" | "https" | "socks5h") {
         return None;
     }
 
@@ -407,6 +410,12 @@ mod tests {
         assert!(raw.contains("@[::1]:1080"), "{raw}");
         assert!(raw.contains("user%40name"), "{raw}");
         assert!(!raw.contains("user@name"), "{raw}");
+    }
+
+    #[test]
+    fn proxy_url_builder_upgrades_socks5_to_socks5h() {
+        let raw = build_proxy_url("socks5", "127.0.0.1", 1080, None, None).expect("valid proxy URL");
+        assert_eq!(raw, "socks5h://127.0.0.1:1080");
     }
 
     #[test]

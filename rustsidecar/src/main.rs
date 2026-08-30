@@ -175,10 +175,15 @@ fn decode_proxy(headers: &HeaderMap) -> Result<Option<String>, Response> {
 }
 
 fn normalize_proxy_url(proxy_url: String) -> Result<String, Response> {
-    let parsed =
+    let mut parsed =
         reqwest::Url::parse(&proxy_url).map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     match parsed.scheme() {
-        "http" | "https" | "socks5" | "socks5h" => {}
+        "socks5" => {
+            parsed
+                .set_scheme("socks5h")
+                .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+        }
+        "http" | "https" | "socks5h" => {}
         _ => return Err(StatusCode::BAD_REQUEST.into_response()),
     }
     // Proxy selectors are rebuilt by the authenticated Go loopback client or
@@ -203,6 +208,10 @@ mod proxy_url_tests {
         ] {
             assert!(normalize_proxy_url(raw.to_string()).is_ok(), "{raw}");
         }
+        assert_eq!(
+            normalize_proxy_url("socks5://127.0.0.1:1080".to_string()).unwrap(),
+            "socks5h://127.0.0.1:1080"
+        );
     }
 
     #[test]
