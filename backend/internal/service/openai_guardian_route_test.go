@@ -61,6 +61,20 @@ func TestOpenAICodexGuardianRouteRejectsNormalReviewAndSpoofedSignals(t *testing
 	require.False(t, IsOpenAICodexGuardianRequest(ctx))
 }
 
+func TestOpenAICodexGuardianRouteForceCodexCLIStillRequiresFingerprint(t *testing.T) {
+	body := []byte(`{"model":"codex-auto-review"}`)
+	c, _ := guardianTestContext(t, body, codexAutoReviewModel, false)
+	c.Request.Header.Set("User-Agent", "rewritten-by-front-proxy/1.0")
+	c.Request.Header.Del("originator")
+
+	ctx := WithOpenAICodexGuardianRoute(c.Request.Context(), c, body, codexAutoReviewModel, true)
+	require.True(t, IsOpenAICodexGuardianRequest(ctx), "forced Codex mode should tolerate a rewritten UA when the engine fingerprint is intact")
+
+	c.Request.Header.Del("x-codex-window-id")
+	ctx = WithOpenAICodexGuardianRoute(c.Request.Context(), c, body, codexAutoReviewModel, true)
+	require.False(t, IsOpenAICodexGuardianRequest(ctx), "forced Codex mode must not waive the independent engine fingerprint")
+}
+
 func TestOpenAICodexGuardianRouteRejectsConflictingMetadata(t *testing.T) {
 	c, _ := guardianTestContext(t, []byte(`{"model":"codex-auto-review"}`), codexAutoReviewModel, false)
 	c.Request.Header.Set(codexTurnMetadataHeader, `{"subagent_kind":"review"}`)
