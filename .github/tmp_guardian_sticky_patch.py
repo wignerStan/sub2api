@@ -27,6 +27,12 @@ replace_once(
     "if shouldClearOpenAIStickySessionForRequest(ctx, account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !isOpenAIAccountSchedulableForRequest(ctx, account) {",
 )
 
+replace_once(
+    "backend/internal/service/openai_account_scheduler.go",
+    "\t\tif !account.IsSchedulable() {\n\t\t\tfilterStats.exclude(\"not_schedulable\")\n\t\t\tcontinue\n\t\t}",
+    "\t\tif !isOpenAIAccountSchedulableForRequest(ctx, account) {\n\t\t\tfilterStats.exclude(\"not_schedulable\")\n\t\t\tcontinue\n\t\t}",
+)
+
 test = '''func TestOpenAICodexGuardianSchedulingPredicateIgnoresNormalQuotaOnly(t *testing.T) {
 \tquotaReset := time.Now().Add(time.Hour)
 \taccount := &Account{
