@@ -488,8 +488,7 @@ async fn http_tunnel_e2ee(
 
     // Read sealed E2EE request body and decrypt. HTTP bodies are complete
     // record streams; leftover bytes therefore indicate a truncated request.
-    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await
-    {
+    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };

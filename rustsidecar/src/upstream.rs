@@ -66,6 +66,11 @@ fn is_allowed_codex_path(host: &str, path: &str) -> bool {
         || path == "/backend-api/conversation"
         || path.starts_with("/backend-api/conversation/")
         || path.starts_with("/backend-api/codex/")
+        || path == "/backend-api/settings/account_user_setting"
+        || path.starts_with("/backend-api/settings/")
+        || path.starts_with("/backend-api/accounts/")
+        || path == "/backend-api/subscriptions"
+        || path.starts_with("/backend-api/subscriptions/")
 }
 
 #[cfg(test)]
@@ -86,6 +91,9 @@ mod tests {
             "https://chat.openai.com/backend-api/codex/responses",
             "https://auth.openai.com/oauth/token",
             "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami",
+            "https://chatgpt.com/backend-api/settings/account_user_setting?feature=training_allowed&value=false",
+            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+            "https://chatgpt.com/backend-api/subscriptions",
         ] {
             assert!(allowed_codex_upstream_url(raw), "{raw}");
         }
