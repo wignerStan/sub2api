@@ -1,0 +1,81 @@
+name: run staged Guardian routing patch
+
+on:
+  push:
+    branches:
+      - fix/codex-free-guardian-routing
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/codex-free-guardian-routing
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Extract and apply staged patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/tmp-free-guardian-routing.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(source) if line.strip() == "python3 - <<'PY'") + 1
+          end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
+          out = []
+          prefix = '          '
+          for line in source[start:end]:
+              out.append(line[len(prefix):] if line.startswith(prefix) else line)
+          Path('/tmp/apply_guardian.py').write_text('\n'.join(out) + '\n')
+          PY
+          python3 /tmp/apply_guardian.py
+
+      - name: Format changed sources
+        shell: bash
+        run: |
+          gofmt -w \
+            backend/internal/service/openai_guardian_route.go \
+            backend/internal/service/openai_guardian_route_test.go \
+            backend/internal/service/openai_gateway_service.go \
+            backend/internal/service/openai_gateway_forward.go \
+            backend/internal/service/openai_gateway_passthrough.go \
+            backend/internal/service/openai_ws_forwarder_payload.go \
+            backend/internal/service/openai_ws_forwarder_v2.go \
+            backend/internal/service/openai_ws_forwarder_ingress.go \
+            backend/internal/service/openai_ws_v2_passthrough_adapter.go \
+            backend/internal/service/openai_gateway_scheduling.go \
+            backend/internal/service/openai_account_scheduler.go \
+            backend/internal/service/openai_account_runtime_block_fastpath.go \
+            backend/internal/handler/openai_gateway_handler.go
+          cargo fmt --manifest-path rustsidecar/Cargo.toml
+
+      - name: Focused Guardian tests
+        working-directory: backend
+        run: go test ./internal/service -run 'TestOpenAICodexGuardian' -count=1
+
+      - name: Handler and service regression suites
+        working-directory: backend
+        run: go test ./internal/handler ./internal/service -count=1
+
+      - name: Sidecar tests
+        run: cargo test --manifest-path rustsidecar/Cargo.toml --lib
+
+      - name: Verify and publish tested tree
+        shell: bash
+        run: |
+          git diff --check
+          git rm .github/workflows/tmp-free-guardian-routing.yml .github/workflows/tmp-run-guardian-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend rustsidecar
+          git commit -m "fix(codex): route verified Guardian traffic to free endpoints"
+          git push origin HEAD:fix/codex-free-guardian-routing
