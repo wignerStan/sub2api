@@ -28,7 +28,9 @@ import (
 
 const (
 	// ChatGPT internal API for OAuth accounts
-	chatgptCodexURL = "https://chatgpt.com/backend-api/codex/responses"
+	chatgptCodexURL                   = "https://chatgpt.com/backend-api/codex/responses"
+	chatgptCodexGuardianURL           = "https://chatgpt.com/backend-api/codex/guardian"
+	chatgptCodexGuardianClassifierURL = "https://chatgpt.com/backend-api/codex/guardian-classifier"
 	// OpenAI Platform API for API Key accounts (fallback)
 	openaiPlatformAPIURL            = "https://api.openai.com/v1/responses"
 	openaiPlatformAPIInputTokensURL = "https://api.openai.com/v1/responses/input_tokens"
@@ -72,33 +74,37 @@ const (
 
 // OpenAI allowed headers whitelist (for non-passthrough).
 var openaiAllowedHeaders = map[string]bool{
-	"content-type":            true,
-	"conversation_id":         true,
-	"user-agent":              true,
-	"originator":              true,
-	"session_id":              true,
-	"openai-beta":             true,
-	"x-codex-beta-features":   true,
-	"x-codex-installation-id": true,
-	"x-codex-turn-metadata":   true,
-	"x-codex-window-id":       true,
-	responsesLiteHeaderKey:    true,
+	"content-type":             true,
+	"conversation_id":          true,
+	"user-agent":               true,
+	"originator":               true,
+	"session_id":               true,
+	"openai-beta":              true,
+	"x-codex-beta-features":    true,
+	"x-codex-installation-id":  true,
+	"x-codex-turn-metadata":    true,
+	"x-codex-window-id":        true,
+	"x-codex-parent-thread-id": true,
+	"x-openai-subagent":        true,
+	responsesLiteHeaderKey:     true,
 }
 
 // OpenAI passthrough allowed headers whitelist.
 // locale / timeout / attestation 不透传。beta 先拷贝，OAuth 再由 sanitize 剥离并重建。
 var openaiPassthroughAllowedHeaders = map[string]bool{
-	"content-type":            true,
-	"conversation_id":         true,
-	"user-agent":              true,
-	"originator":              true,
-	"session_id":              true,
-	"openai-beta":             true,
-	"x-codex-beta-features":   true,
-	"x-codex-installation-id": true,
-	"x-codex-turn-metadata":   true,
-	"x-codex-window-id":       true,
-	responsesLiteHeaderKey:    true,
+	"content-type":             true,
+	"conversation_id":          true,
+	"user-agent":               true,
+	"originator":               true,
+	"session_id":               true,
+	"openai-beta":              true,
+	"x-codex-beta-features":    true,
+	"x-codex-installation-id":  true,
+	"x-codex-turn-metadata":    true,
+	"x-codex-window-id":        true,
+	"x-codex-parent-thread-id": true,
+	"x-openai-subagent":        true,
+	responsesLiteHeaderKey:     true,
 }
 
 // codex_cli_only 拒绝时记录的请求头白名单（仅用于诊断日志，不参与上游透传）
@@ -462,6 +468,7 @@ type OpenAIGatewayService struct {
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockReason     sync.Map // key: account ID, value: strongest active block reason
 	openaiAccountRuntimeBlockLocks      sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiAccountRuntimeBlockGeneration sync.Map // key: int64(accountID), value: uint64
 	openaiAccountRuntimeBlockSequence   atomic.Uint64

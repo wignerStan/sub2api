@@ -77,6 +77,8 @@ mod tests {
         for raw in [
             "https://chatgpt.com/backend-api/codex/responses",
             "https://chatgpt.com/backend-api/codex/models",
+            "https://chatgpt.com/backend-api/codex/guardian",
+            "wss://chatgpt.com/backend-api/codex/guardian-classifier",
             "https://chatgpt.com/backend-api/codex/compact",
             "https://chatgpt.com/backend-api/wham/usage",
             "https://chatgpt.com/backend-api/files",
