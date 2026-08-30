@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-08-27T14:56:25.441183+00:00",
+  "generated_at": "2026-08-30T09:42:43.181652+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "bce96bcb43c1aeea69fa0aa230809fa9e4eba80e",
-      "date": "2026-08-27T14:54:13Z",
-      "message": "Reject oversized reviewed terminal input (#41159)",
-      "html_url": "https://github.com/openai/codex/commit/bce96bcb43c1aeea69fa0aa230809fa9e4eba80e"
+      "sha": "28327355b861ab6cc76b01c7248663eb1be440cf",
+      "date": "2026-08-30T07:40:36Z",
+      "message": "Update tests for default-enabled update_plan (#41630)",
+      "html_url": "https://github.com/openai/codex/commit/28327355b861ab6cc76b01c7248663eb1be440cf"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
@@ -107,7 +107,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 235,
+          "line": 251,
           "symbol": "ChatGPT-Account-ID"
         }
       },
@@ -118,7 +118,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 241,
+          "line": 257,
           "symbol": "X-OpenAI-Fedramp"
         }
       }
@@ -283,7 +283,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 2078,
+          "line": 2118,
           "symbol": "x-codex-beta-features"
         }
       },
@@ -294,7 +294,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 150,
+          "line": 154,
           "symbol": "x-codex-routing-hint"
         }
       },
@@ -316,7 +316,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 155,
+          "line": 159,
           "symbol": "x-openai-memgen-request"
         }
       },
@@ -327,7 +327,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 164,
+          "line": 168,
           "symbol": "x-openai-internal-codex-responses-lite"
         }
       },
@@ -338,7 +338,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 151,
+          "line": 155,
           "symbol": "x-codex-turn-state"
         }
       },
@@ -627,7 +627,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 2078,
+          "line": 2118,
           "symbol": "x-codex-beta-features"
         }
       },
@@ -638,7 +638,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 150,
+          "line": 154,
           "symbol": "x-codex-routing-hint"
         }
       },
@@ -660,7 +660,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 155,
+          "line": 159,
           "symbol": "x-openai-memgen-request"
         }
       },
@@ -671,7 +671,7 @@
         "layer": "codex",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 164,
+          "line": 168,
           "symbol": "x-openai-internal-codex-responses-lite"
         }
       },
@@ -682,7 +682,7 @@
         "layer": "ws-handshake",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 148,
+          "line": 152,
           "symbol": "OpenAI-Beta"
         }
       },
@@ -693,7 +693,7 @@
         "layer": "ws-handshake",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 157,
+          "line": 161,
           "symbol": "x-responsesapi-include-timing-metrics"
         }
       }
@@ -802,7 +802,7 @@
         "name": "ws_request_header_x_openai_internal_codex_responses_lite",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 162,
+          "line": 166,
           "symbol": "WS client_metadata"
         }
       },
@@ -818,7 +818,7 @@
         "name": "x-codex-ws-stream-request-start-ms",
         "source": {
           "path": "codex-rs/core/src/client.rs",
-          "line": 160,
+          "line": 164,
           "symbol": "WS client_metadata"
         }
       }
