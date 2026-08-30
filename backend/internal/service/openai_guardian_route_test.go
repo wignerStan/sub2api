@@ -90,6 +90,25 @@ func TestOpenAICodexGuardianAccountSchedulableIgnoresNormalQuotaOnly(t *testing.
 	require.False(t, isOpenAICodexGuardianAccountSchedulable(account))
 }
 
+func TestOpenAICodexGuardianSchedulingPredicateIgnoresNormalQuotaOnly(t *testing.T) {
+	quotaReset := time.Now().Add(time.Hour)
+	account := &Account{
+		Platform:         PlatformOpenAI,
+		Type:             AccountTypeOAuth,
+		Status:           StatusActive,
+		Schedulable:      true,
+		RateLimitResetAt: &quotaReset,
+	}
+	guardianCtx := context.WithValue(context.Background(), openAICodexGuardianRouteContextKey{}, OpenAICodexGuardianRouteReview)
+
+	require.True(t, isOpenAIAccountSchedulableForRequest(guardianCtx, account))
+	require.False(t, isOpenAIAccountSchedulableForRequest(context.Background(), account))
+
+	overload := time.Now().Add(time.Minute)
+	account.OverloadUntil = &overload
+	require.False(t, isOpenAIAccountSchedulableForRequest(guardianCtx, account))
+}
+
 func TestOpenAICodexGuardianRuntimeBlockIgnoresOnly429(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := &Account{

@@ -159,6 +159,13 @@ func isOpenAICodexGuardianAccountSchedulable(account *Account) bool {
 	return true
 }
 
+func isOpenAIAccountSchedulableForRequest(ctx context.Context, account *Account) bool {
+	if IsOpenAICodexGuardianRequest(ctx) && account != nil && account.IsOpenAI() && account.IsOpenAIOAuthLike() {
+		return isOpenAICodexGuardianAccountSchedulable(account)
+	}
+	return account != nil && account.IsSchedulable()
+}
+
 func (s *OpenAIGatewayService) getOpenAIAccountForSchedulingContext(ctx context.Context, accountID int64) (*Account, error) {
 	if IsOpenAICodexGuardianRequest(ctx) && s != nil && s.accountRepo != nil {
 		return s.accountRepo.GetByID(ctx, accountID)
