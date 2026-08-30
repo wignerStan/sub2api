@@ -31,32 +31,33 @@ jobs:
           source = Path('.github/workflows/tmp-free-guardian-routing.yml').read_text().splitlines()
           start = next(i for i, line in enumerate(source) if line.strip() == "python3 - <<'PY'") + 1
           end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
-          out = []
           prefix = '          '
-          for line in source[start:end]:
-              out.append(line[len(prefix):] if line.startswith(prefix) else line)
+          out = [line[len(prefix):] if line.startswith(prefix) else line for line in source[start:end]]
           script = '\n'.join(out) + '\n'
-          stale = '''replace_once(
-    p,
-    '\\t\\t"x-codex-installation-id",\\n\\t\\t"session-id",\\n',
-    '\\t\\t"x-codex-installation-id",\\n'
-    '\\t\\t"x-codex-parent-thread-id",\\n'
-    '\\t\\t"x-openai-subagent",\\n'
-    '\\t\\t"x-openai-internal-codex-responses-lite",\\n'
-    '\\t\\t"session-id",\\n',
-)'''
-          fixed = '''replace_once(
-    p,
-    '\\t\\t\\t"x-codex-installation-id",\\n',
-    '\\t\\t\\t"x-codex-installation-id",\\n'
-    '\\t\\t\\t"x-codex-parent-thread-id",\\n'
-    '\\t\\t\\t"x-openai-subagent",\\n'
-    '\\t\\t\\t"x-openai-internal-codex-responses-lite",\\n',
-)'''
+          stale = (
+              "replace_once(\n"
+              "    p,\n"
+              "    '\\t\\t\"x-codex-installation-id\",\\n\\t\\t\"session-id\",\\n',\n"
+              "    '\\t\\t\"x-codex-installation-id\",\\n'\n"
+              "    '\\t\\t\"x-codex-parent-thread-id\",\\n'\n"
+              "    '\\t\\t\"x-openai-subagent\",\\n'\n"
+              "    '\\t\\t\"x-openai-internal-codex-responses-lite\",\\n'\n"
+              "    '\\t\\t\"session-id\",\\n',\n"
+              ")"
+          )
+          fixed = (
+              "replace_once(\n"
+              "    p,\n"
+              "    '\\t\\t\\t\"x-codex-installation-id\",\\n',\n"
+              "    '\\t\\t\\t\"x-codex-installation-id\",\\n'\n"
+              "    '\\t\\t\\t\"x-codex-parent-thread-id\",\\n'\n"
+              "    '\\t\\t\\t\"x-openai-subagent\",\\n'\n"
+              "    '\\t\\t\\t\"x-openai-internal-codex-responses-lite\",\\n',\n"
+              ")"
+          )
           if stale not in script:
               raise SystemExit('staged script header anchor rewrite not found')
-          script = script.replace(stale, fixed, 1)
-          Path('/tmp/apply_guardian.py').write_text(script)
+          Path('/tmp/apply_guardian.py').write_text(script.replace(stale, fixed, 1))
           PY
           python3 /tmp/apply_guardian.py
 
