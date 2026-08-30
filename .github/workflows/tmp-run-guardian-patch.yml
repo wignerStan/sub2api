@@ -34,6 +34,7 @@ jobs:
           prefix = '          '
           out = [line[len(prefix):] if line.startswith(prefix) else line for line in source[start:end]]
           script = '\n'.join(out) + '\n'
+
           stale = (
               "replace_once(\n"
               "    p,\n"
@@ -57,7 +58,21 @@ jobs:
           )
           if stale not in script:
               raise SystemExit('staged script header anchor rewrite not found')
-          Path('/tmp/apply_guardian.py').write_text(script.replace(stale, fixed, 1))
+          script = script.replace(stale, fixed, 1)
+
+          old_signature = '"func (s *OpenAIGatewayService) buildOpenAIResponsesWSURL(ctx context.Context, account *Account) (string, error) {"'
+          new_signature = r'"func (s *OpenAIGatewayService) buildOpenAIResponsesWSURL(account *Account) (string, error) {\n\treturn s.buildOpenAIResponsesWSURLForContext(context.Background(), account)\n}\n\nfunc (s *OpenAIGatewayService) buildOpenAIResponsesWSURLForContext(ctx context.Context, account *Account) (string, error) {"'
+          if script.count(old_signature) != 1:
+              raise SystemExit(f'context-aware WS helper signature anchor count={script.count(old_signature)}')
+          script = script.replace(old_signature, new_signature, 1)
+
+          old_call = '"buildOpenAIResponsesWSURL(ctx, account)"'
+          new_call = '"buildOpenAIResponsesWSURLForContext(ctx, account)"'
+          if script.count(old_call) != 1:
+              raise SystemExit(f'context-aware WS helper call anchor count={script.count(old_call)}')
+          script = script.replace(old_call, new_call, 1)
+
+          Path('/tmp/apply_guardian.py').write_text(script)
           PY
           python3 /tmp/apply_guardian.py
 
