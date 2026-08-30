@@ -104,7 +104,7 @@ jobs:
         run: go test ./internal/handler ./internal/service -count=1
 
       - name: Sidecar tests
-        run: cargo test --manifest-path rustsidecar/Cargo.toml --lib
+        run: cargo test --manifest-path rustsidecar/Cargo.toml --bin sub2api-sidecar
 
       - name: Verify and publish tested tree
         shell: bash
