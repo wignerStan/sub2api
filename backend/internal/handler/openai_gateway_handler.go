@@ -463,8 +463,17 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 	}
 
-	// 解析渠道级模型映射
-	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	// Stock Codex custom providers cannot select /guardian directly; recognize
+	// the verified fallback before channel mapping so the dedicated model ID is preserved.
+	c.Request = c.Request.WithContext(service.WithOpenAICodexGuardianRoute(
+		c.Request.Context(), c, body, reqModel, h.cfg != nil && h.cfg.Gateway.ForceCodexCLI,
+	))
+	var channelMapping service.ChannelMappingResult
+	if service.IsOpenAICodexGuardianRequest(c.Request.Context()) {
+		channelMapping = service.ChannelMappingResult{MappedModel: reqModel, BillingModelSource: "requested"}
+	} else {
+		channelMapping, _ = h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
+	}
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)
 	seedOpenAIForwardImageIntentHint(c, channelMapping.Mapped, imageIntent)
 	forwardModel := reqModel
@@ -1941,8 +1950,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return body
 	}
 
-	// 解析渠道级模型映射
-	channelMappingWS, _ := h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, reqModel)
+	// Preserve verified Guardian backend model IDs and route identity for the
+	// entire upgraded connection.
+	ctx = service.WithOpenAICodexGuardianRoute(
+		ctx, c, firstMessage, reqModel, h.cfg != nil && h.cfg.Gateway.ForceCodexCLI,
+	)
+	c.Request = c.Request.WithContext(ctx)
+	var channelMappingWS service.ChannelMappingResult
+	if service.IsOpenAICodexGuardianRequest(ctx) {
+		channelMappingWS = service.ChannelMappingResult{MappedModel: reqModel, BillingModelSource: "requested"}
+	} else {
+		channelMappingWS, _ = h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, reqModel)
+	}
 	wsForwardModel := reqModel
 	if channelMappingWS.Mapped && strings.TrimSpace(channelMappingWS.MappedModel) != "" {
 		wsForwardModel = strings.TrimSpace(channelMappingWS.MappedModel)

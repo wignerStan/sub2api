@@ -126,6 +126,15 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		return false
 	}
 
+	// Dedicated Guardian endpoints are a separate unmetered quota domain.
+	// A Guardian 429 is request-local and must not poison the account's normal
+	// /responses 5h/7d scheduling state.
+	if statusCode == http.StatusTooManyRequests &&
+		IsOpenAICodexGuardianRequest(ctx) &&
+		account != nil && account.IsOpenAI() && account.IsOpenAIOAuthLike() {
+		return false
+	}
+
 	if isOpenAIImageRateLimitError(statusCode, responseBody) {
 		if s != nil && s.rateLimitService != nil {
 			_ = s.rateLimitService.HandleOpenAIImageRateLimit(stateCtx, account, statusCode, headers, responseBody)
@@ -325,7 +334,26 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockLock(accountID int64) *s
 	return mu
 }
 
-func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, _ string) (uint64, bool) {
+func (s *OpenAIGatewayService) rememberOpenAIAccountRuntimeBlockReason(accountID int64, reason string) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "unknown"
+	}
+	if reason == "429" {
+		if current, ok := s.openaiAccountRuntimeBlockReason.Load(accountID); ok {
+			if currentReason, _ := current.(string); strings.TrimSpace(currentReason) != "" && currentReason != "429" {
+				return
+			}
+		}
+	}
+	s.openaiAccountRuntimeBlockReason.Store(accountID, reason)
+}
+
+func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, reason string) (uint64, bool) {
+	s.rememberOpenAIAccountRuntimeBlockReason(account.ID, reason)
 	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
 	now := time.Now()
@@ -368,6 +396,7 @@ func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	mu.Lock()
 	defer mu.Unlock()
 	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
+	s.openaiAccountRuntimeBlockReason.Delete(accountID)
 	s.openaiOAuth429RetryStartedAt.Delete(accountID)
 	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
 }
@@ -386,6 +415,7 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	cooldownUntil, ok := value.(time.Time)
 	if !ok || cooldownUntil.IsZero() {
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
+		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 		return false
 	}
@@ -393,6 +423,7 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 		return true
 	}
 	s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
+	s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 	return false
 }
@@ -480,6 +511,23 @@ func (s *OpenAIGatewayService) isOpenAIRateLimitCooldownPersisted(account *Accou
 
 func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlocked(account *Account, requestedModel string) bool {
 	return s != nil && (s.isOpenAIAccountRuntimeBlocked(account) || s.isOpenAIRateLimitCooldownPersisted(account) || s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel))
+}
+
+func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlockedForContext(ctx context.Context, account *Account, requestedModel string) bool {
+	if s == nil || !IsOpenAICodexGuardianRequest(ctx) || account == nil || !account.IsOpenAI() || !account.IsOpenAIOAuthLike() {
+		return s != nil && s.isOpenAIAccountRequestRuntimeBlocked(account, requestedModel)
+	}
+	if s.isOpenAIAccountRuntimeBlocked(account) {
+		reasonValue, ok := s.openaiAccountRuntimeBlockReason.Load(account.ID)
+		if !ok {
+			return true
+		}
+		reason, _ := reasonValue.(string)
+		if strings.TrimSpace(reason) != "429" {
+			return true
+		}
+	}
+	return s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel)
 }
 
 func (s *OpenAIGatewayService) recordOpenAIOAuth429() {
