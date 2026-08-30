@@ -22,81 +22,21 @@ jobs:
           check-latest: false
           cache: true
           cache-dependency-path: backend/go.sum
-
       - name: Patch Guardian sticky quota handling
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected one anchor, found {count}")
-              p.write_text(text.replace(old, new, 1))
-
-          replace_once(
-              "backend/internal/service/openai_guardian_route.go",
-              "\treturn true\n}\n\nfunc (s *OpenAIGatewayService) getOpenAIAccountForSchedulingContext",
-              "\treturn true\n}\n\nfunc isOpenAIAccountSchedulableForRequest(ctx context.Context, account *Account) bool {\n"
-              "\tif IsOpenAICodexGuardianRequest(ctx) && account != nil && account.IsOpenAI() && account.IsOpenAIOAuthLike() {\n"
-              "\t\treturn isOpenAICodexGuardianAccountSchedulable(account)\n"
-              "\t}\n"
-              "\treturn account != nil && account.IsSchedulable()\n"
-              "}\n\nfunc (s *OpenAIGatewayService) getOpenAIAccountForSchedulingContext",
-          )
-
-          replace_once(
-              "backend/internal/service/openai_account_scheduler.go",
-              "if shouldClearOpenAIStickySessionForRequest(ctx, account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {",
-              "if shouldClearOpenAIStickySessionForRequest(ctx, account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !isOpenAIAccountSchedulableForRequest(ctx, account) {",
-          )
-
-          test = '''func TestOpenAICodexGuardianSchedulingPredicateIgnoresNormalQuotaOnly(t *testing.T) {
-	quotaReset := time.Now().Add(time.Hour)
-	account := &Account{
-		Platform:         PlatformOpenAI,
-		Type:             AccountTypeOAuth,
-		Status:           StatusActive,
-		Schedulable:      true,
-		RateLimitResetAt: &quotaReset,
-	}
-	guardianCtx := context.WithValue(context.Background(), openAICodexGuardianRouteContextKey{}, OpenAICodexGuardianRouteReview)
-
-	require.True(t, isOpenAIAccountSchedulableForRequest(guardianCtx, account))
-	require.False(t, isOpenAIAccountSchedulableForRequest(context.Background(), account))
-
-	overload := time.Now().Add(time.Minute)
-	account.OverloadUntil = &overload
-	require.False(t, isOpenAIAccountSchedulableForRequest(guardianCtx, account))
-}
-
-'''
-          replace_once(
-              "backend/internal/service/openai_guardian_route_test.go",
-              "func TestOpenAICodexGuardianRuntimeBlockIgnoresOnly429(t *testing.T) {",
-              test + "func TestOpenAICodexGuardianRuntimeBlockIgnoresOnly429(t *testing.T) {",
-          )
-          PY
-
+        run: python3 .github/tmp_guardian_sticky_patch.py
       - name: Format changed Go files
         run: gofmt -w backend/internal/service/openai_guardian_route.go backend/internal/service/openai_guardian_route_test.go backend/internal/service/openai_account_scheduler.go
-
       - name: Focused Guardian tests
         working-directory: backend
         run: go test ./internal/service -run 'TestOpenAICodexGuardian' -count=1
-
       - name: Handler and service regression suites
         working-directory: backend
         run: go test ./internal/handler ./internal/service -count=1
-
       - name: Publish tested staging tree
         shell: bash
         run: |
           git diff --check
-          git rm .github/workflows/tmp-guardian-sticky-quota.yml
+          git rm .github/workflows/tmp-guardian-sticky-quota.yml .github/tmp_guardian_sticky_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add backend/internal/service/openai_guardian_route.go backend/internal/service/openai_guardian_route_test.go backend/internal/service/openai_account_scheduler.go
