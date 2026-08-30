@@ -58,7 +58,6 @@ pub fn transform_request_body(
 
     let mut modified = false;
 
-
     // If client_metadata is present, validate, sanitize, and converge
     if let Some(metadata) = obj.get_mut("client_metadata") {
         sanitize_client_metadata(metadata, &identity, policy)?;
@@ -114,13 +113,10 @@ pub fn transform_ws_frame(
         .map(|s| s.to_string());
 
     let window_num = header_window_number.unwrap_or_else(|| {
-        let meta_opt = obj.get("client_metadata").or_else(|| {
-            obj.get("response").and_then(|r| r.get("client_metadata"))
-        });
-        extract_window_number(
-            obj.get("window_id").and_then(|v| v.as_str()),
-            meta_opt,
-        )
+        let meta_opt = obj
+            .get("client_metadata")
+            .or_else(|| obj.get("response").and_then(|r| r.get("client_metadata")));
+        extract_window_number(obj.get("window_id").and_then(|v| v.as_str()), meta_opt)
     });
 
     let identity = ConvergedIdentity::new(
@@ -133,7 +129,6 @@ pub fn transform_ws_frame(
     );
 
     let mut modified = false;
-
 
     if let Some(metadata) = obj.get_mut("client_metadata") {
         sanitize_client_metadata(metadata, &identity, policy)?;

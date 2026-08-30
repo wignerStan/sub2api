@@ -1258,10 +1258,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	switch account.Type {
 	case AccountTypeOAuth:
 		// OAuth accounts use ChatGPT internal API
-		targetURL = chatgptCodexURL
+		targetURL = openAICodexBackendURLForContext(ctx)
 	case AccountTypeSetupToken:
 		if account.IsOpenAIOAuthLike() {
-			targetURL = chatgptCodexURL
+			targetURL = openAICodexBackendURLForContext(ctx)
 		} else {
 			targetURL = openaiPlatformAPIURL
 		}
