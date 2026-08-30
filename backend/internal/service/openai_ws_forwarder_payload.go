@@ -26,16 +26,20 @@ func validateOpenAIWSBearerToken(account *Account, token string) error {
 }
 
 func (s *OpenAIGatewayService) buildOpenAIResponsesWSURL(account *Account) (string, error) {
+	return s.buildOpenAIResponsesWSURLForContext(context.Background(), account)
+}
+
+func (s *OpenAIGatewayService) buildOpenAIResponsesWSURLForContext(ctx context.Context, account *Account) (string, error) {
 	if account == nil {
 		return "", errors.New("account is nil")
 	}
 	var targetURL string
 	switch account.Type {
 	case AccountTypeOAuth:
-		targetURL = chatgptCodexURL
+		targetURL = openAICodexBackendURLForContext(ctx)
 	case AccountTypeSetupToken:
 		if account.IsOpenAIOAuthLike() {
-			targetURL = chatgptCodexURL
+			targetURL = openAICodexBackendURLForContext(ctx)
 		} else {
 			targetURL = openaiPlatformAPIURL
 		}
@@ -94,6 +98,9 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 		for _, name := range [...]string{
 			"x-codex-window-id",
 			"x-codex-installation-id",
+			"x-codex-parent-thread-id",
+			"x-openai-subagent",
+			"x-openai-internal-codex-responses-lite",
 			"session-id",
 			"thread-id",
 			"x-client-request-id",
