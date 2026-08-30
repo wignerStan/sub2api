@@ -62,9 +62,12 @@ func detectOpenAICodexGuardianRoute(
 			!openai.IsCodexOfficialClientOriginator(originator) {
 			return OpenAICodexGuardianRouteNone
 		}
-		if !openai.EvaluateEngineFingerprint(c.Request.Header, body, openai.DefaultEngineFingerprintSignals) {
-			return OpenAICodexGuardianRouteNone
-		}
+	}
+	// ForceCodexCLI only compensates for an inbound User-Agent/originator that a
+	// front proxy rewrote. The request still needs the independent Codex engine
+	// fingerprint before it may enter the dedicated unmetered Guardian routes.
+	if !openai.EvaluateEngineFingerprint(c.Request.Header, body, openai.DefaultEngineFingerprintSignals) {
+		return OpenAICodexGuardianRouteNone
 	}
 
 	headerMetadata := c.GetHeader(codexTurnMetadataHeader)
