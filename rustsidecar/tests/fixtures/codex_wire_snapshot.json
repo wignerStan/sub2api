@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-08-30T09:42:43.181652+00:00",
+  "generated_at": "2026-08-31T10:27:51.746609+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "28327355b861ab6cc76b01c7248663eb1be440cf",
-      "date": "2026-08-30T07:40:36Z",
-      "message": "Update tests for default-enabled update_plan (#41630)",
-      "html_url": "https://github.com/openai/codex/commit/28327355b861ab6cc76b01c7248663eb1be440cf"
+      "sha": "d58d0e5841e0de08e251673db2d5af8cf3a1ad51",
+      "date": "2026-08-31T08:31:23Z",
+      "message": "Allow models to enable token budgeting by default (#41803)",
+      "html_url": "https://github.com/openai/codex/commit/d58d0e5841e0de08e251673db2d5af8cf3a1ad51"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
@@ -392,7 +392,7 @@
         "name": "parent_turn_id",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 45,
+          "line": 46,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -400,7 +400,7 @@
         "name": "root_turn_id",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 46,
+          "line": 47,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -448,7 +448,7 @@
         "name": "x-codex-turn-metadata",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 213,
+          "line": 215,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -704,7 +704,7 @@
         "name": "parent_turn_id",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 45,
+          "line": 46,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -712,7 +712,7 @@
         "name": "root_turn_id",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 46,
+          "line": 47,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -760,7 +760,7 @@
         "name": "x-codex-turn-metadata",
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 213,
+          "line": 215,
           "symbol": "CodexResponsesMetadata::client_metadata"
         }
       },
@@ -843,7 +843,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 505,
+          "line": 510,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -856,7 +856,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 507,
+          "line": 512,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -869,7 +869,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 509,
+          "line": 514,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -882,7 +882,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 511,
+          "line": 516,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -895,7 +895,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 513,
+          "line": 518,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -908,7 +908,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 515,
+          "line": 520,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -921,7 +921,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 517,
+          "line": 522,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -934,7 +934,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 519,
+          "line": 524,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -947,7 +947,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 521,
+          "line": 526,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -960,7 +960,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 523,
+          "line": 528,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -973,7 +973,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 525,
+          "line": 530,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -986,7 +986,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 527,
+          "line": 532,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -999,7 +999,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 529,
+          "line": 534,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1012,7 +1012,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 531,
+          "line": 536,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1025,7 +1025,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 533,
+          "line": 538,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1038,7 +1038,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 535,
+          "line": 540,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1051,7 +1051,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 537,
+          "line": 542,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1064,7 +1064,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 539,
+          "line": 544,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1077,7 +1077,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 541,
+          "line": 546,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1090,7 +1090,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 543,
+          "line": 548,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1103,7 +1103,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 545,
+          "line": 550,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1116,7 +1116,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 547,
+          "line": 552,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1129,7 +1129,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 549,
+          "line": 554,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1142,7 +1142,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 551,
+          "line": 556,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1155,7 +1155,20 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 553,
+          "line": 558,
+          "symbol": "CodexTurnMetadataPayload"
+        }
+      },
+      {
+        "name": "history_ingest_requested",
+        "type": "Option<bool>",
+        "serde": [
+          "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+        ],
+        "flattened": false,
+        "source": {
+          "path": "codex-rs/core/src/responses_metadata.rs",
+          "line": 560,
           "symbol": "CodexTurnMetadataPayload"
         }
       },
@@ -1168,7 +1181,7 @@
         "flattened": false,
         "source": {
           "path": "codex-rs/core/src/responses_metadata.rs",
-          "line": 555,
+          "line": 562,
           "symbol": "CodexTurnMetadataPayload"
         }
       }
@@ -1182,7 +1195,7 @@
       "flattened": true,
       "source": {
         "path": "codex-rs/core/src/responses_metadata.rs",
-        "line": 557,
+        "line": 564,
         "symbol": "CodexTurnMetadataPayload"
       }
     },
@@ -1203,7 +1216,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 175,
+            "line": 177,
             "symbol": "TurnMetadataWorkspace"
           }
         },
@@ -1216,7 +1229,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 177,
+            "line": 179,
             "symbol": "TurnMetadataWorkspace"
           }
         },
@@ -1229,7 +1242,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 179,
+            "line": 181,
             "symbol": "TurnMetadataWorkspace"
           }
         }
@@ -1242,7 +1255,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 187,
+            "line": 189,
             "symbol": "TurnToolNamespaceInfo"
           }
         },
@@ -1253,7 +1266,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 189,
+            "line": 191,
             "symbol": "TurnToolNamespaceInfo"
           }
         }
@@ -1266,7 +1279,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 194,
+            "line": 196,
             "symbol": "TurnToolFunctionInfo"
           }
         },
@@ -1277,7 +1290,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 196,
+            "line": 198,
             "symbol": "TurnToolFunctionInfo"
           }
         },
@@ -1288,7 +1301,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 197,
+            "line": 199,
             "symbol": "TurnToolFunctionInfo"
           }
         },
@@ -1299,7 +1312,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 198,
+            "line": 200,
             "symbol": "TurnToolFunctionInfo"
           }
         },
@@ -1310,7 +1323,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 199,
+            "line": 201,
             "symbol": "TurnToolFunctionInfo"
           }
         }
@@ -1323,7 +1336,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 108,
+            "line": 110,
             "symbol": "CompactionTurnMetadata"
           }
         },
@@ -1334,7 +1347,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 110,
+            "line": 112,
             "symbol": "CompactionTurnMetadata"
           }
         },
@@ -1345,7 +1358,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 111,
+            "line": 113,
             "symbol": "CompactionTurnMetadata"
           }
         },
@@ -1356,7 +1369,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 112,
+            "line": 114,
             "symbol": "CompactionTurnMetadata"
           }
         },
@@ -1367,7 +1380,7 @@
           "flattened": false,
           "source": {
             "path": "codex-rs/core/src/responses_metadata.rs",
-            "line": 113,
+            "line": 115,
             "symbol": "CompactionTurnMetadata"
           }
         }
