@@ -62,6 +62,64 @@ func TestOpenAIWSStateStore_ResponseConnTTL(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestOpenAIWSStateStore_ScopedResponseConnDoesNotCrossThreads(t *testing.T) {
+	store := NewOpenAIWSStateStore(nil)
+	scoped, ok := store.(openAIWSResponseConnScopeStore)
+	require.True(t, ok)
+	scoped.BindResponseConnForScope("resp_shared", "thread_root", "conn_root", time.Minute)
+	scoped.BindResponseConnForScope("resp_shared", "thread_child", "conn_child", time.Minute)
+
+	conn, found := scoped.GetResponseConnForScope("resp_shared", "thread_root")
+	require.True(t, found)
+	require.Equal(t, "conn_root", conn)
+	conn, found = scoped.GetResponseConnForScope("resp_shared", "thread_child")
+	require.True(t, found)
+	require.Equal(t, "conn_child", conn)
+	_, found = scoped.GetResponseConnForScope("resp_shared", "thread_unknown")
+	require.False(t, found)
+
+	// Deleting the legacy response binding must retire all scoped projections as
+	// well; otherwise a stale fork could resurrect an evicted transport.
+	store.DeleteResponseConn("resp_shared")
+	_, found = scoped.GetResponseConnForScope("resp_shared", "thread_root")
+	require.False(t, found)
+}
+
+// A state-store implementation may predate the optional scoped response
+// binding extension.  Thread-aware requests must still fail closed to a fresh
+// transport instead of inheriting the process-global parent binding.
+func TestLookupOpenAIWSIngressResponseConn_DoesNotFallbackForThreadAwareLegacyStore(t *testing.T) {
+	base := NewOpenAIWSStateStore(nil)
+	base.BindResponseConn("resp_shared", "conn_parent", time.Minute)
+	legacy := openAIWSLegacyStateStore{OpenAIWSStateStore: base}
+
+	connID, ok, scoped := lookupOpenAIWSIngressResponseConn(
+		legacy,
+		"resp_shared",
+		"thread_child",
+		true,
+	)
+	require.False(t, ok)
+	require.False(t, scoped)
+	require.Empty(t, connID)
+
+	connID, ok, scoped = lookupOpenAIWSIngressResponseConn(
+		legacy,
+		"resp_shared",
+		"",
+		false,
+	)
+	require.True(t, ok)
+	require.False(t, scoped)
+	require.Equal(t, "conn_parent", connID)
+}
+
+// Keep the optional scoped methods out of the dynamic method set so this
+// wrapper models an older external OpenAIWSStateStore implementation.
+type openAIWSLegacyStateStore struct {
+	OpenAIWSStateStore
+}
+
 func TestOpenAIWSStateStore_SessionTurnStateTTL(t *testing.T) {
 	store := NewOpenAIWSStateStore(nil)
 	store.BindSessionTurnState(9, "session_hash_1", "turn_state_1", 30*time.Millisecond)

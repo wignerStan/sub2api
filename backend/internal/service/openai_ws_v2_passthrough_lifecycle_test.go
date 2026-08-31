@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -253,6 +254,78 @@ func TestPassthroughLifecycle_ResponsesLiteFirstFramePinsParallelToolCalls(t *te
 	case <-time.After(3 * time.Second):
 		t.Fatal("Lite 首帧测试等待 passthrough 退出超时")
 	}
+}
+
+func TestPassthroughLifecycle_ConnectionLimitReturnsReplayableSameAccountFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	controlCtx, cancelControl := context.WithCancelCause(context.Background())
+	defer cancelControl(context.Canceled)
+	cfg := passthroughLifecycleConfig()
+	cfg.Gateway.OpenAIWS.IngressInterTurnIdleTimeoutSeconds = 5
+	firstUpstream := newStagedPassthroughConn()
+	firstUpstream.Send(`{"type":"error","error":{"code":"websocket_connection_limit_reached","type":"invalid_request_error","message":"Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."}}`)
+	secondUpstream := newStagedPassthroughConn()
+	secondUpstream.Send(`{"type":"response.completed","response":{"id":"resp_passthrough_rotated","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`)
+	dialer := &openAIWSQueueDialer{conns: []openAIWSClientConn{firstUpstream, secondUpstream}}
+	svc := &OpenAIGatewayService{
+		cfg:                       cfg,
+		httpUpstream:              &httpUpstreamRecorder{},
+		cache:                     &stubGatewayCache{},
+		openaiWSResolver:          NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:             NewCodexToolCorrector(),
+		openaiWSPassthroughDialer: dialer,
+	}
+	account := passthroughLifecycleAccount()
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_, firstMessage, err := ReadOpenAIWSClientMessage(controlCtx, conn, 3*time.Second, coderws.StatusPolicyViolation, "missing first response.create message")
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		req := r.Clone(controlCtx)
+		req.Header = req.Header.Clone()
+		ginCtx.Request = req
+		firstErr := svc.ProxyResponsesWebSocketFromClient(controlCtx, ginCtx, conn, account, "sk-test", firstMessage, nil)
+		retryPayload, retryCurrentTurn := OpenAIWSCurrentTurnRetryPayload(firstErr)
+		if !retryCurrentTurn || len(retryPayload) == 0 {
+			serverErr <- fmt.Errorf("connection-limit error was not replayable: %v", firstErr)
+			return
+		}
+		if gjson.GetBytes(retryPayload, "previous_response_id").Exists() {
+			serverErr <- errors.New("connection-limit retry retained previous_response_id")
+			return
+		}
+		if gjson.GetBytes(retryPayload, "prompt_cache_key").String() != "client-replay-key" {
+			serverErr <- errors.New("connection-limit retry did not use the canonical client payload")
+			return
+		}
+		serverErr <- svc.ProxyResponsesWebSocketFromClient(controlCtx, ginCtx, conn, account, "sk-test", retryPayload, nil)
+	}))
+	defer server.Close()
+
+	clientConn := dialPassthroughLifecycleClientWithPayload(t, server, `{"type":"response.create","model":"gpt-5.1","stream":false,"prompt_cache_key":"client-replay-key","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"rotate me"}]}]}`)
+	defer func() { _ = clientConn.CloseNow() }()
+	completed, err := readPassthroughLifecycleFrame(t, clientConn, 5*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "response.completed", gjson.GetBytes(completed, "type").String())
+	require.Equal(t, "resp_passthrough_rotated", gjson.GetBytes(completed, "response.id").String())
+	require.NoError(t, clientConn.Close(coderws.StatusNormalClosure, "done"))
+	select {
+	case err := <-serverErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection-limit passthrough retry did not finish")
+	}
+	require.Equal(t, 2, dialer.DialCount())
 }
 
 func TestOpenAIWSPassthroughTurnLifecycle_SerializesTerminalCommitAndNextTurn(t *testing.T) {

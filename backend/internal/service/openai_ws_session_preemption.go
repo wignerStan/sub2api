@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -58,28 +59,104 @@ func (s *OpenAIGatewayService) BeginOpenAIWSIngressSessionPreemption(
 	}
 
 	preemptSessionHash := ""
+	stateSessionHash := ""
 	preemptGroupID := getOpenAIGroupIDFromContext(c)
-	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
-		preemptSessionHash = s.GenerateSessionHash(c, firstClientMessage)
+	if account != nil && account.IsOpenAIOAuthLike() {
+		stateSessionHash = s.GenerateSessionHash(c, firstClientMessage)
+		preemptSessionHash = openAIWSSessionPreemptionScope(c, firstClientMessage, stateSessionHash)
 	}
-	preemptCtx, cleanup, armed, preemptedPrevious := s.beginOpenAIWSSessionPreemptContext(
+	preemptCtx, cleanup, armed, preemptedPrevious := s.beginOpenAIWSSessionPreemptContextScoped(
 		ctx,
 		account,
 		preemptGroupID,
 		getAPIKeyIDFromContext(c),
 		preemptSessionHash,
+		stateSessionHash,
 		false,
 	)
 	if !armed {
 		return ctx, func() {}, false
 	}
-	if preemptedPrevious {
+	// A thread-scoped claim must not clear the shared session's sticky state:
+	// root and subagent/fork threads legitimately share that state while their
+	// transports remain independent.  Preserve the historical cleanup only for
+	// an unscoped (session-level) claim.
+	if preemptedPrevious && preemptSessionHash == stateSessionHash {
 		if stateStore := s.getOpenAIWSStateStore(); stateStore != nil {
-			stateStore.DeleteSessionTurnState(preemptGroupID, preemptSessionHash)
-			stateStore.DeleteSessionConn(preemptGroupID, preemptSessionHash)
+			stateStore.DeleteSessionTurnState(preemptGroupID, stateSessionHash)
+			stateStore.DeleteSessionConn(preemptGroupID, stateSessionHash)
 		}
 	}
 	return context.WithValue(preemptCtx, openAIWSSessionPreemptContextKey{}, true), cleanup, true
+}
+
+// openAIWSSessionPreemptionScope returns the ownership key for one inbound
+// WebSocket.  Codex can run a root thread and several fork/subagent threads
+// under one session_id; those transports must not preempt each other.  When a
+// thread signal is available, derive a separate opaque scope while retaining
+// the original session hash as the sticky-state key.  Older clients that do
+// not expose thread metadata retain the historical session-level behavior.
+func openAIWSSessionPreemptionScope(c *gin.Context, firstClientMessage []byte, stateSessionHash string) string {
+	stateSessionHash = strings.TrimSpace(stateSessionHash)
+	if stateSessionHash == "" {
+		return ""
+	}
+	threadID := openAIWSSessionPreemptionThreadID(c, firstClientMessage)
+	if threadID == "" {
+		return stateSessionHash
+	}
+	return DeriveSessionHashFromSeed("sub2api:openai-ws-preempt-thread:v1:" + stateSessionHash + ":" + threadID)
+}
+
+// openAIWSIngressStateHash mirrors the preemption scope for state that is
+// specific to one live ingress transport (turn-state and session->conn
+// affinity).  Account scheduling still uses the unsuffixed session hash, but
+// root/fork threads must not overwrite each other's continuation state.
+func openAIWSIngressStateHash(c *gin.Context, firstClientMessage []byte, sessionHash string) string {
+	sessionHash = strings.TrimSpace(sessionHash)
+	if sessionHash == "" {
+		return ""
+	}
+	if scoped := openAIWSSessionPreemptionScope(c, firstClientMessage, sessionHash); scoped != "" {
+		return scoped
+	}
+	return sessionHash
+}
+
+func openAIWSSessionPreemptionThreadID(c *gin.Context, firstClientMessage []byte) string {
+	var headers http.Header
+	if c != nil && c.Request != nil {
+		headers = c.Request.Header
+	}
+	// Keep this precedence identical to Codex fingerprint resolution. A real
+	// thread/window carrier must win over a conversation compatibility fallback,
+	// even when the former is available only in the first response.create body.
+	if value := normalizeOpenAIWSSessionPreemptionThreadID(extractClientThreadID(headers)); value != "" {
+		return value
+	}
+	if value := normalizeOpenAIWSSessionPreemptionThreadID(extractCodexBodyExplicitThreadID(firstClientMessage)); value != "" {
+		return value
+	}
+	if value := normalizeOpenAIWSSessionPreemptionThreadID(extractClientConversationID(headers)); value != "" {
+		return value
+	}
+	if value := normalizeOpenAIWSSessionPreemptionThreadID(extractCodexBodyConversationID(firstClientMessage)); value != "" {
+		return value
+	}
+	// x-client-request-id is deliberately not a fallback.  Although the
+	// official Codex client currently mirrors thread-id there, compatible
+	// clients commonly generate a new request UUID for every frame.  Using it
+	// would make one logical thread look like a new owner on each turn and can
+	// preempt the very connection that is waiting for that turn.
+	return ""
+}
+
+func normalizeOpenAIWSSessionPreemptionThreadID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 512 {
+		return ""
+	}
+	return value
 }
 
 func newOpenAIWSSessionPreemptKey(groupID, apiKeyID int64, sessionHash string) (openAIWSSessionPreemptKey, bool) {
@@ -138,13 +215,42 @@ func (s *OpenAIGatewayService) beginOpenAIWSSessionPreemptContext(
 	sessionHash string,
 	httpIngressWSOneShot bool,
 ) (context.Context, func(), bool, bool) {
+	return s.beginOpenAIWSSessionPreemptContextScoped(
+		ctx,
+		account,
+		groupID,
+		apiKeyID,
+		sessionHash,
+		sessionHash,
+		httpIngressWSOneShot,
+	)
+}
+
+// beginOpenAIWSSessionPreemptContextScoped separates the transport claim
+// scope from the sticky-state key.  Codex root/subagent threads can share one
+// session identity, so their live WebSocket ownership must be independent;
+// state cleanup remains session-level only when the claim itself is
+// session-scoped.
+func (s *OpenAIGatewayService) beginOpenAIWSSessionPreemptContextScoped(
+	ctx context.Context,
+	account *Account,
+	groupID, apiKeyID int64,
+	preemptSessionHash string,
+	stateSessionHash string,
+	httpIngressWSOneShot bool,
+) (context.Context, func(), bool, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if s == nil || account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth || httpIngressWSOneShot {
+	if s == nil || account == nil || !account.IsOpenAIOAuthLike() || httpIngressWSOneShot {
 		return ctx, func() {}, false, false
 	}
-	key, ok := newOpenAIWSSessionPreemptKey(groupID, apiKeyID, sessionHash)
+	preemptSessionHash = strings.TrimSpace(preemptSessionHash)
+	stateSessionHash = strings.TrimSpace(stateSessionHash)
+	if stateSessionHash == "" {
+		stateSessionHash = preemptSessionHash
+	}
+	key, ok := newOpenAIWSSessionPreemptKey(groupID, apiKeyID, preemptSessionHash)
 	if !ok {
 		return ctx, func() {}, false, false
 	}
@@ -154,9 +260,11 @@ func (s *OpenAIGatewayService) beginOpenAIWSSessionPreemptContext(
 	var preemptOnce sync.Once
 	preempt := func() {
 		preemptOnce.Do(func() {
-			if stateStore := s.getOpenAIWSStateStore(); stateStore != nil {
-				stateStore.DeleteSessionTurnState(key.groupID, key.sessionHash)
-				stateStore.DeleteSessionConn(key.groupID, key.sessionHash)
+			if stateSessionHash != "" && preemptSessionHash == stateSessionHash {
+				if stateStore := s.getOpenAIWSStateStore(); stateStore != nil {
+					stateStore.DeleteSessionTurnState(key.groupID, stateSessionHash)
+					stateStore.DeleteSessionConn(key.groupID, stateSessionHash)
+				}
 			}
 			cancel(errOpenAIWSSessionPreempted)
 		})

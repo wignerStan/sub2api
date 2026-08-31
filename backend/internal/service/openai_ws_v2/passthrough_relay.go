@@ -24,6 +24,22 @@ type FrameConn interface {
 	Close() error
 }
 
+// PingConn is an optional protocol-level keepalive capability.  It is kept
+// separate from FrameConn so existing adapters and deterministic test doubles
+// do not have to grow a fake control-frame implementation.
+type PingConn interface {
+	Ping(ctx context.Context) error
+}
+
+// PingCapability lets adapters that expose a uniform wrapper around an
+// optional PingConn tell the relay whether a protocol probe is actually
+// available.  Without this second interface a wrapper method would make a
+// legacy/fake connection look ping-capable and the first scheduled probe
+// would terminate an otherwise valid relay with an "unsupported" error.
+type PingCapability interface {
+	SupportsPing() bool
+}
+
 type Usage struct {
 	InputTokens              int
 	OutputTokens             int
@@ -71,6 +87,8 @@ type RelayExit struct {
 
 type RelayOptions struct {
 	WriteTimeout                    time.Duration
+	KeepaliveInterval               time.Duration
+	KeepaliveTimeout                time.Duration
 	IdleTimeout                     time.Duration
 	UpstreamDrainTimeout            time.Duration
 	FirstTurnStartedAt              time.Time
@@ -170,6 +188,14 @@ func Relay(
 	if writeTimeout <= 0 {
 		writeTimeout = 2 * time.Minute
 	}
+	keepaliveInterval := options.KeepaliveInterval
+	if keepaliveInterval <= 0 {
+		keepaliveInterval = 10 * time.Second
+	}
+	keepaliveTimeout := options.KeepaliveTimeout
+	if keepaliveTimeout <= 0 {
+		keepaliveTimeout = 5 * time.Second
+	}
 	drainTimeout := options.UpstreamDrainTimeout
 	if drainTimeout <= 0 {
 		drainTimeout = 1200 * time.Millisecond
@@ -267,7 +293,12 @@ func Relay(
 	clientToUpstreamFrames.Add(1)
 	markActivity()
 
-	exitCh := make(chan relayExitSignal, 3)
+	// There are up to five independent producers: client reader, upstream
+	// reader, two protocol keepalive probes, and the optional idle watchdog.
+	// Keep the signal channel larger than that fan-in so simultaneous shutdown
+	// (for example a failed Pong racing a peer Close) cannot leave a reader
+	// blocked forever while Relay waits to join it.
+	exitCh := make(chan relayExitSignal, 8)
 	dropDownstreamWrites := atomic.Bool{}
 	clientReaderStarted := atomic.Bool{}
 	startClientReader := func() {
@@ -307,6 +338,30 @@ func Relay(
 			exitCh,
 		)
 	}()
+	// A passthrough relay has a live reader on both sockets, so protocol Ping
+	// can safely be used to keep reverse proxies and the OpenAI edge from
+	// expiring a quiet inter-turn connection.  The optional interface keeps
+	// unsupported legacy adapters unchanged.
+	var keepaliveWG sync.WaitGroup
+	startKeepalive := func(direction string, conn FrameConn) {
+		keepaliveWG.Add(1)
+		go func() {
+			defer keepaliveWG.Done()
+			runRelayKeepalive(
+				relayCtx,
+				direction,
+				conn,
+				keepaliveInterval,
+				keepaliveTimeout,
+				&lastActivity,
+				nowFn,
+				onTrace,
+				exitCh,
+			)
+		}()
+	}
+	startKeepalive("client", clientConn)
+	startKeepalive("upstream", upstreamConn)
 	go runIdleWatchdog(relayCtx, nowFn, options.IdleTimeout, &lastActivity, onTrace, exitCh)
 
 	firstExit := <-exitCh
@@ -360,6 +415,18 @@ func Relay(
 
 	relayCancel()
 	_ = upstreamConn.Close()
+	// A Ping operation intentionally uses a detached, bounded context (see
+	// runRelayKeepalive). Join those goroutines before returning so a late
+	// control-frame write cannot race the caller's final close handshake.
+	keepaliveDone := make(chan struct{})
+	go func() {
+		keepaliveWG.Wait()
+		close(keepaliveDone)
+	}()
+	select {
+	case <-keepaliveDone:
+	case <-time.After(100 * time.Millisecond):
+	}
 	// ReadFrame observes relayCtx cancellation and Close is the transport-level
 	// fallback. Join the reader before touching relayState or firing the final
 	// turn callback; otherwise a late read can race Relay's result settlement.
@@ -486,7 +553,7 @@ func runClientToUpstream(
 				Error:     err.Error(),
 				Graceful:  isDisconnectError(err),
 			})
-			exitCh <- relayExitSignal{stage: "read_client", err: err, graceful: isDisconnectError(err)}
+			sendRelayExit(ctx, exitCh, relayExitSignal{stage: "read_client", err: err, graceful: isDisconnectError(err)})
 			return
 		}
 		markActivity()
@@ -498,7 +565,7 @@ func runClientToUpstream(
 				PayloadBytes: len(payload),
 				Error:        err.Error(),
 			})
-			exitCh <- relayExitSignal{stage: "write_upstream", err: err}
+			sendRelayExit(ctx, exitCh, relayExitSignal{stage: "write_upstream", err: err})
 			return
 		}
 		if forwardedFrames != nil {
@@ -540,12 +607,12 @@ func runUpstreamToClient(
 				Graceful:        isDisconnectError(err),
 				WroteDownstream: wroteDownstream,
 			})
-			exitCh <- relayExitSignal{
+			sendRelayExit(ctx, exitCh, relayExitSignal{
 				stage:           "read_upstream",
 				err:             err,
 				graceful:        isDisconnectError(err),
 				wroteDownstream: wroteDownstream,
-			}
+			})
 			return
 		}
 		markActivity()
@@ -559,11 +626,11 @@ func runUpstreamToClient(
 					WroteDownstream: wroteDownstream,
 					Error:           err.Error(),
 				})
-				exitCh <- relayExitSignal{
+				sendRelayExit(ctx, exitCh, relayExitSignal{
 					stage:           "upstream_message",
 					err:             err,
 					wroteDownstream: wroteDownstream,
-				}
+				})
 				return
 			}
 		}
@@ -591,11 +658,11 @@ func runUpstreamToClient(
 				WroteDownstream: wroteDownstream,
 			})
 			if observedEvent.terminal {
-				exitCh <- relayExitSignal{
+				sendRelayExit(ctx, exitCh, relayExitSignal{
 					stage:           "drain_terminal",
 					graceful:        true,
 					wroteDownstream: wroteDownstream,
-				}
+				})
 				return
 			}
 			markActivity()
@@ -617,7 +684,7 @@ func runUpstreamToClient(
 				WroteDownstream: wroteDownstream,
 				Error:           writeErr.Error(),
 			})
-			exitCh <- relayExitSignal{stage: "write_client", err: writeErr, wroteDownstream: wroteDownstream}
+			sendRelayExit(ctx, exitCh, relayExitSignal{stage: "write_client", err: writeErr, wroteDownstream: wroteDownstream})
 			return
 		}
 		wroteDownstream = true
@@ -628,6 +695,93 @@ func runUpstreamToClient(
 			forwardedFrames.Add(1)
 		}
 		markActivity()
+	}
+}
+
+func runRelayKeepalive(
+	ctx context.Context,
+	direction string,
+	conn FrameConn,
+	interval time.Duration,
+	timeout time.Duration,
+	_ *atomic.Int64,
+	nowFn func() time.Time,
+	onTrace func(event RelayTraceEvent),
+	exitCh chan<- relayExitSignal,
+) {
+	pinger, ok := conn.(PingConn)
+	if !ok || pinger == nil || interval <= 0 {
+		return
+	}
+	if capability, ok := conn.(PingCapability); ok && !capability.SupportsPing() {
+		return
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	// A ticker waits one full interval before its first tick.  That leaves a
+	// freshly upgraded hop exposed when an intermediary uses a shorter idle
+	// window than our default (and makes a relay that starts during an already
+	// quiet turn look dead).  Send the first probe immediately; subsequent
+	// probes remain evenly spaced at the configured interval.
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	first := true
+	for {
+		if first {
+			first = false
+		} else {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+		// The immediate iteration still needs to observe cancellation before
+		// touching the connection.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		// Do not gate this probe on the relay-wide activity timestamp.  The
+		// client and upstream sockets have independent intermediary idle
+		// timers, while lastActivity is intentionally shared for the relay's
+		// application-idle watchdog.  If one pinger updated that shared value,
+		// the other direction could be skipped forever and its socket would
+		// still be reaped by an edge proxy.  A small RFC 6455 Ping on each hop
+		// every interval is cheap and is the only reliable way to protect both
+		// halves.
+		// coder/websocket closes the entire transport when the context passed to
+		// Ping is canceled, even if the cancellation happens while the control
+		// frame is being flushed.  Relay cancellation is a normal shutdown path,
+		// so only consult ctx before starting the operation and let this detached
+		// timeout finish before the final Close handshake runs.
+		pingCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := pinger.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			emitRelayTrace(onTrace, RelayTraceEvent{
+				Stage:     "keepalive_failed",
+				Direction: direction,
+				Error:     err.Error(),
+			})
+			select {
+			case exitCh <- relayExitSignal{stage: "keepalive_" + direction, err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		emitRelayTrace(onTrace, RelayTraceEvent{
+			Stage:     "keepalive_ok",
+			Direction: direction,
+		})
 	}
 }
 
@@ -663,7 +817,7 @@ func runIdleWatchdog(
 				Direction: "watchdog",
 				Error:     context.DeadlineExceeded.Error(),
 			})
-			exitCh <- relayExitSignal{stage: "idle_timeout", err: context.DeadlineExceeded}
+			sendRelayExit(ctx, exitCh, relayExitSignal{stage: "idle_timeout", err: context.DeadlineExceeded})
 			return
 		}
 	}
@@ -674,6 +828,29 @@ func emitRelayTrace(onTrace func(event RelayTraceEvent), event RelayTraceEvent) 
 		return
 	}
 	onTrace(event)
+}
+
+// sendRelayExit is cancellation-aware so a reader that loses a race with the
+// first exit signal cannot remain blocked forever on a full fan-in channel.
+// Relay intentionally keeps the first signal and cancels relayCtx; subsequent
+// producers only need to best-effort publish their diagnostics for the short
+// drain window.
+func sendRelayExit(ctx context.Context, exitCh chan<- relayExitSignal, signal relayExitSignal) {
+	if exitCh == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case exitCh <- signal:
+		return
+	default:
+	}
+	select {
+	case exitCh <- signal:
+	case <-ctx.Done():
+	}
 }
 
 func relayMessageTypeString(msgType coderws.MessageType) string {

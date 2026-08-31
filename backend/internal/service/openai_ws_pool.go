@@ -18,7 +18,13 @@ import (
 )
 
 const (
-	openAIWSConnMaxAge             = 60 * time.Minute
+	openAIWSConnMaxAge = 60 * time.Minute
+	// OpenAI enforces a hard lifetime on Responses WebSockets.  Rotate pooled
+	// transports well before that boundary so a long-running Codex thread never
+	// has to discover the limit in the middle of its next turn.  The five-minute
+	// margin is intentionally conservative: a dial, TLS/proxy handshake and a
+	// full-input replay can all take measurable time under load.
+	openAIWSConnRotationAge        = 55 * time.Minute
 	openAIWSConnHealthCheckIdle    = 90 * time.Second
 	openAIWSConnHealthCheckTO      = 2 * time.Second
 	openAIWSConnPrewarmExtraDelay  = 2 * time.Second
@@ -74,6 +80,11 @@ type openAIWSAcquireRequest struct {
 	ForceNewConn bool
 	// ForcePreferredConn: 强制本次只使用 PreferredConnID，禁止漂移到其它连接。
 	ForcePreferredConn bool
+	// PersistentIngress marks a client-facing WebSocket whose upstream lease is
+	// intentionally held across turn boundaries.  Its transport count must not
+	// be capped at the account's per-turn concurrency: a root thread can be
+	// idle while a fork/subagent needs a separate live socket.
+	PersistentIngress bool
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
@@ -81,9 +92,14 @@ type openAIWSHandshakeCompatibilityKey struct {
 	codexInstallationID string
 	sessionIDHyphen     string
 	sessionIDUnderscore string
-	threadID            string
-	clientRequestID     string
-	codexWindowID       string
+	// conversation_id is the Codex thread/conversation identity used by a
+	// number of clients that share one session-id across a root and its forked
+	// subagents.  Reusing an idle socket across those conversations can mix
+	// store=false response chains even when all fingerprint headers match.
+	conversationID  string
+	threadID        string
+	clientRequestID string
+	codexWindowID   string
 }
 
 type openAIWSConnLease struct {
@@ -132,6 +148,25 @@ func (l *openAIWSConnLease) Reused() bool {
 		return false
 	}
 	return l.reused
+}
+
+// Age reports the physical upstream WebSocket age, rather than the time since
+// this lease was acquired.  OpenAI's connection limit is based on the former.
+func (l *openAIWSConnLease) Age() time.Duration {
+	if l == nil || l.conn == nil {
+		return 0
+	}
+	return l.conn.age(time.Now())
+}
+
+// NeedsRotation is true once the transport reaches the pre-expiry rotation
+// window.  A session holding the lease must explicitly reconnect; pool cleanup
+// cannot evict a leased connection without interrupting its caller.
+func (l *openAIWSConnLease) NeedsRotation() bool {
+	if l == nil || l.conn == nil || l.released.Load() {
+		return false
+	}
+	return l.conn.needsRotation(time.Now())
 }
 
 func (l *openAIWSConnLease) HandshakeHeader(name string) string {
@@ -218,6 +253,14 @@ func (l *openAIWSConnLease) PingWithTimeout(timeout time.Duration) error {
 	return conn.pingWithTimeout(timeout)
 }
 
+func (l *openAIWSConnLease) PingWithContext(ctx context.Context, timeout time.Duration) error {
+	conn, err := l.activeConn()
+	if err != nil {
+		return err
+	}
+	return conn.pingWithContext(ctx, timeout)
+}
+
 func (l *openAIWSConnLease) SupportsIdlePingWithoutReader() bool {
 	conn, err := l.activeConn()
 	if err != nil {
@@ -286,6 +329,13 @@ func (c *openAIWSConn) tryAcquire() bool {
 	if c == nil {
 		return false
 	}
+	// Never hand a near-expiry transport to a new turn.  The account pool
+	// normally removes these sockets before selection; this second check closes
+	// the small race where an idle connection crosses the rotation boundary
+	// between cleanup and semaphore acquisition.
+	if c.needsRotation(time.Now()) {
+		return false
+	}
 	select {
 	case <-c.closedCh:
 		return false
@@ -298,6 +348,10 @@ func (c *openAIWSConn) tryAcquire() bool {
 			c.release()
 			return false
 		default:
+		}
+		if c.needsRotation(time.Now()) {
+			c.release()
+			return false
 		}
 		return true
 	default:
@@ -329,6 +383,10 @@ func (c *openAIWSConn) acquire(ctx context.Context) error {
 				c.release()
 				return errOpenAIWSConnClosed
 			default:
+			}
+			if c.needsRotation(time.Now()) {
+				c.release()
+				return errOpenAIWSPreferredConnUnavailable
 			}
 			return nil
 		}
@@ -437,6 +495,17 @@ func (c *openAIWSConn) readMessage(readCtx context.Context) ([]byte, error) {
 	}
 	payload, err := c.ws.ReadMessage(readCtx)
 	if err != nil {
+		// The coder adapter owns a background Reader, so cancelling this
+		// per-call context no longer causes coder/websocket itself to close the
+		// transport (the old direct Conn.Read path did that via its read-timeout
+		// hook).  A timed-out upstream read must remain terminal for this pooled
+		// connection; otherwise a later lease could consume stale response
+		// frames from the abandoned turn.  Close asynchronously to preserve the
+		// old prompt-return behavior while the caller evicts the lease.
+		if terminal, ok := c.ws.(openAIWSReadTimeoutTerminal); ok && terminal.ReadTimeoutClosesConnection() &&
+			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			go c.close()
+		}
 		return nil, err
 	}
 	c.touch()
@@ -444,6 +513,10 @@ func (c *openAIWSConn) readMessage(readCtx context.Context) ([]byte, error) {
 }
 
 func (c *openAIWSConn) pingWithTimeout(timeout time.Duration) error {
+	return c.pingWithContext(context.Background(), timeout)
+}
+
+func (c *openAIWSConn) pingWithContext(parent context.Context, timeout time.Duration) error {
 	if c == nil {
 		return errOpenAIWSConnClosed
 	}
@@ -453,20 +526,73 @@ func (c *openAIWSConn) pingWithTimeout(timeout time.Duration) error {
 	default:
 	}
 
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.ws == nil {
-		return errOpenAIWSConnClosed
+	if parent == nil {
+		parent = context.Background()
 	}
 	if timeout <= 0 {
 		timeout = openAIWSConnHealthCheckTO
 	}
-	pingCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	// Use the caller context only while waiting for the application's write
+	// mutex.  coder/websocket attaches an AfterFunc to the context passed to
+	// Ping; cancelling that context while the control frame is in flight closes
+	// the underlying socket.  Once the mutex is acquired, the protocol operation
+	// therefore gets its own bounded context that is allowed to run to
+	// completion, even when the caller is concurrently releasing the lease.
+	lockCtx, cancelLock := context.WithTimeout(parent, timeout)
+	if err := lockOpenAIWSWriteMutex(lockCtx, &c.writeMu); err != nil {
+		cancelLock()
+		return err
+	}
+	cancelLock()
+	defer c.writeMu.Unlock()
+	if c.ws == nil {
+		return errOpenAIWSConnClosed
+	}
+	select {
+	case <-c.closedCh:
+		return errOpenAIWSConnClosed
+	default:
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), timeout)
+	defer cancelPing()
 	if err := c.ws.Ping(pingCtx); err != nil {
 		return err
 	}
+	c.touch()
 	return nil
+}
+
+// lockOpenAIWSWriteMutex keeps a keepalive probe cancellable while a large
+// application frame is being flushed.  A plain Mutex.Lock would let a probe
+// goroutine outlive its turn (and potentially ping a lease after it was
+// released) for the full write timeout.
+func lockOpenAIWSWriteMutex(ctx context.Context, mu *sync.Mutex) error {
+	if mu == nil {
+		return errOpenAIWSConnClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *openAIWSConn) supportsIdlePingWithoutReader() bool {
@@ -528,6 +654,14 @@ func (c *openAIWSConn) age(now time.Time) time.Duration {
 		return 0
 	}
 	return now.Sub(created)
+}
+
+func (c *openAIWSConn) needsRotation(now time.Time) bool {
+	if c == nil || openAIWSConnRotationAge <= 0 {
+		return false
+	}
+	age := c.age(now)
+	return age >= openAIWSConnRotationAge
 }
 
 func (c *openAIWSConn) isLeased() bool {
@@ -829,7 +963,7 @@ func (p *openAIWSConnPool) runBackgroundCleanupSweep(now time.Time) {
 		maxConns := p.maxConnsHardCap()
 		ap.mu.Lock()
 		if ap.lastAcquire != nil && ap.lastAcquire.Account != nil {
-			maxConns = p.effectiveMaxConnsByAccount(ap.lastAcquire.Account)
+			maxConns = p.effectiveMaxConnsForAcquire(*ap.lastAcquire)
 		}
 		evicted := p.cleanupAccountLocked(ap, now, maxConns)
 		ap.lastCleanupAt = now
@@ -863,7 +997,7 @@ retryAcquire:
 	accountID := req.Account.ID
 	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
 	routingAffinity := normalizeOpenAIWSRoutingAffinity(req.Headers)
-	effectiveMaxConns := p.effectiveMaxConnsByAccount(req.Account)
+	effectiveMaxConns := p.effectiveMaxConnsForAcquire(req)
 	if effectiveMaxConns <= 0 {
 		return nil, errOpenAIWSConnQueueFull
 	}
@@ -872,8 +1006,12 @@ retryAcquire:
 	ap.mu.Lock()
 	acquireGeneration := ap.generation
 	now := time.Now()
+	// Cleanup is throttled for idle-size accounting, but age retirement must be
+	// checked on every acquire.  Otherwise a socket can sit just past the
+	// rotation window during the cleanup interval and be handed to a new turn.
+	evicted = append(evicted, p.evictRotationDueLocked(ap, now)...)
 	if ap.lastCleanupAt.IsZero() || now.Sub(ap.lastCleanupAt) >= openAIWSAcquireCleanupInterval {
-		evicted = p.cleanupAccountLocked(ap, now, effectiveMaxConns)
+		evicted = append(evicted, p.cleanupAccountLocked(ap, now, effectiveMaxConns)...)
 		ap.lastCleanupAt = now
 	}
 	pickStartedAt := time.Now()
@@ -891,6 +1029,17 @@ retryAcquire:
 			}
 			preferredConn, ok := ap.conns[preferredConnID]
 			if !ok || !preferredConn.matchesHandshakeCompatibility(compatibility) {
+				p.recordConnPickDuration(time.Since(pickStartedAt))
+				ap.mu.Unlock()
+				closeOpenAIWSConns(evicted)
+				return nil, errOpenAIWSPreferredConnUnavailable
+			}
+			// tryAcquire deliberately rejects a transport in the rotation window.
+			// Do not turn that rejection into an indefinite wait on the same
+			// semaphore: a leased stale socket can never become safe merely by
+			// waiting for its current owner to release it. The ingress layer will
+			// replay the turn on a fresh transport when it has enough history.
+			if preferredConn.needsRotation(time.Now()) {
 				p.recordConnPickDuration(time.Since(pickStartedAt))
 				ap.mu.Unlock()
 				closeOpenAIWSConns(evicted)
@@ -943,6 +1092,12 @@ retryAcquire:
 					return p.acquire(ctx, req, retry+1)
 				}
 				return nil, err
+			}
+			if preferredConn.needsRotation(time.Now()) {
+				preferredConn.release()
+				preferredConn.close()
+				p.evictConn(accountID, preferredConn.id)
+				return nil, errOpenAIWSPreferredConnUnavailable
 			}
 			if p.shouldHealthCheckConn(preferredConn) {
 				if err := preferredConn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
@@ -1021,7 +1176,12 @@ retryAcquire:
 			p.ensureTargetIdleAsync(accountID)
 			return lease, nil
 		}
-		if routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns {
+		// A persistent ingress lease represents an independent client session.
+		// If the preferred/affine connection is busy, first look for any other
+		// compatible idle connection and then create a new one while capacity is
+		// available.  The legacy path intentionally queues on the least-busy
+		// connection when no routing hint is present.
+		if req.PersistentIngress || routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns {
 			for _, conn := range ap.conns {
 				if conn == nil || conn == best || !conn.matchesHandshakeCompatibility(compatibility) {
 					continue
@@ -1182,7 +1342,22 @@ acquireAtCapacity:
 		if errors.Is(err, errOpenAIWSConnClosed) && retry < 1 {
 			return p.acquire(ctx, req, retry+1)
 		}
+		if errors.Is(err, errOpenAIWSPreferredConnUnavailable) {
+			if retry < 1 {
+				return p.acquire(ctx, req, retry+1)
+			}
+			return nil, errOpenAIWSConnClosed
+		}
 		return nil, err
+	}
+	if target.needsRotation(time.Now()) {
+		target.release()
+		target.close()
+		p.evictConn(accountID, target.id)
+		if retry < 1 {
+			return p.acquire(ctx, req, retry+1)
+		}
+		return nil, errOpenAIWSConnClosed
 	}
 	if p.shouldHealthCheckConn(target) {
 		if err := target.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
@@ -1203,6 +1378,34 @@ acquireAtCapacity:
 	p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 	p.ensureTargetIdleAsync(accountID)
 	return lease, nil
+}
+
+// evictRotationDueLocked removes every idle transport that has entered the
+// pre-expiry window.  It is deliberately allowed to remove pinned idle
+// connections: a pin is only a routing hint, while reusing a near-expiry
+// socket would deterministically recreate the upstream 60-minute failure.
+// Leased connections are left to their owning ingress session, which performs
+// a replay-safe rotation before its next write.
+func (p *openAIWSConnPool) evictRotationDueLocked(ap *openAIWSAccountPool, now time.Time) []*openAIWSConn {
+	if p == nil || ap == nil || len(ap.conns) == 0 {
+		return nil
+	}
+	var evicted []*openAIWSConn
+	for id, conn := range ap.conns {
+		if conn == nil || conn.isLeased() || !conn.needsRotation(now) {
+			continue
+		}
+		delete(ap.conns, id)
+		if len(ap.pinnedConns) > 0 {
+			delete(ap.pinnedConns, id)
+		}
+		evicted = append(evicted, conn)
+	}
+	if len(evicted) > 0 {
+		p.metrics.scaleDownTotal.Add(int64(len(evicted)))
+		ap.signalChangedLocked()
+	}
+	return evicted
 }
 
 func (p *openAIWSConnPool) recordConnPickDuration(duration time.Duration) {
@@ -1242,6 +1445,9 @@ func (p *openAIWSConnPool) pickOldestIdleConnLocked(ap *openAIWSAccountPool) *op
 		if conn == nil || conn.isLeased() || conn.waiters.Load() > 0 || p.isConnPinnedLocked(ap, conn.id) {
 			continue
 		}
+		if conn.needsRotation(time.Now()) {
+			continue
+		}
 		if oldest == nil || conn.lastUsedAt().Before(oldest.lastUsedAt()) {
 			oldest = conn
 		}
@@ -1261,6 +1467,9 @@ func (p *openAIWSConnPool) pickOldestIdleConnWithoutHandshakeCompatibilityLocked
 		if conn == nil ||
 			conn.matchesHandshakeCompatibility(compatibility) ||
 			conn.isLeased() || conn.waiters.Load() > 0 || p.isConnPinnedLocked(ap, conn.id) {
+			continue
+		}
+		if conn.needsRotation(time.Now()) {
 			continue
 		}
 		if oldest == nil || conn.lastUsedAt().Before(oldest.lastUsedAt()) {
@@ -1350,10 +1559,10 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			continue
 		default:
 		}
-		if p.isConnPinnedLocked(ap, id) {
-			continue
-		}
-		if maxAge > 0 && !conn.isLeased() && conn.age(now) > maxAge {
+		// A pin preserves routing affinity, not physical socket lifetime. Retire
+		// idle pinned sockets in the rotation window too.
+		if !conn.isLeased() && ((openAIWSConnRotationAge > 0 && conn.needsRotation(now)) ||
+			(maxAge > 0 && conn.age(now) > maxAge)) {
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
@@ -1421,7 +1630,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	}
 	preferredConnID = stringsTrim(preferredConnID)
 	if preferredConnID != "" {
-		if conn, ok := ap.conns[preferredConnID]; ok && conn.matchesHandshakeCompatibility(compatibility) {
+		if conn, ok := ap.conns[preferredConnID]; ok && conn.matchesHandshakeCompatibility(compatibility) && !conn.needsRotation(time.Now()) {
 			return conn
 		}
 	}
@@ -1429,7 +1638,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	var bestWaiters int32
 	var bestLastUsed time.Time
 	for _, conn := range ap.conns {
-		if conn == nil || !conn.matchesHandshakeCompatibility(compatibility) {
+		if conn == nil || !conn.matchesHandshakeCompatibility(compatibility) || conn.needsRotation(time.Now()) {
 			continue
 		}
 		waiters := conn.waiters.Load()
@@ -1459,7 +1668,8 @@ func (p *openAIWSConnPool) pickLeastBusyConnWithRoutingAffinityLocked(
 	for _, conn := range ap.conns {
 		if conn == nil ||
 			!conn.matchesHandshakeCompatibility(compatibility) ||
-			!conn.matchesRoutingAffinity(routingAffinity) {
+			!conn.matchesRoutingAffinity(routingAffinity) ||
+			conn.needsRotation(time.Now()) {
 			continue
 		}
 		waiters := conn.waiters.Load()
@@ -1535,7 +1745,7 @@ func (p *openAIWSConnPool) ensureTargetIdleAsync(accountID int64) {
 	}
 	effectiveMaxConns := p.maxConnsHardCap()
 	if ap.lastAcquire != nil && ap.lastAcquire.Account != nil {
-		effectiveMaxConns = p.effectiveMaxConnsByAccount(ap.lastAcquire.Account)
+		effectiveMaxConns = p.effectiveMaxConnsForAcquire(*ap.lastAcquire)
 	}
 	target := p.targetConnCountLocked(ap, effectiveMaxConns)
 	current := len(ap.conns) + ap.creating
@@ -1654,7 +1864,7 @@ func (p *openAIWSConnPool) prewarmConns(accountID int64, req openAIWSAcquireRequ
 			conn.close()
 			continue
 		}
-		if len(ap.conns) >= p.effectiveMaxConnsByAccount(req.Account) {
+		if len(ap.conns) >= p.effectiveMaxConnsForAcquire(req) {
 			ap.signalChangedLocked()
 			ap.mu.Unlock()
 			conn.close()
@@ -1911,6 +2121,34 @@ func (p *openAIWSConnPool) effectiveMaxConnsByAccount(account *Account) int {
 	return effective
 }
 
+// effectiveMaxConnsForAcquire returns the transport ceiling for one acquire.
+// Account concurrency is a per-turn admission limit; it is not a safe upper
+// bound for persistent WebSocket transports because those transports remain
+// leased while their clients wait between turns.  Keep the ordinary pool
+// policy unchanged, but let explicitly persistent ingress sessions use the
+// configured hard cap (while still rejecting accounts whose effective limit is
+// zero and never exceeding that cap).
+func (p *openAIWSConnPool) effectiveMaxConnsForAcquire(req openAIWSAcquireRequest) int {
+	maxConns := p.effectiveMaxConnsByAccount(req.Account)
+	if maxConns <= 0 || !req.PersistentIngress {
+		return maxConns
+	}
+	if hardCap := p.maxConnsHardCap(); hardCap > maxConns {
+		maxConns = hardCap
+	}
+	// A persistent ingress transport is held by the client while it waits
+	// between turns.  Codex can open a root and one or more child/fork threads
+	// concurrently under the same account/session.  A configured/effective
+	// ceiling of one would therefore make the second thread wait on the root
+	// forever (the root cannot release until the child finishes).  Reserve a
+	// small transport floor for persistent ingress; ordinary turn-scoped
+	// acquires continue to honor the account limit exactly.
+	if maxConns < 2 {
+		maxConns = 2
+	}
+	return maxConns
+}
+
 func (p *openAIWSConnPool) minIdlePerAccount() int {
 	if p != nil && p.cfg != nil && p.cfg.Gateway.OpenAIWS.MinIdlePerAccount >= 0 {
 		return p.cfg.Gateway.OpenAIWS.MinIdlePerAccount
@@ -2041,6 +2279,10 @@ func normalizeOpenAIWSHandshakeCompatibility(account *Account, headers http.Head
 	}
 	key.sessionIDHyphen = normalizeOpenAIWSStableIdentityHeader(headers, "session-id")
 	key.sessionIDUnderscore = normalizeOpenAIWSStableIdentityHeader(headers, "session_id")
+	key.conversationID = normalizeOpenAIWSStableIdentityHeader(headers, "conversation_id")
+	if key.conversationID == "" {
+		key.conversationID = normalizeOpenAIWSStableIdentityHeader(headers, "conversation-id")
+	}
 	key.threadID = normalizeOpenAIWSStableIdentityHeader(headers, "thread-id")
 	key.clientRequestID = normalizeOpenAIWSStableIdentityHeader(headers, "x-client-request-id")
 	key.codexWindowID = normalizeOpenAIWSStableIdentityHeader(headers, "x-codex-window-id")
@@ -2048,7 +2290,7 @@ func normalizeOpenAIWSHandshakeCompatibility(account *Account, headers http.Head
 }
 
 func activeCodexFingerprintMode(account *Account) codexFingerprintMode {
-	if account == nil || !account.IsOpenAIOAuth() {
+	if account == nil || !account.IsOpenAIOAuthLike() {
 		return codexFingerprintOff
 	}
 	return effectiveCodexFingerprintMode(account.GetCodexFingerprintMode())

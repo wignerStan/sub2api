@@ -44,7 +44,12 @@ const (
 	openAIWSStoreDisabledConnModeOff      = "off"
 
 	openAIWSIngressStagePreviousResponseNotFound = "previous_response_not_found"
-	openAIWSMaxPrevResponseIDDeletePasses        = 8
+	// The upstream Responses service closes/rejects a socket after a hard
+	// lifetime (currently reported as websocket_connection_limit_reached).  This
+	// is a transport event, not a user request error: ingress can safely replay a
+	// turn that has not produced any downstream bytes on a fresh socket.
+	openAIWSIngressStageConnectionLimit   = "connection_limit"
+	openAIWSMaxPrevResponseIDDeletePasses = 8
 )
 
 var openAIWSLogValueReplacer = strings.NewReplacer(
@@ -94,6 +99,42 @@ type openAIWSIngressTurnError struct {
 	stage           string
 	cause           error
 	wroteDownstream bool
+}
+
+type openAIWSConnectionLimitError struct {
+	code         string
+	message      string
+	retryPayload []byte
+}
+
+func (e *openAIWSConnectionLimitError) Error() string {
+	if e == nil {
+		return "upstream websocket connection lifetime limit reached"
+	}
+	if strings.TrimSpace(e.message) != "" {
+		return e.message
+	}
+	if strings.TrimSpace(e.code) != "" {
+		return e.code
+	}
+	return "upstream websocket connection lifetime limit reached"
+}
+
+func (e *openAIWSConnectionLimitError) RetryPayload() []byte {
+	if e == nil {
+		return nil
+	}
+	return append([]byte(nil), e.retryPayload...)
+}
+
+const openAIWSConnectionLimitFailoverReason GatewayFailureReason = "openai_ws_connection_limit"
+
+// IsOpenAIWSConnectionLimitFailover reports the special passthrough failover
+// marker.  It is exported because the HTTP handler owns the account-attempt
+// loop while the relay itself only sees a FrameConn error.
+func IsOpenAIWSConnectionLimitFailover(err error) bool {
+	var failover *UpstreamFailoverError
+	return errors.As(err, &failover) && failover != nil && failover.Reason == openAIWSConnectionLimitFailoverReason
 }
 
 type openAIWSCurrentTurnFailoverError struct {
@@ -172,11 +213,19 @@ func isOpenAIWSIngressTurnRetryable(err error) bool {
 		return false
 	}
 	switch turnErr.stage {
-	case "write_upstream", "read_upstream":
+	case "write_upstream", "read_upstream", openAIWSIngressStageConnectionLimit:
 		return true
 	default:
 		return false
 	}
+}
+
+func isOpenAIWSIngressConnectionLimit(err error) bool {
+	var turnErr *openAIWSIngressTurnError
+	if !errors.As(err, &turnErr) || turnErr == nil || turnErr.wroteDownstream {
+		return false
+	}
+	return strings.TrimSpace(turnErr.stage) == openAIWSIngressStageConnectionLimit
 }
 
 func openAIWSIngressTurnRetryReason(err error) string {

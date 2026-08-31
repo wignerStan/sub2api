@@ -196,6 +196,10 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
+		// This request path may be re-entered with an account-scoped replay body
+		// after failover. Derive the snapshot from the original handshake headers;
+		// the WS ingress path is the only caller that explicitly opts into
+		// first-frame body topology capture.
 		fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 		if fpIDs != nil && (!isOpenAIResponsesCompactPath(c) || gjson.GetBytes(body, "client_metadata").Exists()) {
 			fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)

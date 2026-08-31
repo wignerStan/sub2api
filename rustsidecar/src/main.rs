@@ -29,7 +29,7 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::{HttpClient, HttpClientBuilder};
 use codex_websocket_client::{WebSocketConnector, WebSocketTlsMode};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::handshake::client::Request as TsRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Error as TsError;
@@ -52,6 +52,12 @@ const UPSTREAM_PROXY_HEADER: &str = "x-upstream-proxy";
 const ACCOUNT_ID_HEADER: &str = "x-account-id";
 const WS_CLOSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WS_CLOSE_REASON_MAX_BYTES: usize = 123;
+// Keep both loopback and upstream WebSockets below the idle windows used by
+// common reverse proxies.  The Go side also probes these sockets; the sidecar
+// heartbeat is deliberately independent so a stalled Go turn cannot leave the
+// TLS-disguise hop silent.
+const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const WS_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     let name = name.as_str().to_ascii_lowercase();
@@ -505,7 +511,8 @@ async fn http_tunnel_e2ee(
 
     // Read sealed E2EE request body and decrypt. HTTP bodies are complete
     // record streams; leftover bytes therefore indicate a truncated request.
-    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await {
+    let sealed_bytes = match axum::body::to_bytes(axum_request.into_body(), 64 * 1024 * 1024).await
+    {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -782,8 +789,9 @@ async fn pump_ws(
     header_window_number: Option<u64>,
     policy: UnknownFieldPolicy,
 ) {
-    let seal_ts = |message: TsMessage| -> TsMessage {
-        match (&e2ee_key, message) {
+    let seal_key = e2ee_key;
+    let seal_ts = move |message: TsMessage| -> TsMessage {
+        match (&seal_key, message) {
             (Some(key), TsMessage::Text(text)) => match e2ee::seal(key, text.as_bytes()) {
                 Ok(sealed) => TsMessage::Binary(sealed.into()),
                 Err(err) => {
@@ -805,8 +813,9 @@ async fn pump_ws(
     let profile_for_upstream = profile.clone();
     let salt_for_upstream = salt.clone();
     let version_for_upstream = agent_version.clone();
+    let open_key = e2ee_key;
     let open_and_transform_ts = move |message: TsMessage| -> TsMessage {
-        let plain_msg = match (&e2ee_key, message) {
+        let plain_msg = match (&open_key, message) {
             (Some(key), TsMessage::Text(text)) => match e2ee::open(key, text.as_bytes()) {
                 Ok(plain) => match String::from_utf8(plain) {
                     Ok(text) => TsMessage::text(text),
@@ -853,79 +862,221 @@ async fn pump_ws(
         }
     };
 
-    let (mut client_sink, mut client_stream) = client.split();
-    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+    let (client_sink, mut client_stream) = client.split();
+    let (upstream_sink, mut upstream_stream) = upstream.split();
+    // Split sinks are shared only for the final, symmetric close.  Each
+    // direction still has a single writer, so normal data/control frames do
+    // not interleave at the sink level.
+    let client_sink = Arc::new(Mutex::new(client_sink));
+    let upstream_sink = Arc::new(Mutex::new(upstream_sink));
+    // A level-triggered watch channel is used instead of Notify::notify_waiters:
+    // a one-shot notification can be lost if the opposite pump is between
+    // select iterations, leaving it reading until the drain timeout and then
+    // forcing an abort (the client observes that as a TCP reset without a
+    // WebSocket close handshake).
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let to_upstream = async {
-        while let Some(message) = client_stream.next().await {
-            match message {
-                Ok(message) => {
-                    let Some(ts) = axum_to_ts(message) else {
-                        continue;
-                    };
-                    let (ts, is_close) =
-                        transform_and_classify_ws_message(ts, &open_and_transform_ts);
-                    if upstream_sink.send(ts).await.is_err() {
+    let mut to_upstream_shutdown = shutdown_rx.clone();
+    let to_upstream_sink = upstream_sink.clone();
+    let to_upstream_client_sink = client_sink.clone();
+    let to_upstream = async move {
+        // `interval` yields its first tick immediately.  Send the first protocol
+        // Ping as soon as the tunnel starts so a short-lived edge idle timer cannot
+        // expire the freshly upgraded socket before the first scheduled renewal.
+        let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = to_upstream_shutdown.changed() => {
+                    if changed.is_err() || *to_upstream_shutdown.borrow() {
                         break;
                     }
-                    if is_close {
+                },
+                _ = keepalive.tick() => {
+                    let ping = TsMessage::Ping(Vec::<u8>::new().into());
+                    let ping_result = tokio::time::timeout(WS_KEEPALIVE_TIMEOUT, async {
+                        let mut sink = to_upstream_sink.lock().await;
+                        sink.send(ping).await
+                    }).await;
+                    if !matches!(ping_result, Ok(Ok(()))) {
                         break;
                     }
                 }
-                Err(_) => break,
-            }
-        }
-        if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, upstream_sink.close())
-            .await
-            .is_err()
-        {
-            tracing::debug!("timed out closing upstream websocket sink");
-        }
-    };
-
-    let to_client = async {
-        while let Some(message) = upstream_stream.next().await {
-            match message {
-                Ok(message) => {
-                    let (message, is_close) = transform_and_classify_ws_message(message, &seal_ts);
-                    if let Some(message) = ts_to_axum(message) {
-                        if client_sink.send(message).await.is_err() {
-                            break;
+                message = client_stream.next() => {
+                    let Some(message) = message else { break };
+                    match message {
+                        Ok(message) => {
+                            let Some(ts) = axum_to_ts(message) else { continue };
+                            let (ts, is_close) =
+                                transform_and_classify_ws_message(ts, &open_and_transform_ts);
+                            // This sidecar terminates both WebSocket hops. Control
+                            // frames are therefore hop-local: forwarding a Ping or
+                            // Pong across the tunnel makes a Pong generated for a
+                            // local keepalive look like the peer's response on the
+                            // other hop. It also used to acquire the client and
+                            // upstream sink locks in opposite orders in the two
+                            // pumps, which deadlocked as soon as both peers pinged
+                            // concurrently. Axum queues an automatic Pong when a
+                            // Ping is read; send an explicit Pong on the *same*
+                            // hop to flush it immediately, then consume the Ping.
+                            if let TsMessage::Ping(payload) = &ts {
+                                let pong = AxumMessage::Pong(payload.clone().into());
+                                let mut sink = to_upstream_client_sink.lock().await;
+                                if sink.send(pong).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if matches!(ts, TsMessage::Pong(_)) {
+                                continue;
+                            }
+                            let mut sink = to_upstream_sink.lock().await;
+                            if sink.send(ts).await.is_err() {
+                                break;
+                            }
+                            if is_close {
+                                break;
+                            }
                         }
-                        if is_close {
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
             }
-        }
-        if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, client_sink.close())
-            .await
-            .is_err()
-        {
-            tracing::debug!("timed out closing downstream websocket sink");
         }
     };
 
-    tokio::pin!(to_upstream);
-    tokio::pin!(to_client);
-
-    tokio::select! {
-        _ = &mut to_client => {
-            // Upstream finished producing responses/errors and closed the stream.
+    let mut to_client_shutdown = shutdown_rx;
+    let to_client_sink = client_sink.clone();
+    let to_client_upstream_sink = upstream_sink.clone();
+    let to_client = async move {
+        let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = to_client_shutdown.changed() => {
+                    if changed.is_err() || *to_client_shutdown.borrow() {
+                        break;
+                    }
+                },
+                _ = keepalive.tick() => {
+                    let ping_result = tokio::time::timeout(
+                        WS_KEEPALIVE_TIMEOUT,
+                        async {
+                            let mut sink = to_client_sink.lock().await;
+                            sink.send(AxumMessage::Ping(Vec::new().into())).await
+                        },
+                    ).await;
+                    if !matches!(ping_result, Ok(Ok(()))) {
+                        break;
+                    }
+                }
+                message = upstream_stream.next() => {
+                    let Some(message) = message else { break };
+                    match message {
+                        Ok(message) => {
+                            let (message, is_close) = transform_and_classify_ws_message(message, &seal_ts);
+                            // Control frames are local to each terminated hop.
+                            // Reply on the upstream sink itself so the peer gets
+                            // a prompt Pong, but never forward Ping/Pong to the
+                            // client (or vice versa). Keeping each branch to one
+                            // sink lock also prevents a client-Ping/upstream-Ping
+                            // lock inversion between the two direction pumps.
+                            if let TsMessage::Ping(payload) = &message {
+                                let pong = TsMessage::Pong(payload.clone());
+                                let mut sink = to_client_upstream_sink.lock().await;
+                                if sink.send(pong).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if matches!(message, TsMessage::Pong(_)) {
+                                continue;
+                            }
+                            if let Some(message) = ts_to_axum(message) {
+                                let mut sink = to_client_sink.lock().await;
+                                if sink.send(message).await.is_err() {
+                                    break;
+                                }
+                                if is_close {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
         }
-        _ = &mut to_upstream => {
-            // Closing the client write half must terminate the upstream request side.
-            // Give the upstream a bounded window to return its final response/close.
-            if tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, to_client.as_mut())
+    };
+
+    // Whichever direction terminates first tells the other direction to stop
+    // reading.  We then close *both* sinks explicitly; dropping a split sink
+    // here was the source of bare TCP resets without a WebSocket close
+    // handshake (the exact error seen by Codex as “connection reset without
+    // closing handshake”).
+    let mut to_upstream = tokio::spawn(to_upstream);
+    let mut to_client = tokio::spawn(to_client);
+    let first_finished = tokio::select! {
+        _ = &mut to_client => 0u8,
+        _ = &mut to_upstream => 1u8,
+    };
+
+    // Preserve the WebSocket close-drain ordering.  When the client direction
+    // ends first (normally because it sent a Close frame), the upstream side
+    // must remain alive long enough to read the peer's final response/Close
+    // acknowledgement.  Signalling shutdown before that drain cancels the
+    // reader immediately and turns an otherwise valid handshake into a bare
+    // TCP reset (the exact `connection reset without closing handshake` seen
+    // by Codex).  Conversely, once the upstream direction ends, stopping the
+    // client reader is safe and avoids waiting on a dead downstream socket.
+    let (drained, drain_timeout) = if first_finished == 0 {
+        let _ = shutdown_tx.send(true);
+        (
+            tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, &mut to_upstream)
                 .await
-                .is_err()
-            {
-                tracing::debug!("timed out draining upstream websocket after client close");
-            }
+                .is_ok(),
+            "upstream",
+        )
+    } else {
+        let drained = tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, &mut to_client)
+            .await
+            .is_ok();
+        let _ = shutdown_tx.send(true);
+        (drained, "client")
+    };
+    if !drained {
+        tracing::debug!(
+            direction = drain_timeout,
+            "timed out draining websocket direction"
+        );
+        if first_finished == 0 {
+            to_upstream.abort();
+            let _ = to_upstream.await;
+        } else {
+            to_client.abort();
+            let _ = to_client.await;
         }
     }
+
+    let close_upstream = async {
+        let _ = tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, async {
+            let mut sink = upstream_sink.lock().await;
+            let _ = sink.close().await;
+        })
+        .await;
+    };
+    let close_client = async {
+        let _ = tokio::time::timeout(WS_CLOSE_DRAIN_TIMEOUT, async {
+            let mut sink = client_sink.lock().await;
+            let _ = sink.close().await;
+        })
+        .await;
+    };
+    // Closing the upstream first lets it observe a close from the local side;
+    // the downstream close then completes the client handshake.  Each close
+    // is independently bounded so one broken half cannot strand the other.
+    close_upstream.await;
+    close_client.await;
 }
 
 async fn ws_tunnel(

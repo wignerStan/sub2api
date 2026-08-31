@@ -152,6 +152,54 @@ func TestResolveConvergedThreadID_EmptySession(t *testing.T) {
 	assert.Equal(t, "", resolveConvergedThreadID(testCodexFingerprintSeed, ""))
 }
 
+func TestExtractClientThreadID_FallsBackToWindowProjection(t *testing.T) {
+	h := make(http.Header)
+	h.Set("session-id", "shared-session")
+	h.Set("x-codex-window-id", "child-thread:3")
+	assert.Equal(t, "child-thread", extractClientThreadID(h))
+
+	h.Del("x-codex-window-id")
+	h.Set("window-id", `{"thread_id":"json-thread","window_number":4}`)
+	assert.Equal(t, "json-thread", extractClientThreadID(h))
+}
+
+func TestExtractClientThreadID_ExplicitHeaderWinsOverWindowProjection(t *testing.T) {
+	h := make(http.Header)
+	h.Set("thread-id", "header-thread")
+	h.Set("x-codex-window-id", "window-thread:1")
+	assert.Equal(t, "header-thread", extractClientThreadID(h))
+}
+
+func TestResolveCodexFingerprintIDsFromRequest_ConversationFallbackSeparatesForks(t *testing.T) {
+	account := newTestOAuthAccount(4504, map[string]any{codexFingerprintModeExtraKey: "session"})
+	rootHeaders := make(http.Header)
+	rootHeaders.Set("session-id", "shared-session")
+	rootHeaders.Set("conversation_id", "root-conversation")
+	childHeaders := rootHeaders.Clone()
+	childHeaders.Set("conversation_id", "child-conversation")
+
+	rootIDs := resolveCodexFingerprintIDsFromRequest(account, rootHeaders)
+	childIDs := resolveCodexFingerprintIDsFromRequest(account, childHeaders)
+	require.NotNil(t, rootIDs)
+	require.NotNil(t, childIDs)
+	require.Equal(t, rootIDs.sessionID, childIDs.sessionID)
+	require.NotEqual(t, rootIDs.threadID, childIDs.threadID)
+	require.Equal(t, resolveConvergedThreadID(rootIDs.seed, "root-conversation"), rootIDs.threadID)
+	require.Equal(t, resolveConvergedThreadID(childIDs.seed, "child-conversation"), childIDs.threadID)
+}
+
+func TestResolveCodexFingerprintIDsFromRequest_ExplicitThreadWinsOverConversation(t *testing.T) {
+	account := newTestOAuthAccount(4505, map[string]any{codexFingerprintModeExtraKey: "session"})
+	headers := make(http.Header)
+	headers.Set("session-id", "shared-session")
+	headers.Set("conversation_id", "conversation-fallback")
+	headers.Set("thread-id", "explicit-thread")
+
+	ids := resolveCodexFingerprintIDsFromRequest(account, headers)
+	require.NotNil(t, ids)
+	require.Equal(t, resolveConvergedThreadID(ids.seed, "explicit-thread"), ids.threadID)
+}
+
 func TestResolveCodexFingerprintIDsFromRequest_ExplicitOffIsSession(t *testing.T) {
 	account := newTestOAuthAccount(1, map[string]any{codexFingerprintModeExtraKey: "off"})
 	ids := resolveCodexFingerprintIDsFromRequest(account, nil)
@@ -640,6 +688,8 @@ func cloneCodexFingerprintIDsForTest(ids *codexFingerprintIDs) *codexFingerprint
 	cloned := *ids
 	cloned.originalBodySessionID = ""
 	cloned.originalBodySessionIDCaptured = false
+	cloned.promptCacheDefaultCaptured = false
+	cloned.promptCacheWasSessionDefault = false
 	return &cloned
 }
 
@@ -937,6 +987,96 @@ func TestEnsureStagedCodexFingerprintIDs_ResolvesWhenUnstaged(t *testing.T) {
 	assert.NotEqual(t, "client-session", h.Get("session_id"))
 	assert.Equal(t, ids.installationID, h.Get("x-codex-installation-id"))
 	assert.NotEqual(t, "client-install", h.Get("x-codex-installation-id"))
+}
+
+func TestEnsureStagedCodexFingerprintIDsForBody_PreservesThreadTopologyWithoutHeaders(t *testing.T) {
+	c := newFingerprintStageTestContext(t)
+	account := newTestOAuthAccount(4500, map[string]any{codexFingerprintModeExtraKey: "session"})
+	c.Request.Header.Set("session-id", "shared-session")
+
+	rootBody := []byte(`{"type":"response.create","client_metadata":{"session_id":"shared-session","thread_id":"root-thread"}}`)
+	rootIDs := ensureStagedCodexFingerprintIDsForBody(c, account, rootBody)
+	require.NotNil(t, rootIDs)
+	require.NotEqual(t, rootIDs.sessionID, "shared-session")
+	// A staged snapshot is connection-scoped. Start a second context to model a
+	// fork that uses the same session header but carries its thread only in the
+	// first event body.
+	childCtx := newFingerprintStageTestContext(t)
+	childCtx.Request.Header.Set("session-id", "shared-session")
+	childBody := []byte(`{"type":"response.create","client_metadata":{"session_id":"shared-session","thread_id":"child-thread","parent_thread_id":"root-thread","forked_from_thread_id":"root-thread","window_number":2}}`)
+	childIDs := ensureStagedCodexFingerprintIDsForBody(childCtx, account, childBody)
+	require.NotNil(t, childIDs)
+
+	assert.Equal(t, rootIDs.sessionID, childIDs.sessionID)
+	assert.NotEqual(t, rootIDs.threadID, childIDs.threadID)
+	assert.Equal(t, resolveConvergedThreadID(childIDs.seed, "root-thread"), childIDs.parentThreadID)
+	assert.Equal(t, resolveConvergedThreadID(childIDs.seed, "root-thread"), childIDs.forkedFromThreadID)
+	assert.Equal(t, uint64(2), childIDs.windowNumber)
+	assert.Equal(t, childIDs.threadID+":2", childIDs.windowID)
+
+	rewritten, err := applyStagedCodexFingerprintClientMetadataRaw(childCtx, account, childBody)
+	require.NoError(t, err)
+	assert.Equal(t, childIDs.threadID, gjson.GetBytes(rewritten, "client_metadata.thread_id").String())
+	embedded := gjson.GetBytes(rewritten, "client_metadata.x-codex-turn-metadata").String()
+	assert.Equal(t, childIDs.parentThreadID, gjson.Get(embedded, "parent_thread_id").String())
+}
+
+func TestEnsureStagedCodexFingerprintIDsForBody_ConversationFallbackSeparatesForks(t *testing.T) {
+	account := newTestOAuthAccount(4506, map[string]any{codexFingerprintModeExtraKey: "session"})
+	newContext := func() *gin.Context {
+		c := newFingerprintStageTestContext(t)
+		c.Request.Header.Set("session-id", "shared-session")
+		return c
+	}
+
+	rootBody := []byte(`{"type":"response.create","client_metadata":{"session_id":"shared-session","conversation_id":"root-conversation"}}`)
+	childBody := []byte(`{"type":"response.create","client_metadata":{"session_id":"shared-session","conversation_id":"child-conversation"}}`)
+	rootIDs := ensureStagedCodexFingerprintIDsForBody(newContext(), account, rootBody)
+	childIDs := ensureStagedCodexFingerprintIDsForBody(newContext(), account, childBody)
+	require.NotNil(t, rootIDs)
+	require.NotNil(t, childIDs)
+	require.Equal(t, rootIDs.sessionID, childIDs.sessionID)
+	require.NotEqual(t, rootIDs.threadID, childIDs.threadID)
+}
+
+func TestEnsureStagedCodexFingerprintIDsForBody_ExplicitBodyThreadWinsHeaderConversation(t *testing.T) {
+	account := newTestOAuthAccount(4507, map[string]any{codexFingerprintModeExtraKey: "session"})
+	c := newFingerprintStageTestContext(t)
+	c.Request.Header.Set("session-id", "shared-session")
+	c.Request.Header.Set("conversation_id", "conversation-fallback")
+	body := []byte(`{"type":"response.create","client_metadata":{"thread_id":"explicit-body-thread"}}`)
+
+	ids := ensureStagedCodexFingerprintIDsForBody(c, account, body)
+	require.NotNil(t, ids)
+	require.Equal(t, resolveConvergedThreadID(ids.seed, "explicit-body-thread"), ids.threadID)
+}
+
+func TestApplyStagedCodexFingerprintClientMetadataRaw_ReplayedFirstFrameKeepsThreadIdentity(t *testing.T) {
+	account := newTestOAuthAccount(4508, map[string]any{codexFingerprintModeExtraKey: "session"})
+	c := newFingerprintStageTestContext(t)
+	c.Request.Header.Set("session-id", "shared-session")
+	body := []byte(`{"type":"response.create","prompt_cache_key":"shared-session","client_metadata":{"session_id":"shared-session","thread_id":"child-thread"}}`)
+
+	first, err := applyStagedCodexFingerprintClientMetadataRaw(c, account, body)
+	require.NoError(t, err)
+	ids := stagedCodexFingerprintIDs(c, account)
+	require.NotNil(t, ids)
+	firstThreadID := ids.threadID
+	require.NotEmpty(t, firstThreadID)
+
+	// Passthrough same-account reconnect passes the already rewritten replay
+	// frame through the first-frame seam again. That must not hash the converged
+	// thread ID a second time.
+	replayed, changed, err := applyCodexAccountIdentityClientMetadataRaw(first, account, 0)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NotEqual(t, ids.sessionID, gjson.GetBytes(replayed, "prompt_cache_key").String())
+	second, err := applyStagedCodexFingerprintClientMetadataRaw(c, account, replayed)
+	require.NoError(t, err)
+	require.Equal(t, firstThreadID, ids.threadID)
+	require.Equal(t, firstThreadID, gjson.GetBytes(second, "client_metadata.thread_id").String())
+	require.Equal(t, ids.sessionID, gjson.GetBytes(first, "prompt_cache_key").String())
+	require.Equal(t, ids.sessionID, gjson.GetBytes(second, "prompt_cache_key").String())
 }
 
 func TestApplyStagedCodexFingerprintClientMetadataRaw_WSFrameStripsLeaks(t *testing.T) {

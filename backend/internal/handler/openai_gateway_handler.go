@@ -1845,9 +1845,20 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 	defer func() {
-		_ = wsConn.CloseNow()
+		// The session reader pump is still active here.  A deferred CloseNow
+		// tears down the TCP socket before the peer can observe the close frame,
+		// which is reported by Codex as "connection reset without closing
+		// handshake".  Use the adapter-aware graceful close; it is idempotent
+		// with the explicit close paths below.
+		_ = service.CloseOpenAIWSClientGracefully(ctx, wsConn, coderws.StatusGoingAway, "websocket request finished")
 	}()
 	wsConn.SetReadLimit(service.ResolveOpenAIWSClientReadLimitBytes(h.cfg))
+	// Keep one reader active for the entire downstream session.  This is
+	// required for RFC 6455 Ping/Pong while the gateway is waiting on a quiet
+	// upstream turn; creating short-lived readers only between turns leaves the
+	// current-turn socket invisible to protocol keepalive.
+	ctx = service.WithOpenAIWSClientReadPump(ctx, wsConn)
+	c.Request = c.Request.WithContext(ctx)
 
 	firstMessageTimeout := service.ResolveOpenAIWSClientFirstMessageTimeout(h.cfg)
 	msgType, firstMessage, err := service.ReadOpenAIWSClientMessage(
@@ -2040,6 +2051,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	wsAttemptMessage := append([]byte(nil), firstMessage...)
+	wsConnectionLimitRetryCount := 0
 	waitForWSSameAccountRetry := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
 		if account == nil || failoverErr == nil || failoverErr.StatusCode != http.StatusTooManyRequests || failoverErr.SameAccountRetryDeadline.IsZero() {
 			return false
@@ -2523,6 +2535,36 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						zap.Int("upstream_status", failoverErr.StatusCode),
 						zap.Int("retry_payload_bytes", len(retryPayload)),
 					)
+				}
+				// A provider-enforced 60-minute WebSocket lifetime is transport
+				// rotation, not an account failure. Passthrough cannot swap its
+				// upstream socket inside the relay, so retry the replay-safe current
+				// frame through the same account and the same downstream socket.
+				// Do this before the generic failover path, which would otherwise
+				// switch credentials or close the client session.
+				if retryCurrentTurn && service.IsOpenAIWSConnectionLimitFailover(err) {
+					if wsConnectionLimitRetryCount >= 3 {
+						closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
+						return
+					}
+					wsConnectionLimitRetryCount++
+					if !ensureUserSlotHeld() {
+						return
+					}
+					if currentAccountRelease == nil {
+						accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+						if acquireErr != nil || !acquired {
+							reqLog.Warn("openai.websocket_connection_limit_retry_slot_unavailable",
+								zap.Int64("account_id", account.ID),
+								zap.Error(acquireErr),
+							)
+							closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
+							return
+						}
+						currentAccountRelease = wrapReleaseOnDone(ctx, accountRelease)
+					}
+					wsFirstMessage = wsAttemptMessage
+					continue
 				}
 				if waitForWSSameAccountRetry(account, failoverErr) {
 					if failoverErr.ShouldReportAccountScheduleFailure() {

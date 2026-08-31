@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
@@ -21,6 +22,173 @@ import (
 type openAIWSRejectedFieldRetryError struct {
 	body   []byte
 	reason string
+}
+
+// lookupOpenAIWSIngressResponseConn resolves the transport that owns a
+// previous response.  The historical response_id -> conn map is global, which
+// is correct for legacy clients but unsafe for Codex: a root thread and a
+// forked/subagent thread share session-id while each has an independent
+// store=false WebSocket.  Prefer the thread-scoped binding when available and
+// deliberately suppress the global fallback for a thread-aware request so a
+// child can obtain its own connection instead of queueing behind its parent.
+func lookupOpenAIWSIngressResponseConn(
+	store OpenAIWSStateStore,
+	responseID string,
+	scope string,
+	threadAware bool,
+) (connID string, ok bool, scoped bool) {
+	if store == nil || strings.TrimSpace(responseID) == "" {
+		return "", false, false
+	}
+	scope = strings.TrimSpace(scope)
+	if scope != "" {
+		if scopedStore, supportsScoped := store.(openAIWSResponseConnScopeStore); supportsScoped {
+			if connID, ok := scopedStore.GetResponseConnForScope(responseID, scope); ok {
+				return connID, true, true
+			}
+		}
+		// Never fall back to the legacy process-global response binding for a
+		// thread-aware Codex request.  Some embedders use a distributed/test
+		// state store that implements only OpenAIWSStateStore (without the
+		// optional scoped extension); falling back in that case silently routes
+		// a child onto its parent's socket and can block both turns forever.
+		// Replaying the child history on a fresh transport is safe; sharing an
+		// unknown transport is not.
+		if threadAware {
+			return "", false, false
+		}
+	}
+	connID, ok = store.GetResponseConn(responseID)
+	return connID, ok, false
+}
+
+func openAIWSIngressHasThreadIdentity(c *gin.Context, account *Account, body []byte) bool {
+	if account == nil || !account.IsOpenAIOAuthLike() {
+		return false
+	}
+	return openAIWSSessionPreemptionThreadID(c, body) != ""
+}
+
+func startOpenAIWSLeaseKeepalive(ctx context.Context, lease *openAIWSConnLease) func() {
+	if lease == nil {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	interval := openAIWSClientIdlePingInterval(0)
+	timeout := openAIWSClientIdlePingTimeout(0)
+	keepaliveCtx, cancelKeepalive := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveCtx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			// Do not derive the operation context from keepaliveCtx.  A stop or
+			// parent cancellation can otherwise fire coder/websocket's write-timeout
+			// hook while Ping is still writing its control frame, which hard-closes a
+			// healthy socket.  The operation is independently bounded and the stop
+			// function joins this goroutine before returning.
+			pingCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := lease.PingWithContext(pingCtx, timeout)
+			cancel()
+			if err != nil {
+				if keepaliveCtx.Err() == nil {
+					lease.MarkBroken()
+					logOpenAIWSModeInfo(
+						"ingress_ws_upstream_keepalive_failed conn_id=%s cause=%s",
+						truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
+						truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
+					)
+				}
+				return
+			}
+		}
+	}()
+	return func() {
+		cancelKeepalive()
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-done:
+		case <-time.After(timeout + time.Second):
+		}
+	}
+}
+
+func startOpenAIWSClientKeepalive(ctx context.Context, conn *coderws.Conn) func() {
+	if conn == nil || openAIWSClientReadPumpFromContext(ctx, conn) == nil ||
+		!openAIWSClientShouldProbeIdle(ctx, coderws.StatusNormalClosure, openAIWSClientInterTurnIdleReason) {
+		// Without the session reader pump Conn.Ping cannot safely wait for a
+		// Pong.  Direct/unit callers keep the legacy read ownership contract.
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	interval := openAIWSClientIdlePingInterval(0)
+	timeout := openAIWSClientIdlePingTimeout(0)
+	keepaliveCtx, cancelKeepalive := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveCtx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			// As with the upstream lease, keep the Ping operation detached from
+			// the lifecycle cancellation.  Canceling a coder/websocket Ping context
+			// during its write invokes the library's Close callback.
+			pingCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				if keepaliveCtx.Err() == nil {
+					logOpenAIWSModeInfo(
+						"ingress_ws_client_keepalive_failed cause=%s",
+						truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
+					)
+					// A failed Pong proves the downstream transport is no longer
+					// usable. Finish a real close handshake when possible. CloseNow
+					// here races coder/websocket's reader and is observed by Codex as
+					// a reset without a closing handshake (1005/EOF).
+					_ = CloseOpenAIWSClientGracefully(context.Background(), conn, coderws.StatusGoingAway, "websocket keepalive failed")
+				}
+				return
+			}
+		}
+	}()
+	return func() {
+		cancelKeepalive()
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-done:
+		case <-time.After(timeout + time.Second):
+		}
+	}
 }
 
 func (e *openAIWSRejectedFieldRetryError) Error() string {
@@ -83,6 +251,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	// Service callers (including failover tests and embedders) may bypass the
+	// HTTP handler. Install the same session-wide reader here so protocol pings
+	// remain safe on those entry points as well.
+	ctx = WithOpenAIWSClientReadPump(ctx, clientConn)
 	// A handler may reuse the same gin context across account failover attempts.
 	// Never let an OAuth attempt's response aliases leak into the next account.
 	setCodexToolNameReverse(c, nil)
@@ -184,6 +356,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	debugEnabled := isOpenAIWSModeDebugEnabled()
+	// Body-carried thread topology is needed by the native pooled WS path. The
+	// HTTP bridge is re-entered with account-scoped replay bodies during
+	// failover; treating those transformed IDs as a fresh client thread would
+	// make the replacement account derive a different identity than the legacy
+	// bridge contract (and leak the previous account's topology). Keep bridge
+	// fingerprint staging header-based.
+	captureBodyFingerprintTopology := !forceHTTPBridge
 
 	type openAIWSClientPayload struct {
 		payloadRaw               []byte
@@ -466,8 +645,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		var fpErr error
 		if turn > 1 {
 			fpBody, fpErr = applyStagedCodexFingerprintClientMetadataRawForFollowup(c, account, normalized, true)
-		} else {
+		} else if captureBodyFingerprintTopology {
 			fpBody, fpErr = applyStagedCodexFingerprintClientMetadataRaw(c, account, normalized)
+		} else {
+			// The bridge must not infer a new thread from an already transformed
+			// replay body. Resolve/stage only from handshake headers for this
+			// account attempt.
+			fpBody, _, fpErr = applyCodexFingerprintClientMetadataRaw(
+				normalized,
+				ensureStagedCodexFingerprintIDs(c, account),
+			)
 		}
 		if fpErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", fpErr)
@@ -499,15 +686,49 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return clientConn.Write(writeCtx, coderws.MessageText, message)
 	}
 
-	readClientMessage := func() ([]byte, error) {
+	var upstreamIdleProbeFailed atomic.Bool
+	readClientMessage := func(upstreamLeases ...*openAIWSConnLease) ([]byte, error) {
 		idleTimeout := s.openAIWSIngressInterTurnIdleTimeout()
-		msgType, payload, readErr := ReadOpenAIWSClientMessage(
-			ctx,
-			clientConn,
-			idleTimeout,
-			coderws.StatusNormalClosure,
-			"websocket idle timeout",
-		)
+		var idlePings []func(context.Context) error
+		if len(upstreamLeases) > 0 && upstreamLeases[0] != nil {
+			upstreamLease := upstreamLeases[0]
+			idlePings = append(idlePings, func(pingCtx context.Context) error {
+				pingErr := upstreamLease.PingWithContext(pingCtx, openAIWSClientIdlePingTimeout(idleTimeout))
+				if pingErr != nil {
+					// A failed upstream probe means this continuation cannot safely
+					// be returned to the pool, even when the downstream client is
+					// still healthy.
+					upstreamIdleProbeFailed.Store(true)
+					upstreamLease.MarkBroken()
+					// The client half is still usable. Tell the idle reader to
+					// retire only this upstream lease and keep waiting for the
+					// next client turn instead of sending a normal-close frame.
+					return newOpenAIWSIdlePingNonTerminalError(pingErr)
+				}
+				return pingErr
+			})
+		}
+		var msgType coderws.MessageType
+		var payload []byte
+		var readErr error
+		if len(idlePings) > 0 {
+			msgType, payload, readErr = ReadOpenAIWSClientMessageWithIdlePing(
+				ctx,
+				clientConn,
+				idleTimeout,
+				coderws.StatusNormalClosure,
+				"websocket idle timeout",
+				idlePings[0],
+			)
+		} else {
+			msgType, payload, readErr = ReadOpenAIWSClientMessage(
+				ctx,
+				clientConn,
+				idleTimeout,
+				coderws.StatusNormalClosure,
+				"websocket idle timeout",
+			)
+		}
 		if readErr != nil {
 			var closeErr *OpenAIWSClientCloseError
 			if errors.As(readErr, &closeErr) && closeErr.StatusCode() == coderws.StatusNormalClosure {
@@ -535,33 +756,53 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	groupID := getOpenAIGroupIDFromContext(c)
 	storeDisabledConnMode := s.openAIWSStoreDisabledConnMode()
 	sessionHash := ""
+	// The account scheduler intentionally uses a session-level sticky hash, but
+	// turn-state/connection affinity belongs to one Codex thread.  Root and
+	// fork/subagent threads may share session_id while carrying different
+	// upstream continuation state and leased transports.
+	stateSessionHash := ""
 	preferredConnID := ""
+	preferredConnScoped := false
 	storeDisabled := false
 	refreshIngressRouteState := func(payload openAIWSClientPayload) {
 		sessionHash = s.GenerateSessionHash(c, payload.rawForHash)
+		stateSessionHash = openAIWSIngressStateHash(c, payload.rawForHash, sessionHash)
 		if turnState == "" && stateStore != nil && sessionHash != "" {
-			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
+			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, stateSessionHash); ok {
 				turnState = savedTurnState
 			}
 		}
 
 		preferredConnID = ""
+		preferredConnScoped = false
 		if stateStore != nil && payload.previousResponseID != "" {
-			if connID, ok := stateStore.GetResponseConn(payload.previousResponseID); ok {
+			if connID, ok, scoped := lookupOpenAIWSIngressResponseConn(
+				stateStore,
+				payload.previousResponseID,
+				stateSessionHash,
+				openAIWSIngressHasThreadIdentity(c, account, payload.rawForHash),
+			); ok {
 				preferredConnID = connID
+				preferredConnScoped = scoped
 			}
 		}
 
 		storeDisabled = s.isOpenAIWSStoreDisabledInRequestRaw(payload.payloadRaw, account)
-		if stateStore != nil && storeDisabled && payload.previousResponseID == "" && sessionHash != "" {
-			if connID, ok := stateStore.GetSessionConn(groupID, sessionHash); ok {
+		if stateStore != nil && storeDisabled && payload.previousResponseID == "" && stateSessionHash != "" {
+			if connID, ok := stateStore.GetSessionConn(groupID, stateSessionHash); ok {
 				preferredConnID = connID
+				preferredConnScoped = true
 			}
 		}
 	}
 	refreshIngressRouteState(firstPayload)
 
 	if forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID) {
+		// HTTP-bridge turns can spend a long time waiting for the upstream HTTP
+		// response while the downstream WebSocket carries no data. Keep the
+		// client hop alive for the same reason as the native WS path.
+		stopBridgeClientKeepalive := startOpenAIWSClientKeepalive(ctx, clientConn)
+		defer stopBridgeClientKeepalive()
 		logOpenAIWSModeInfo(
 			"ingress_ws_http_bridge_start account_id=%d account_type=%s payload_bytes=%d threshold_bytes=%d has_session_hash=%v store_disabled=%v",
 			account.ID,
@@ -710,8 +951,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if bridgeTurnState := strings.TrimSpace(result.ResponseHeaders.Get(openAIWSTurnStateHeader)); bridgeTurnState != "" {
 				turnState = bridgeTurnState
-				if stateStore != nil && sessionHash != "" {
-					stateStore.BindSessionTurnState(groupID, sessionHash, bridgeTurnState, s.openAIWSSessionStickyTTL())
+				if stateStore != nil && stateSessionHash != "" {
+					stateStore.BindSessionTurnState(groupID, stateSessionHash, bridgeTurnState, s.openAIWSSessionStickyTTL())
 				}
 			}
 			responseID := strings.TrimSpace(result.RequestID)
@@ -775,6 +1016,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			return ""
 		}(),
 		ForceNewConn: false,
+		// The lease survives the inter-turn wait.  Do not let the account's
+		// per-turn concurrency value serialize independent root/fork sockets in
+		// the shared ctx-pool.
+		PersistentIngress: true,
 	}
 	pool := s.getOpenAIWSConnPool()
 	if pool == nil {
@@ -854,6 +1099,18 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if isOpenAIWSSessionPreempted(ctx) {
 				return nil, errOpenAIWSSessionPreempted
 			}
+			// A strict response/thread affinity hint becoming unavailable is a
+			// local pool-topology event (usually a rotated or evicted socket), not
+			// evidence that the account is transiently unhealthy. Handle it before
+			// cooldown/rate bookkeeping so one stale fork cannot poison scheduling
+			// for the root and its other subagents.
+			if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) {
+				return nil, NewOpenAIWSClientCloseError(
+					coderws.StatusPolicyViolation,
+					"upstream continuation connection is unavailable; please restart the conversation",
+					acquireErr,
+				)
+			}
 			canonicalModel := canonicalOpenAIAccountSchedulingModel(account, ingressSessionOriginalModel)
 			s.handleOpenAIWSDialTransientFailure(ctx, account, canonicalModel, acquireErr)
 			dialStatus, dialClass, dialCloseStatus, dialCloseReason, dialRespServer, dialRespVia, dialRespCFRay, dialRespReqID := summarizeOpenAIWSDialError(acquireErr)
@@ -882,13 +1139,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()))
 				return nil, s.newOpenAIWSRateLimitFailoverError(account, dialErr.ResponseHeaders, nil, acquireErr.Error())
 			}
-			if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) {
-				return nil, NewOpenAIWSClientCloseError(
-					coderws.StatusPolicyViolation,
-					"upstream continuation connection is unavailable; please restart the conversation",
-					acquireErr,
-				)
-			}
 			if errors.Is(acquireErr, context.DeadlineExceeded) || errors.Is(acquireErr, errOpenAIWSConnQueueFull) {
 				return nil, NewOpenAIWSClientCloseError(
 					coderws.StatusTryAgainLater,
@@ -901,8 +1151,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		connID := strings.TrimSpace(lease.ConnID())
 		if handshakeTurnState := strings.TrimSpace(lease.HandshakeHeader(openAIWSTurnStateHeader)); handshakeTurnState != "" {
 			turnState = handshakeTurnState
-			if stateStore != nil && sessionHash != "" {
-				stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
+			if stateStore != nil && stateSessionHash != "" {
+				stateStore.BindSessionTurnState(groupID, stateSessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 			}
 			updatedHeaders := cloneHeader(baseAcquireReq.Headers)
 			if updatedHeaders == nil {
@@ -930,6 +1180,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
 		}
+		// The upstream response can be silent while Codex runs a tool or a
+		// sub-agent.  Keep the leased socket alive during that *active* read as
+		// well as during the inter-turn wait; otherwise an edge/proxy idle timer
+		// can reset the connection before the next event arrives.
+		stopUpstreamKeepalive := startOpenAIWSLeaseKeepalive(ctx, lease)
+		defer stopUpstreamKeepalive()
+		stopClientKeepalive := startOpenAIWSClientKeepalive(ctx, clientConn)
+		defer stopClientKeepalive()
 		turnStart := time.Now()
 		wroteDownstream := false
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
@@ -1006,8 +1264,40 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				lastEventType = eventType
 			}
 			if eventType == "error" {
-				s.handleOpenAIWSErrorEventTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), upstreamMessage)
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
+				fallbackReason, _ := classifyOpenAIWSErrorEventFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
+				// OpenAI's 60-minute physical socket cap is delivered as a
+				// protocol error event.  It must never be forwarded as a terminal
+				// application error: when no response bytes have reached the
+				// client, the complete turn can be replayed on a newly dialed
+				// connection.  Mark/evict the old lease before returning so the
+				// retry cannot pick the same exhausted socket.
+				if fallbackReason == "ws_connection_limit_reached" && !wroteDownstream {
+					lease.MarkBroken()
+					limitMessage := strings.TrimSpace(errMsgRaw)
+					if limitMessage == "" {
+						limitMessage = "Responses websocket connection limit reached; creating a new websocket connection"
+					}
+					logOpenAIWSModeInfo(
+						"ingress_ws_connection_limit_reconnect account_id=%d turn=%d conn_id=%s code=%s type=%s message=%s age_ms=%d",
+						account.ID,
+						turn,
+						truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
+						truncateOpenAIWSLogValue(errCodeRaw, openAIWSLogValueMaxLen),
+						truncateOpenAIWSLogValue(errTypeRaw, openAIWSLogValueMaxLen),
+						truncateOpenAIWSLogValue(limitMessage, openAIWSLogValueMaxLen),
+						lease.Age().Milliseconds(),
+					)
+					return nil, wrapOpenAIWSIngressTurnError(
+						openAIWSIngressStageConnectionLimit,
+						&openAIWSConnectionLimitError{code: errCodeRaw, message: limitMessage},
+						false,
+					)
+				}
+				// A connection-lifetime rejection is expected transport rotation,
+				// not evidence that the account is unhealthy. Keep it out of
+				// transient-account cooldown bookkeeping before the retry decision.
+				s.handleOpenAIWSErrorEventTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), upstreamMessage)
 				statusCode := openAIWSRejectedFieldRetryHTTPStatus(upstreamMessage)
 				if !wroteDownstream && statusCode == http.StatusBadRequest && rejectedFieldRetryState != nil {
 					retryBody, retryReason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(
@@ -1033,7 +1323,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					}
 				}
 				s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), upstreamMessage, errCodeRaw, errTypeRaw, errMsgRaw)
-				fallbackReason, _ := classifyOpenAIWSErrorEventFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
 				errCode, errType, errMessage := summarizeOpenAIWSErrorEventFieldsFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
 				recoverablePrevNotFound := fallbackReason == openAIWSIngressStagePreviousResponseNotFound &&
 					turnPreviousResponseID != "" &&
@@ -1225,11 +1514,26 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	currentImageSizeTier := firstPayload.imageSizeTier
 	currentImageInputSize := firstPayload.imageInputSize
 	currentPayloadBytes := firstPayload.payloadBytes
+	lastTurnResponseID := ""
 	isStrictAffinityTurn := func(payload []byte) bool {
 		if !storeDisabled {
 			return false
 		}
-		return strings.TrimSpace(openAIWSPayloadStringFromRaw(payload, "previous_response_id")) != ""
+		if strings.TrimSpace(openAIWSPayloadStringFromRaw(payload, "previous_response_id")) == "" {
+			return false
+		}
+		// A response binding from the same thread is safe to enforce strictly,
+		// including after a reconnect where there is no local lastTurnResponseID.
+		// An unscoped/global binding may belong to the parent of a fork; only
+		// enforce it when this live ingress session produced the immediately
+		// preceding response. Otherwise the pool must be allowed to create an
+		// independent transport and replay the child history.
+		if preferredConnScoped {
+			return preferredConnID != ""
+		}
+		expected := strings.TrimSpace(lastTurnResponseID)
+		return expected != "" &&
+			strings.TrimSpace(openAIWSPayloadStringFromRaw(payload, "previous_response_id")) == expected
 	}
 	var sessionLease *openAIWSConnLease
 	sessionConnID := ""
@@ -1284,9 +1588,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	turn := 1
 	rejectedFieldRetryState = newOpenAIResponsesRejectedFieldRetryState(currentPayload)
 	turnRetry := 0
+	connectionLimitRetry := 0
+	rotationAttempted := false
 	turnPrevRecoveryTried := false
 	lastTurnFinishedAt := time.Time{}
-	lastTurnResponseID := ""
 	lastTurnPayload := []byte(nil)
 	var lastTurnStrictState *openAIWSIngressPreviousTurnStrictState
 	lastTurnReplayInput := []json.RawMessage(nil)
@@ -1311,6 +1616,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		sessionLease = nil
 		sessionConnID = ""
 		preferredConnID = ""
+		preferredConnScoped = false
 	}
 	recoverIngressPrevResponseNotFound := func(relayErr error, turn int, connID string) bool {
 		if !isOpenAIWSIngressPreviousResponseNotFound(relayErr) {
@@ -1379,33 +1685,91 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		skipBeforeTurn = true
 		return true
 	}
-	retryIngressTurn := func(relayErr error, turn int, connID string) bool {
-		if !isOpenAIWSIngressTurnRetryable(relayErr) || turnRetry >= 1 {
-			return false
+	retryIngressTurn := func(relayErr error, turn int, connID string) (bool, error) {
+		if !isOpenAIWSIngressTurnRetryable(relayErr) {
+			return false, nil
 		}
-		if isStrictAffinityTurn(currentPayload) {
-			logOpenAIWSModeInfo(
-				"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=strict_affinity",
-				account.ID,
-				turn,
-				truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+		connectionLimit := isOpenAIWSIngressConnectionLimit(relayErr)
+		maxRetries := 1
+		if connectionLimit {
+			// A replacement dial can race an edge-side retirement or a transient
+			// connection-cap response. Allow a small bounded retry budget for this
+			// specific, replay-safe transport event without weakening ordinary
+			// request-error retry semantics.
+			maxRetries = 3
+			if connectionLimitRetry >= maxRetries {
+				return false, NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket connection lifetime limit could not be recovered; please reconnect",
+					relayErr,
+				)
+			}
+			// A fresh physical socket has no response chain state. Rebuild the
+			// complete input and remove previous_response_id before acquiring it.
+			// The helper rejects orphaned function_call_output payloads instead of
+			// silently duplicating an unsafe turn.
+			retryPayload, retrySafe, retryErr := buildOpenAIWSCurrentTurnRetryPayload(
+				currentPayload,
+				currentTurnReplayInput,
+				currentTurnReplayInputExists,
+				currentOriginalModel,
 			)
-			return false
+			if retryErr != nil {
+				return false, NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket connection lifetime limit could not be replayed; please reconnect",
+					retryErr,
+				)
+			}
+			if !retrySafe || len(retryPayload) == 0 {
+				return false, NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket connection lifetime limit could not be replayed safely; please reconnect",
+					relayErr,
+				)
+			}
+			currentPayload = retryPayload
+			currentPayloadBytes = len(retryPayload)
+			connectionLimitRetry++
+		} else {
+			if turnRetry >= maxRetries {
+				return false, nil
+			}
+			if isStrictAffinityTurn(currentPayload) {
+				logOpenAIWSModeInfo(
+					"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=strict_affinity",
+					account.ID,
+					turn,
+					truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+				)
+				return false, nil
+			}
 		}
 		turnRetry++
 		logOpenAIWSModeInfo(
-			"ingress_ws_turn_retry account_id=%d turn=%d retry=%d reason=%s conn_id=%s",
+			"ingress_ws_turn_retry account_id=%d turn=%d retry=%d reason=%s conn_id=%s connection_limit=%v",
 			account.ID,
 			turn,
 			turnRetry,
 			truncateOpenAIWSLogValue(openAIWSIngressTurnRetryReason(relayErr), openAIWSLogValueMaxLen),
 			truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+			connectionLimit,
 		)
 		resetSessionLease(true)
 		skipBeforeTurn = true
-		return true
+		return true, nil
 	}
 	for {
+		if upstreamIdleProbeFailed.Swap(false) {
+			// The client frame may have won the race with a failed Pong.  Retire
+			// the failed transport before this turn is written to upstream.
+			resetSessionLease(true)
+			logOpenAIWSModeInfo(
+				"ingress_ws_upstream_idle_probe_retire account_id=%d turn=%d",
+				account.ID,
+				turn,
+			)
+		}
 		if turn > 1 && !skipBeforeTurn && hooks != nil && hooks.BeforeRequest != nil {
 			if err := hooks.BeforeRequest(turn, currentPayload, currentOriginalModel); err != nil {
 				return err
@@ -1569,10 +1933,90 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 		}
+		// A leased pooled socket can remain held while the client is idle, so the
+		// pool's idle cleanup cannot retire it. Rotate it before the next request
+		// reaches the wire; otherwise OpenAI will reject the turn at its hard
+		// 60-minute WebSocket lifetime boundary. Replay is performed only when the
+		// complete input history is available and tool-call output context is
+		// self-contained.
+		if sessionLease != nil && sessionLease.NeedsRotation() {
+			if rotationAttempted {
+				return NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket reached its lifetime limit during rotation; please reconnect",
+					nil,
+				)
+			}
+			retryPayload, retrySafe, retryErr := buildOpenAIWSCurrentTurnRetryPayload(
+				currentPayload,
+				currentTurnReplayInput,
+				currentTurnReplayInputExists,
+				currentOriginalModel,
+			)
+			if retryErr != nil {
+				return NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket lifetime rotation failed; please reconnect",
+					retryErr,
+				)
+			}
+			if !retrySafe || len(retryPayload) == 0 {
+				return NewOpenAIWSClientCloseError(
+					coderws.StatusTryAgainLater,
+					"upstream websocket lifetime rotation is not replay-safe; please reconnect",
+					nil,
+				)
+			}
+			logOpenAIWSModeInfo(
+				"ingress_ws_connection_age_rotate account_id=%d turn=%d conn_id=%s age_ms=%d payload_bytes=%d",
+				account.ID,
+				turn,
+				truncateOpenAIWSLogValue(sessionLease.ConnID(), openAIWSIDValueMaxLen),
+				sessionLease.Age().Milliseconds(),
+				len(retryPayload),
+			)
+			currentPayload = retryPayload
+			currentPayloadBytes = len(retryPayload)
+			rotationAttempted = true
+			resetSessionLease(true)
+			skipBeforeTurn = true
+			continue
+		}
 		forcePreferredConn := isStrictAffinityTurn(currentPayload)
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn)
 			if acquireErr != nil {
+				// A scoped response binding can outlive the physical socket it
+				// identifies (normal after the 55-minute rotation or a process
+				// restart). Do not turn that stale hint into a permanent 1008: when
+				// the current request contains a complete replayable input, remove
+				// previous_response_id and continue on a fresh transport.
+				stalePreferredConnID := strings.TrimSpace(preferredConnID)
+				if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) &&
+					forcePreferredConn && !turnPrevRecoveryTried && currentPreviousResponseID != "" &&
+					(!hasFunctionCallOutput || (currentTurnReplayInputExists && openAIWSRawItemsHaveToolCallContextForOutputs(currentTurnReplayInput))) {
+					retryPayload, retrySafe, retryErr := buildOpenAIWSCurrentTurnRetryPayload(
+						currentPayload,
+						currentTurnReplayInput,
+						currentTurnReplayInputExists,
+						currentOriginalModel,
+					)
+					if retryErr == nil && retrySafe && len(retryPayload) > 0 {
+						turnPrevRecoveryTried = true
+						currentPayload = retryPayload
+						currentPayloadBytes = len(retryPayload)
+						preferredConnID = ""
+						preferredConnScoped = false
+						skipBeforeTurn = true
+						logOpenAIWSModeInfo(
+							"ingress_ws_stale_preferred_conn_recovery account_id=%d turn=%d stale_conn_id=%s action=drop_previous_response_id_retry",
+							account.ID,
+							turn,
+							truncateOpenAIWSLogValue(stalePreferredConnID, openAIWSIDValueMaxLen),
+						)
+						continue
+					}
+				}
 				return fmt.Errorf("acquire upstream websocket: %w", acquireErr)
 			}
 			sessionLease = acquiredLease
@@ -1730,8 +2174,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if recoverIngressPrevResponseNotFound(relayErr, turn, connID) {
 				continue
 			}
-			if retryIngressTurn(relayErr, turn, connID) {
+			if retry, retryErr := retryIngressTurn(relayErr, turn, connID); retry {
 				continue
+			} else if retryErr != nil {
+				relayErr = retryErr
 			}
 			finalErr := relayErr
 			if unwrapped := errors.Unwrap(relayErr); unwrapped != nil {
@@ -1744,6 +2190,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			return finalErr
 		}
 		turnRetry = 0
+		connectionLimitRetry = 0
+		rotationAttempted = false
 		turnPrevRecoveryTried = false
 		lastTurnFinishedAt = time.Now()
 		lastTurnClean = true
@@ -1780,15 +2228,19 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			ttl := s.openAIWSResponseStickyTTL()
 			logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 			stateStore.BindResponseConn(responseID, connID, ttl)
+			if scopedStore, ok := stateStore.(openAIWSResponseConnScopeStore); ok && stateSessionHash != "" {
+				scopedStore.BindResponseConnForScope(responseID, stateSessionHash, connID, ttl)
+			}
 		}
-		if stateStore != nil && storeDisabled && sessionHash != "" {
-			stateStore.BindSessionConn(groupID, sessionHash, connID, s.openAIWSSessionStickyTTL())
+		if stateStore != nil && storeDisabled && stateSessionHash != "" {
+			stateStore.BindSessionConn(groupID, stateSessionHash, connID, s.openAIWSSessionStickyTTL())
 		}
 		if connID != "" {
 			preferredConnID = connID
+			preferredConnScoped = storeDisabled && stateSessionHash != ""
 		}
 
-		nextClientMessage, readErr := readClientMessage()
+		nextClientMessage, readErr := readClientMessage(sessionLease)
 		if readErr != nil {
 			if isOpenAIWSSessionPreempted(ctx) {
 				return errOpenAIWSSessionPreempted
@@ -1854,8 +2306,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		if stateStore != nil && nextPayload.previousResponseID != "" {
-			if stickyConnID, ok := stateStore.GetResponseConn(nextPayload.previousResponseID); ok {
+			if stickyConnID, ok, scoped := lookupOpenAIWSIngressResponseConn(
+				stateStore,
+				nextPayload.previousResponseID,
+				stateSessionHash,
+				openAIWSIngressHasThreadIdentity(c, account, nextPayload.rawForHash),
+			); ok {
 				if sessionConnID != "" && stickyConnID != "" && stickyConnID != sessionConnID {
+					preferredConnID = sessionConnID
+					preferredConnScoped = storeDisabled && stateSessionHash != ""
 					logOpenAIWSModeInfo(
 						"ingress_ws_keep_session_conn account_id=%d turn=%d conn_id=%s sticky_conn_id=%s previous_response_id=%s",
 						account.ID,
@@ -1866,6 +2325,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					)
 				} else {
 					preferredConnID = stickyConnID
+					preferredConnScoped = scoped
 				}
 			}
 		}

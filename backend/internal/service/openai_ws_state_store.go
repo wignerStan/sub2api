@@ -73,6 +73,19 @@ type OpenAIWSStateStore interface {
 	DeleteSessionConn(groupID int64, sessionHash string)
 }
 
+// openAIWSResponseConnScopeStore is an optional extension implemented by the
+// in-process state store.  response.id -> connection is otherwise global, but
+// Codex deliberately reuses one session-id for a root thread and its forked
+// subagents.  A scoped binding lets a reconnecting thread recover its own
+// store=false transport without accidentally inheriting the parent's socket.
+// It is optional so existing embedders/test doubles implementing
+// OpenAIWSStateStore keep their source compatibility.
+type openAIWSResponseConnScopeStore interface {
+	BindResponseConnForScope(responseID, scope, connID string, ttl time.Duration)
+	GetResponseConnForScope(responseID, scope string) (string, bool)
+	DeleteResponseConnForScope(responseID, scope string)
+}
+
 type defaultOpenAIWSStateStore struct {
 	cache GatewayCache
 
@@ -82,6 +95,7 @@ type defaultOpenAIWSStateStore struct {
 	responseOwners       map[string]openAIHTTPResponseOwnerBinding
 	responseToConnMu     sync.RWMutex
 	responseToConn       map[string]openAIWSConnBinding
+	responseToScopedConn map[string]openAIWSConnBinding
 	sessionToTurnStateMu sync.RWMutex
 	sessionToTurnState   map[string]openAIWSTurnStateBinding
 	sessionToConnMu      sync.RWMutex
@@ -93,12 +107,13 @@ type defaultOpenAIWSStateStore struct {
 // NewOpenAIWSStateStore 创建默认 WS 状态存储。
 func NewOpenAIWSStateStore(cache GatewayCache) OpenAIWSStateStore {
 	store := &defaultOpenAIWSStateStore{
-		cache:              cache,
-		responseToAccount:  make(map[string]openAIWSAccountBinding, 256),
-		responseOwners:     make(map[string]openAIHTTPResponseOwnerBinding, 256),
-		responseToConn:     make(map[string]openAIWSConnBinding, 256),
-		sessionToTurnState: make(map[string]openAIWSTurnStateBinding, 256),
-		sessionToConn:      make(map[string]openAIWSSessionConnBinding, 256),
+		cache:                cache,
+		responseToAccount:    make(map[string]openAIWSAccountBinding, 256),
+		responseOwners:       make(map[string]openAIHTTPResponseOwnerBinding, 256),
+		responseToConn:       make(map[string]openAIWSConnBinding, 256),
+		responseToScopedConn: make(map[string]openAIWSConnBinding, 256),
+		sessionToTurnState:   make(map[string]openAIWSTurnStateBinding, 256),
+		sessionToConn:        make(map[string]openAIWSSessionConnBinding, 256),
 	}
 	store.lastCleanupUnixNano.Store(time.Now().UnixNano())
 	return store
@@ -279,6 +294,26 @@ func (s *defaultOpenAIWSStateStore) BindResponseConn(responseID, connID string, 
 	s.responseToConnMu.Unlock()
 }
 
+func (s *defaultOpenAIWSStateStore) BindResponseConnForScope(responseID, scope, connID string, ttl time.Duration) {
+	id := normalizeOpenAIWSResponseID(responseID)
+	scope = strings.TrimSpace(scope)
+	conn := strings.TrimSpace(connID)
+	if id == "" || scope == "" || conn == "" {
+		return
+	}
+	ttl = normalizeOpenAIWSTTL(ttl)
+	s.maybeCleanup()
+
+	key := openAIWSResponseConnScopeKey(id, scope)
+	s.responseToConnMu.Lock()
+	ensureBindingCapacity(s.responseToScopedConn, key, openAIWSStateStoreMaxEntriesPerMap)
+	s.responseToScopedConn[key] = openAIWSConnBinding{
+		connID:    conn,
+		expiresAt: time.Now().Add(ttl),
+	}
+	s.responseToConnMu.Unlock()
+}
+
 func (s *defaultOpenAIWSStateStore) GetResponseConn(responseID string) (string, bool) {
 	id := normalizeOpenAIWSResponseID(responseID)
 	if id == "" {
@@ -296,6 +331,25 @@ func (s *defaultOpenAIWSStateStore) GetResponseConn(responseID string) (string, 
 	return binding.connID, true
 }
 
+func (s *defaultOpenAIWSStateStore) GetResponseConnForScope(responseID, scope string) (string, bool) {
+	id := normalizeOpenAIWSResponseID(responseID)
+	scope = strings.TrimSpace(scope)
+	if id == "" || scope == "" {
+		return "", false
+	}
+	s.maybeCleanup()
+
+	now := time.Now()
+	key := openAIWSResponseConnScopeKey(id, scope)
+	s.responseToConnMu.RLock()
+	binding, ok := s.responseToScopedConn[key]
+	s.responseToConnMu.RUnlock()
+	if !ok || now.After(binding.expiresAt) || strings.TrimSpace(binding.connID) == "" {
+		return "", false
+	}
+	return binding.connID, true
+}
+
 func (s *defaultOpenAIWSStateStore) DeleteResponseConn(responseID string) {
 	id := normalizeOpenAIWSResponseID(responseID)
 	if id == "" {
@@ -303,6 +357,23 @@ func (s *defaultOpenAIWSStateStore) DeleteResponseConn(responseID string) {
 	}
 	s.responseToConnMu.Lock()
 	delete(s.responseToConn, id)
+	prefix := id + "\x00"
+	for key := range s.responseToScopedConn {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.responseToScopedConn, key)
+		}
+	}
+	s.responseToConnMu.Unlock()
+}
+
+func (s *defaultOpenAIWSStateStore) DeleteResponseConnForScope(responseID, scope string) {
+	id := normalizeOpenAIWSResponseID(responseID)
+	scope = strings.TrimSpace(scope)
+	if id == "" || scope == "" {
+		return
+	}
+	s.responseToConnMu.Lock()
+	delete(s.responseToScopedConn, openAIWSResponseConnScopeKey(id, scope))
 	s.responseToConnMu.Unlock()
 }
 
@@ -420,6 +491,7 @@ func (s *defaultOpenAIWSStateStore) maybeCleanup() {
 
 	s.responseToConnMu.Lock()
 	cleanupExpiredConnBindings(s.responseToConn, now, openAIWSStateStoreCleanupMaxPerMap)
+	cleanupExpiredConnBindings(s.responseToScopedConn, now, openAIWSStateStoreCleanupMaxPerMap)
 	s.responseToConnMu.Unlock()
 
 	s.sessionToTurnStateMu.Lock()
@@ -526,6 +598,10 @@ func openAIHTTPResponseOwnerCacheKey(prefix, responseID string) string {
 // openAIWSResponseAccountMapKey 本地热缓存按分组隔离的 key，与 Redis 层保持一致，避免跨组命中。
 func openAIWSResponseAccountMapKey(groupID int64, responseID string) string {
 	return fmt.Sprintf("%d:%s", groupID, responseID)
+}
+
+func openAIWSResponseConnScopeKey(responseID, scope string) string {
+	return strings.TrimSpace(responseID) + "\x00" + strings.TrimSpace(scope)
 }
 
 func normalizeOpenAIWSTTL(ttl time.Duration) time.Duration {

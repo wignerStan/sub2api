@@ -79,6 +79,28 @@ func (c *openAIWSPolicyEnforcingFrameConn) WriteFrame(ctx context.Context, msgTy
 	return c.inner.WriteFrame(ctx, msgType, payload)
 }
 
+func (c *openAIWSPolicyEnforcingFrameConn) Ping(ctx context.Context) error {
+	if c == nil || c.inner == nil {
+		return errOpenAIWSConnClosed
+	}
+	if pinger, ok := c.inner.(openaiwsv2.PingConn); ok {
+		return pinger.Ping(ctx)
+	}
+	return errOpenAIWSConnClosed
+}
+
+func (c *openAIWSPolicyEnforcingFrameConn) SupportsPing() bool {
+	if c == nil || c.inner == nil {
+		return false
+	}
+	capability, ok := c.inner.(openaiwsv2.PingCapability)
+	if ok {
+		return capability.SupportsPing()
+	}
+	_, ok = c.inner.(openaiwsv2.PingConn)
+	return ok
+}
+
 func (c *openAIWSPolicyEnforcingFrameConn) Close() error {
 	if c == nil || c.inner == nil {
 		return nil
@@ -462,9 +484,38 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) WriteFrame(ctx context.Context
 	return nil
 }
 
+func (c *openAIWSPassthroughFirstOutputFrameConn) Ping(ctx context.Context) error {
+	if c == nil || c.inner == nil {
+		return errOpenAIWSConnClosed
+	}
+	if pinger, ok := c.inner.(openaiwsv2.PingConn); ok {
+		return pinger.Ping(ctx)
+	}
+	return errOpenAIWSConnClosed
+}
+
+func (c *openAIWSPassthroughFirstOutputFrameConn) SupportsPing() bool {
+	if c == nil || c.inner == nil {
+		return false
+	}
+	capability, ok := c.inner.(openaiwsv2.PingCapability)
+	if ok {
+		return capability.SupportsPing()
+	}
+	_, ok = c.inner.(openaiwsv2.PingConn)
+	return ok
+}
+
 func (c *openAIWSPassthroughFirstOutputFrameConn) Close() error {
 	if c == nil || c.inner == nil {
 		return nil
+	}
+	// Passthrough owns a live upstream socket rather than an idle pool entry.
+	// Prefer its adapter's close handshake so a normal relay completion does not
+	// turn into a bare FIN/RST at the sidecar or OpenAI edge.  Pool eviction still
+	// calls the underlying adapter's immediate Close method directly.
+	if graceful, ok := c.inner.(openAIWSGracefulCloser); ok {
+		return graceful.CloseGracefully(coderws.StatusNormalClosure, "")
 	}
 	return c.inner.Close()
 }
@@ -592,8 +643,32 @@ func (c *openAIWSClientFrameConn) ReadFrame(ctx context.Context) (coderws.Messag
 		return coderws.MessageText, nil, errOpenAIWSConnClosed
 	}
 	controlCtx := ctx
+	var stopContextBridge func()
 	if c.controlCtx != nil {
 		controlCtx = c.controlCtx
+		if ctx != nil {
+			// The relay gives each read a child context so its active-turn
+			// deadline can cancel the underlying read.  Historically this method
+			// replaced that child with the session context, which made a timed-out
+			// read wait forever until the peer happened to send another frame. Keep
+			// the session values (read pump, lease-loss cause, idle marker) while
+			// also propagating cancellation from the per-read child.
+			bridgedCtx, cancelCause := context.WithCancelCause(c.controlCtx)
+			stopAfterFunc := context.AfterFunc(ctx, func() {
+				cancelCause(context.Cause(ctx))
+			})
+			controlCtx = bridgedCtx
+			stopContextBridge = func() {
+				stopAfterFunc()
+				cancelCause(nil)
+			}
+		}
+	}
+	if controlCtx == nil {
+		controlCtx = context.Background()
+	}
+	if stopContextBridge != nil {
+		defer stopContextBridge()
 	}
 	msgType, payload, err := readOpenAIWSClientMessageWithTimeoutStart(
 		controlCtx,
@@ -645,13 +720,38 @@ func (c *openAIWSClientFrameConn) WriteFrame(ctx context.Context, msgType coderw
 	return c.conn.Write(ctx, msgType, payload)
 }
 
+func (c *openAIWSClientFrameConn) Ping(ctx context.Context) error {
+	if c == nil || c.conn == nil {
+		return errOpenAIWSConnClosed
+	}
+	if reader := openAIWSClientReadPumpFromContext(c.controlCtx, c.conn); reader != nil {
+		return reader.Ping(ctx)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.conn.Ping(ctx)
+}
+
+func (c *openAIWSClientFrameConn) SupportsPing() bool {
+	if c == nil || c.conn == nil {
+		return false
+	}
+	reader := openAIWSClientReadPumpFromContext(c.controlCtx, c.conn)
+	return reader != nil && reader.SupportsPing()
+}
+
 func (c *openAIWSClientFrameConn) Close() error {
 	if c == nil || c.conn == nil {
 		return nil
 	}
-	_ = c.conn.Close(coderws.StatusNormalClosure, "")
-	_ = c.conn.CloseNow()
-	return nil
+	if reader := openAIWSClientReadPumpFromContext(c.controlCtx, c.conn); reader != nil {
+		if graceful, ok := any(reader).(openAIWSGracefulCloser); ok {
+			return graceful.CloseGracefully(coderws.StatusNormalClosure, "")
+		}
+		return reader.Close()
+	}
+	return c.conn.Close(coderws.StatusNormalClosure, "")
 }
 
 func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
@@ -676,6 +776,24 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	// Keep a canonical, pre-mutation source for a same-account physical-socket
+	// retry.  Replaying the already forwarded frame would run account identity,
+	// fingerprint and prompt-cache scoping a second time, changing stable IDs
+	// across the replacement connection.  The retry re-enters this method and
+	// deliberately reapplies all policy/normalization steps to this source.
+	connectionLimitReplaySource := append([]byte(nil), firstClientMessage...)
+	ctx = WithOpenAIWSClientReadPump(ctx, clientConn)
+	isCodexCLI := false
+	if c != nil {
+		isCodexCLI = openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
+	}
+	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
+		isCodexCLI = true
+	}
+	// Direct callers can enter the v2 passthrough method without going through
+	// ProxyResponsesWebSocketFromClient; preserve the same protocol keepalive
+	// eligibility in that case.
+	ctx = withOpenAIWSClientIdleProbe(ctx, isCodexCLI)
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
@@ -789,6 +907,41 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", fpErr)
 	}
 	firstClientMessage = rewrittenFirst
+	// Keep the replay source for the response.create currently in flight. The
+	// first turn deliberately starts from the canonical pre-mutation client
+	// frame captured above; later client frames replace it from the relay filter.
+	// The lock is needed because that filter and the upstream relay run on
+	// different goroutines.
+	var replayPayloadMu sync.RWMutex
+	latestReplayPayload := connectionLimitReplaySource
+	setLatestReplayPayload := func(payload []byte) {
+		replayPayloadMu.Lock()
+		latestReplayPayload = append(latestReplayPayload[:0], payload...)
+		replayPayloadMu.Unlock()
+	}
+	getLatestReplayPayload := func() []byte {
+		replayPayloadMu.RLock()
+		payload := append([]byte(nil), latestReplayPayload...)
+		replayPayloadMu.RUnlock()
+		return payload
+	}
+	buildConnectionLimitReplayPayload := func() []byte {
+		payload := getLatestReplayPayload()
+		items, exists, err := openAIWSExtractNormalizedInputSequence(payload)
+		if err != nil || !exists {
+			return nil
+		}
+		retryPayload, retrySafe, retryErr := buildOpenAIWSCurrentTurnRetryPayload(
+			payload,
+			items,
+			exists,
+			requestModel,
+		)
+		if retryErr != nil || !retrySafe {
+			return nil
+		}
+		return retryPayload
+	}
 
 	// 在 policy filter 之后再提取 service_tier / reasoning_effort 用于
 	// usage 上报：filter
@@ -824,13 +977,6 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		account.ProxyID != nil && account.Proxy != nil,
 	)
 
-	isCodexCLI := false
-	if c != nil {
-		isCodexCLI = openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
-	}
-	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
-		isCodexCLI = true
-	}
 	turnState := ""
 	turnMetadata := ""
 	if c != nil {
@@ -1112,6 +1258,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if isResponseCreate {
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
+				setLatestReplayPayload(out)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
 				responseCreateAtCopy := responseCreateAt
@@ -1266,8 +1413,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if !ok {
 					return
 				}
-				_ = clientConn.Close(status, reason)
-				_ = clientConn.CloseNow()
+				_ = CloseOpenAIWSClientGracefully(ctx, clientConn, status, reason)
 			},
 			BeforeWriteClient: func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error {
 				if msgType != coderws.MessageText {
@@ -1278,6 +1424,22 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					failureAccountSideEffectsApplied = false
 				}
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
+				fallbackReason, _ := classifyOpenAIWSErrorEventFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
+				isPreOutputConnectionLimit := eventType == "error" && !wroteDownstream && fallbackReason == "ws_connection_limit_reached"
+				if isPreOutputConnectionLimit {
+					logOpenAIWSV2Passthrough(
+						"relay_connection_limit account_id=%d err_code=%s err_type=%s err_message=%s",
+						account.ID,
+						truncateOpenAIWSLogValue(errCodeRaw, openAIWSLogValueMaxLen),
+						truncateOpenAIWSLogValue(errTypeRaw, openAIWSLogValueMaxLen),
+						truncateOpenAIWSLogValue(errMsgRaw, openAIWSLogValueMaxLen),
+					)
+					return &openAIWSConnectionLimitError{
+						code:         errCodeRaw,
+						message:      errMsgRaw,
+						retryPayload: buildConnectionLimitReplayPayload(),
+					}
+				}
 				isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw)
 				if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
 					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
@@ -1323,8 +1485,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			status = coderws.StatusTryAgainLater
 			reason = "websocket ingress capacity lease lost; please reconnect"
 		}
-		_ = clientConn.Close(status, reason)
-		_ = clientConn.CloseNow()
+		_ = CloseOpenAIWSClientGracefully(ctx, clientConn, status, reason)
 		return NewOpenAIWSClientCloseError(status, reason, cause)
 	}
 
@@ -1389,6 +1550,31 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	)
 
 	relayErr := relayExit.Err
+	var connectionLimitErr *openAIWSConnectionLimitError
+	if errors.As(relayErr, &connectionLimitErr) && connectionLimitErr != nil && !relayExit.WroteDownstream {
+		// The relay has not started the client reader until the first downstream
+		// frame, so a pre-output lifetime error is replayable without losing a
+		// concurrently consumed client turn.  Return the typed current-turn
+		// marker; the HTTP handler will invoke this method again on the same
+		// downstream socket with the replacement payload.
+		retryPayload := connectionLimitErr.RetryPayload()
+		if len(retryPayload) > 0 && int(completedTurns.Load()) == 0 {
+			relayErr = newOpenAIWSCurrentTurnFailoverError(
+				s.newOpenAIWSConnectionLimitFailoverError(account, handshakeHeaders, nil, connectionLimitErr.Error()),
+				retryPayload,
+			)
+		} else {
+			// A later passthrough turn may have already consumed client frames and
+			// does not carry enough server history to reconstruct a fresh socket.
+			// Close with a retryable code instead of forwarding the provider's raw
+			// error or risking a duplicated tool call.
+			relayErr = NewOpenAIWSClientCloseError(
+				coderws.StatusTryAgainLater,
+				"upstream websocket connection lifetime reached; please reconnect",
+				connectionLimitErr,
+			)
+		}
+	}
 	var firstOutputTimeoutErr *openAIWSPassthroughFirstOutputTimeoutError
 	if errors.As(relayErr, &firstOutputTimeoutErr) {
 		deadline := firstOutputTimeoutErr.deadline
@@ -1523,6 +1709,30 @@ func (s *OpenAIGatewayService) mapOpenAIWSPassthroughDialError(
 		)
 	}
 	return fmt.Errorf("openai ws passthrough dial: %w", wrappedErr)
+}
+
+func (s *OpenAIGatewayService) newOpenAIWSConnectionLimitFailoverError(
+	account *Account,
+	headers http.Header,
+	responseBody []byte,
+	message string,
+) *UpstreamFailoverError {
+	// This marker is consumed by the WS handler to retry the current frame on
+	// the same account. Switching credentials cannot repair a provider-enforced
+	// physical socket lifetime, and the original error must never be exposed as
+	// a normal application event.
+	return &UpstreamFailoverError{
+		StatusCode:             http.StatusBadGateway,
+		ResponseBody:           append([]byte(nil), responseBody...),
+		ResponseHeaders:        cloneHeader(headers),
+		RetryableOnSameAccount: true,
+		RequestScopedTransient: true,
+		Reason:                 openAIWSConnectionLimitFailoverReason,
+		NextAccountAction:      NextAccountStop,
+		ClientStatusCode:       http.StatusServiceUnavailable,
+		ClientMessage:          "upstream websocket connection lifetime reached; please retry",
+		Stage:                  GatewayFailureStageInference,
+	}
 }
 
 func openaiwsv2RelayMessageTypeName(msgType coderws.MessageType) string {

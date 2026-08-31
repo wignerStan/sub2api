@@ -751,6 +751,42 @@ func TestOpenAIWSConnPool_AcquireDoesNotReuseDifferentStableIdentity(t *testing.
 	}
 }
 
+func TestOpenAIWSConnPool_AcquireDoesNotReuseDifferentConversationIdentity(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 2
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 2
+
+	pool := newOpenAIWSConnPool(cfg)
+	dialer := &openAIWSCountingDialer{}
+	pool.setClientDialerForTest(dialer)
+	account := activeCodexFingerprintPoolAccountForTest(136)
+
+	rootHeaders := stableOpenAIWSIdentityHeadersForTest()
+	rootHeaders.Set("conversation_id", "root-conversation")
+	root, err := pool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account: account,
+		WSURL:   "wss://example.com/v1/responses",
+		Headers: rootHeaders,
+	})
+	require.NoError(t, err)
+	rootID := root.ConnID()
+	root.Release()
+
+	childHeaders := rootHeaders.Clone()
+	childHeaders.Set("conversation_id", "child-conversation")
+	child, err := pool.Acquire(context.Background(), openAIWSAcquireRequest{
+		Account: account,
+		WSURL:   "wss://example.com/v1/responses",
+		Headers: childHeaders,
+	})
+	require.NoError(t, err)
+	require.False(t, child.Reused())
+	require.NotEqual(t, rootID, child.ConnID())
+	child.Release()
+	require.Equal(t, 2, dialer.DialCount())
+}
+
 func TestOpenAIWSConnPool_AcquireRoutingHintRemainsSoftAffinity(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
@@ -1060,6 +1096,86 @@ func TestOpenAIWSConnPool_AcquireForcePreferredConnDirectAndQueueFull(t *testing
 	preferredConn.release()
 }
 
+func TestOpenAIWSConnPool_ForcePreferredConnRejectsRotatingLeasedSocket(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 2
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 2
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 4
+
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	account := &Account{ID: 128, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	preferred := newOpenAIWSConn("rotating_preferred", account.ID, &openAIWSFakeConn{}, nil)
+	// Model a different ingress session currently holding the socket. A strict
+	// waiter must fail immediately; waiting for release would only hand out a
+	// transport that is already inside OpenAI's hard lifetime window.
+	require.True(t, preferred.tryAcquire())
+	preferred.createdAtNano.Store(time.Now().Add(-openAIWSConnRotationAge - time.Second).UnixNano())
+	ap.mu.Lock()
+	ap.conns[preferred.id] = preferred
+	ap.lastCleanupAt = time.Now()
+	ap.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := pool.Acquire(ctx, openAIWSAcquireRequest{
+		Account:            account,
+		WSURL:              "wss://example.com/v1/responses",
+		PreferredConnID:    preferred.id,
+		ForcePreferredConn: true,
+	})
+	require.ErrorIs(t, err, errOpenAIWSPreferredConnUnavailable)
+	require.Equal(t, 0, int(preferred.waiters.Load()), "rotating preferred socket must not accumulate a waiter")
+	preferred.release()
+}
+
+func TestOpenAIWSConnPool_AcquireRejectsSocketThatRotatesWhileQueued(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 4
+
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	account := &Account{ID: 129, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	conn := newOpenAIWSConn("queued_rotating", account.ID, &openAIWSFakeConn{}, nil)
+	require.True(t, conn.tryAcquire())
+	ap.mu.Lock()
+	ap.conns[conn.id] = conn
+	ap.lastCleanupAt = time.Now()
+	ap.mu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := pool.Acquire(ctx, openAIWSAcquireRequest{
+			Account:            account,
+			WSURL:              "wss://example.com/v1/responses",
+			PreferredConnID:    conn.id,
+			ForcePreferredConn: true,
+		})
+		result <- err
+	}()
+	// Age the physical socket while the first lease is still held. The strict
+	// acquire must observe the post-token rotation check rather than queueing
+	// behind it forever.
+	time.Sleep(20 * time.Millisecond)
+	conn.createdAtNano.Store(time.Now().Add(-openAIWSConnRotationAge - time.Second).UnixNano())
+	conn.release()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, errOpenAIWSPreferredConnUnavailable)
+	case <-time.After(time.Second):
+		t.Fatal("strict acquire waited on a socket that had entered rotation")
+	}
+}
+
 func TestOpenAIWSConnPool_CleanupSkipsPinnedConn(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 2
@@ -1197,6 +1313,111 @@ func TestOpenAIWSConnPool_EffectiveMaxConnsByAccount_ModeRouterV2RespectsHardCap
 	require.Equal(t, 0, pool.effectiveMaxConnsByAccount(nonPositive), "并发数<=0 时应不可调度")
 }
 
+func TestOpenAIWSConnPool_PersistentIngressUsesIndependentTransportCapacity(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 3
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 3
+	cfg.Gateway.OpenAIWS.PoolTargetUtilization = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 4
+
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(&openAIWSCountingDialer{})
+	defer pool.Close()
+
+	account := &Account{ID: 902, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+	baseReq := openAIWSAcquireRequest{
+		Account:           account,
+		WSURL:             "wss://example.com/v1/responses",
+		PersistentIngress: true,
+	}
+
+	rootLease, err := pool.Acquire(context.Background(), baseReq)
+	require.NoError(t, err)
+	require.NotNil(t, rootLease)
+	defer rootLease.Release()
+
+	// The first root thread keeps its transport leased while it waits for a
+	// turn.  A fork/subagent must be able to obtain another compatible socket
+	// immediately even though account.Concurrency is one (that value governs
+	// active turns, not persistent transports).
+	childCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	childLease, err := pool.Acquire(childCtx, baseReq)
+	require.NoError(t, err)
+	require.NotNil(t, childLease)
+	defer childLease.Release()
+	require.NotEqual(t, rootLease.ConnID(), childLease.ConnID())
+
+	inflight, _, conns := pool.AccountPoolLoad(account.ID)
+	require.Equal(t, 2, inflight)
+	require.Equal(t, 2, conns)
+}
+
+func TestOpenAIWSConnPool_PersistentIngressSetupTokenSeparatesThreadsWithSingleConfiguredCap(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	// This is a valid (and commonly used in small deployments) hard cap.  A
+	// persistent root lease must not make a child/fork wait forever behind it.
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 2
+	cfg.Gateway.OpenAIWS.PoolTargetUtilization = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 4
+
+	pool := newOpenAIWSConnPool(cfg)
+	dialer := &openAIWSCountingDialer{}
+	pool.setClientDialerForTest(dialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          903,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeSetupToken,
+		Concurrency: 1,
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: "session",
+			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
+		},
+	}
+	rootHeaders := http.Header{
+		"session-id": []string{"shared-session"},
+		"thread-id":  []string{"root-thread"},
+	}
+	childHeaders := rootHeaders.Clone()
+	childHeaders.Set("thread-id", "child-thread")
+	base := openAIWSAcquireRequest{
+		Account:           account,
+		WSURL:             "wss://example.com/v1/responses",
+		PersistentIngress: true,
+	}
+	root := base
+	root.Headers = rootHeaders
+	child := base
+	child.Headers = childHeaders
+
+	require.Equal(t, codexFingerprintSession, activeCodexFingerprintMode(account),
+		"SetupToken must use the same Codex fingerprint compatibility mode as OAuth")
+	require.NotEqual(t,
+		normalizeOpenAIWSHandshakeCompatibility(account, rootHeaders),
+		normalizeOpenAIWSHandshakeCompatibility(account, childHeaders),
+		"root and child thread identities must not share a pool key")
+	require.GreaterOrEqual(t, pool.effectiveMaxConnsForAcquire(root), 2,
+		"persistent ingress needs at least two independent transports")
+
+	rootLease, err := pool.Acquire(context.Background(), root)
+	require.NoError(t, err)
+	defer rootLease.Release()
+	childCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	childLease, err := pool.Acquire(childCtx, child)
+	require.NoError(t, err)
+	defer childLease.Release()
+	require.NotEqual(t, rootLease.ConnID(), childLease.ConnID())
+	require.Equal(t, 2, dialer.DialCount(), "child must dial an independent transport")
+}
+
 func TestOpenAIWSConnPool_AcquireRejectsWhenEffectiveMaxConnsIsZero(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
@@ -1257,6 +1478,19 @@ func TestOpenAIWSConnLease_PingWithTimeout(t *testing.T) {
 	var nilLease *openAIWSConnLease
 	err := nilLease.PingWithTimeout(50 * time.Millisecond)
 	require.ErrorIs(t, err, errOpenAIWSConnClosed)
+}
+
+func TestOpenAIWSConn_PingContextCancelsWhileWriteLockIsBusy(t *testing.T) {
+	conn := newOpenAIWSConn("ping_lock_cancel", 1, &openAIWSFakeConn{}, nil)
+	conn.writeMu.Lock()
+	defer conn.writeMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := conn.pingWithContext(ctx, time.Second)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(started), 200*time.Millisecond)
 }
 
 func TestOpenAIWSConn_ReadAndWriteCanProceedConcurrently(t *testing.T) {

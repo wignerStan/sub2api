@@ -59,19 +59,42 @@ func applyStagedCodexFingerprintHeaders(c *gin.Context, account *Account, h http
 // WS passthrough 不走 HTTP Forward 的解析 seam，未暂存时在此补解析，
 // 避免出站 session/installation 仍是客户端值。
 func ensureStagedCodexFingerprintIDs(c *gin.Context, account *Account) *codexFingerprintIDs {
+	return ensureStagedCodexFingerprintIDsForBody(c, account, nil)
+}
+
+// ensureStagedCodexFingerprintIDsForBody resolves the first WebSocket frame's
+// identity before it is rewritten.  The handshake normally carries
+// thread-id/session-id headers, but Codex-compatible clients are allowed to
+// put those fields only in client_metadata (or x-codex-turn-metadata) of the
+// first response.create event.  Resolving headers alone in that case silently
+// maps every fork to the session fallback, so root and subagent transports get
+// the same pool/preemption key.  Header values remain authoritative when both
+// carriers are present; body values fill only missing graph edges.
+func ensureStagedCodexFingerprintIDsForBody(c *gin.Context, account *Account, body []byte) *codexFingerprintIDs {
 	if ids := stagedCodexFingerprintIDs(c, account); ids != nil {
+		if len(body) > 0 && !ids.bodyTopologyCaptured {
+			enrichCodexFingerprintIDsFromBody(c, ids, body)
+			ids.bodyTopologyCaptured = true
+		}
 		return ids
 	}
 	var clientHeaders http.Header
 	if c != nil && c.Request != nil {
 		clientHeaders = c.Request.Header
 	}
-	ids := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+	ids := resolveCodexFingerprintIDsFromRequestAndBody(account, clientHeaders, body)
 	stageCodexFingerprintIDs(c, ids)
 	return ids
 }
 
 func applyStagedCodexFingerprintClientMetadata(c *gin.Context, account *Account, reqBody map[string]any) bool {
+	// This helper is used by the legacy map-based WS forwarder after the
+	// request attempt has already staged its account-specific fingerprint.  Do
+	// not initialize a new snapshot from the mutable body here: during account
+	// failover the gin context may still contain the previous account's IDs,
+	// and silently deriving a fresh set would make the stale-context guard
+	// ineffective.  The raw passthrough path explicitly uses
+	// ensureStagedCodexFingerprintIDsForBody instead.
 	return applyCodexFingerprintClientMetadata(reqBody, stagedCodexFingerprintIDs(c, account))
 }
 
@@ -79,10 +102,10 @@ func applyStagedCodexFingerprintClientMetadata(c *gin.Context, account *Account,
 // 收敛 ID 改写原始 JSON 帧/体中的 client_metadata。WS passthrough 不走 HTTP
 // Forward 的解析 seam，必须 ensure 后再改写，否则帧体仍是客户端原值。
 func applyStagedCodexFingerprintClientMetadataRaw(c *gin.Context, account *Account, body []byte) ([]byte, error) {
-	if len(body) == 0 || account == nil || !account.IsOpenAIOAuth() {
+	if len(body) == 0 || account == nil || !account.IsOpenAIOAuthLike() {
 		return body, nil
 	}
-	next, _, err := applyCodexFingerprintClientMetadataRaw(body, ensureStagedCodexFingerprintIDs(c, account))
+	next, _, err := applyCodexFingerprintClientMetadataRaw(body, ensureStagedCodexFingerprintIDsForBody(c, account, body))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +123,7 @@ func applyStagedCodexFingerprintClientMetadataRawForFollowup(
 	body []byte,
 	newTurn bool,
 ) ([]byte, error) {
-	if len(body) == 0 || account == nil || !account.IsOpenAIOAuth() {
+	if len(body) == 0 || account == nil || !account.IsOpenAIOAuthLike() {
 		return body, nil
 	}
 	base := ensureStagedCodexFingerprintIDs(c, account)
@@ -112,6 +135,8 @@ func applyStagedCodexFingerprintClientMetadataRawForFollowup(
 	// otherwise rewrite an unrelated prompt_cache_key on a later WS frame.
 	ids.originalBodySessionID = ""
 	ids.originalBodySessionIDCaptured = false
+	ids.promptCacheDefaultCaptured = false
+	ids.promptCacheWasSessionDefault = false
 	if newTurn && (ids.mode == codexFingerprintSession || ids.mode == codexFingerprintFull) {
 		ids.turnID = uuid.Must(uuid.NewV7()).String()
 		ids.turnStartedAtUnixMs = time.Now().UnixMilli()
@@ -491,6 +516,13 @@ type codexFingerprintIDs struct {
 	turnStartedAtUnixMs           int64
 	originalBodySessionID         string
 	originalBodySessionIDCaptured bool
+	promptCacheDefaultCaptured    bool
+	promptCacheWasSessionDefault  bool
+	// bodyTopologyCaptured makes first-frame topology enrichment idempotent.
+	// A same-account WebSocket retry reuses the gin context but its replay body
+	// already contains converged IDs; deriving from those values a second time
+	// would silently change the thread identity across the replacement socket.
+	bodyTopologyCaptured bool
 }
 
 // extractClientWindowNumber extracts the client's current auto_compact window_number
@@ -577,6 +609,23 @@ func extractClientSessionID(h http.Header) string {
 	return strings.TrimSpace(h.Get("session_id"))
 }
 
+// extractClientConversationID returns the per-conversation identity used by
+// Responses clients that keep one session-id for a root and all of its forks.
+// It is deliberately separate from extractClientThreadID: an explicit Codex
+// thread/window projection remains authoritative, while conversation_id is a
+// compatibility fallback only when that topology is otherwise absent.
+func extractClientConversationID(h http.Header) string {
+	if h == nil {
+		return ""
+	}
+	for _, name := range []string{"conversation_id", "conversation-id", "x-conversation-id"} {
+		if value := strings.TrimSpace(h.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func codexFingerprintTurnMetadataString(h http.Header, key string) string {
 	if h == nil {
 		return ""
@@ -598,7 +647,49 @@ func extractClientThreadID(h http.Header) string {
 	if v := strings.TrimSpace(h.Get("thread_id")); v != "" {
 		return v
 	}
-	return codexFingerprintTurnMetadataString(h, "thread_id")
+	if v := strings.TrimSpace(h.Get("x-codex-thread-id")); v != "" {
+		return v
+	}
+	if v := codexFingerprintTurnMetadataString(h, "thread_id"); v != "" {
+		return v
+	}
+	// Some Codex-compatible clients omit thread-id but still send the canonical
+	// window projection (<thread_id>:<window_number>).  Preserve the thread
+	// graph in that case instead of collapsing every fork onto the session ID.
+	for _, name := range []string{"x-codex-window-id", "window-id"} {
+		raw := strings.TrimSpace(h.Get(name))
+		if raw == "" {
+			continue
+		}
+		// Be tolerant of clients that serialize the window projection as JSON.
+		// Only accept an explicit thread_id/window_id field; a bare numeric value
+		// must never become a synthetic thread identity.
+		if gjson.Valid(raw) && gjson.Parse(raw).IsObject() {
+			for _, path := range []string{"thread_id", "window_id"} {
+				value := strings.TrimSpace(gjson.Get(raw, path).String())
+				if value == "" {
+					continue
+				}
+				if idx := strings.LastIndex(value, ":"); idx > 0 {
+					value = strings.TrimSpace(value[:idx])
+				}
+				if value != "" {
+					return value
+				}
+			}
+		}
+		if idx := strings.LastIndex(raw, ":"); idx > 0 {
+			if threadID := strings.TrimSpace(raw[:idx]); threadID != "" {
+				return threadID
+			}
+		}
+	}
+	// Do not use x-client-request-id as a thread identity fallback.  Codex
+	// currently projects its thread id into that header, but many compatible
+	// clients (and proxies) use a fresh request UUID there.  Treating that UUID
+	// as a thread would silently create a new fingerprint/scope for every turn
+	// and is precisely the kind of root/fork split that breaks continuation.
+	return ""
 }
 
 func extractClientParentThreadID(h http.Header) string {
@@ -619,7 +710,7 @@ func extractClientForkedFromThreadID(h http.Header) string {
 // 结合账号配置一次性解析收敛 ID 集合。调用方应将返回的 ids 同时传给
 // applyCodexFingerprintHeaders 和 applyCodexFingerprintClientMetadata。
 func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.Header) *codexFingerprintIDs {
-	if account == nil || !account.IsOpenAIOAuth() {
+	if account == nil || !account.IsOpenAIOAuthLike() {
 		return nil
 	}
 	mode := effectiveCodexFingerprintMode(account.GetCodexFingerprintMode())
@@ -637,7 +728,17 @@ func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.
 	// Session convergence must preserve Codex's graph: one session can contain a
 	// root thread plus multiple subagent/fork threads. Derive each node from the
 	// original thread identity, not from the shared session-id.
-	if clientThreadID := extractClientThreadID(clientHeaders); clientThreadID != "" {
+	clientThreadID := extractClientThreadID(clientHeaders)
+	if clientThreadID == "" {
+		// Several Responses-compatible clients reuse session-id for the root and
+		// every subagent, exposing the actual branch only as conversation_id.
+		// Falling back to session-id here makes their outbound thread-id identical
+		// even though pool/preemption scopes are already separate. Treat the
+		// conversation as a thread seed only when no explicit thread/window signal
+		// exists, preserving the latter's authority.
+		clientThreadID = extractClientConversationID(clientHeaders)
+	}
+	if clientThreadID != "" {
 		ids.threadID = resolveConvergedThreadID(ids.seed, clientThreadID)
 		ids.windowID = fmt.Sprintf("%s:%d", ids.threadID, windowNumber)
 	}
@@ -648,6 +749,195 @@ func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.
 		ids.forkedFromThreadID = resolveConvergedThreadID(ids.seed, forkedFromThreadID)
 	}
 	return ids
+}
+
+// resolveCodexFingerprintIDsFromRequestAndBody extends the handshake-header
+// resolver with the first event body.  It is intentionally used only for the
+// first frame: follow-up frames must retain the connection's established
+// thread scope and may not move a live transport to a different owner.
+func resolveCodexFingerprintIDsFromRequestAndBody(account *Account, clientHeaders http.Header, body []byte) *codexFingerprintIDs {
+	ids := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+	if ids == nil || len(body) == 0 {
+		return ids
+	}
+	if ids.mode == codexFingerprintSession {
+		enrichCodexFingerprintIDsFromBodyHeaders(ids, clientHeaders, body)
+	}
+	ids.bodyTopologyCaptured = true
+	return ids
+}
+
+// enrichCodexFingerprintIDsFromBody adds identity fields that were omitted
+// from the handshake.  This mutates only the freshly staged first-frame
+// snapshot; callers never invoke it for later frames.  Header-derived values
+// always win, which prevents a body field from changing a scope already
+// authenticated by the handshake.
+func enrichCodexFingerprintIDsFromBody(c *gin.Context, ids *codexFingerprintIDs, body []byte) {
+	if ids == nil || len(body) == 0 || ids.mode != codexFingerprintSession {
+		return
+	}
+	var headers http.Header
+	if c != nil && c.Request != nil {
+		headers = c.Request.Header
+	}
+	enrichCodexFingerprintIDsFromBodyHeaders(ids, headers, body)
+}
+
+func enrichCodexFingerprintIDsFromBodyHeaders(ids *codexFingerprintIDs, headers http.Header, body []byte) {
+	if ids == nil || len(body) == 0 || ids.mode != codexFingerprintSession || !gjson.ValidBytes(body) {
+		return
+	}
+	// Explicit thread/window signals are authoritative in carrier order:
+	// handshake header, first-frame body, then the conversation compatibility
+	// fallback.  In particular, a header conversation_id must not hide a real
+	// thread_id that a compatible client can only put in client_metadata.
+	if extractClientThreadID(headers) == "" {
+		rawThread := extractCodexBodyExplicitThreadID(body)
+		if rawThread == "" && extractClientConversationID(headers) == "" {
+			rawThread = extractCodexBodyConversationID(body)
+		}
+		if rawThread != "" {
+			ids.threadID = resolveConvergedThreadID(ids.seed, rawThread)
+			if ids.threadID == "" {
+				ids.threadID = ids.sessionID
+			}
+			ids.windowID = fmt.Sprintf("%s:%d", ids.threadID, ids.windowNumber)
+		}
+	}
+	if extractClientParentThreadID(headers) == "" {
+		if rawParent := extractCodexBodyParentThreadID(body); rawParent != "" {
+			ids.parentThreadID = resolveConvergedThreadID(ids.seed, rawParent)
+		}
+	}
+	if extractClientForkedFromThreadID(headers) == "" {
+		if rawFork := extractCodexBodyForkedFromThreadID(body); rawFork != "" {
+			ids.forkedFromThreadID = resolveConvergedThreadID(ids.seed, rawFork)
+		}
+	}
+	if ids.windowNumber == 0 && extractClientWindowNumber(headers) == 0 {
+		if number, ok := extractCodexBodyWindowNumber(body); ok {
+			ids.windowNumber = number
+			ids.windowID = fmt.Sprintf("%s:%d", ids.threadID, number)
+		}
+	}
+}
+
+// codexBodyIdentityValue reads a scalar from the event itself, its Responses
+// envelope, client_metadata, or the embedded x-codex-turn-metadata JSON.  The
+// paths are deliberately narrow; arbitrary user input must never become a
+// routing/preemption identity.
+func codexBodyIdentityValue(body []byte, keys ...string) string {
+	root := gjson.ParseBytes(body)
+	if !root.Exists() {
+		return ""
+	}
+	views := []gjson.Result{root}
+	if response := root.Get("response"); response.Exists() && response.IsObject() {
+		views = append(views, response)
+	}
+	for _, view := range views {
+		for _, key := range keys {
+			for _, path := range []string{key, "client_metadata." + key} {
+				value := strings.TrimSpace(view.Get(path).String())
+				if value != "" {
+					return value
+				}
+			}
+			// Codex uses an x-codex-* spelling for some flat metadata fields.
+			for _, path := range []string{"client_metadata.x-codex-" + key, "x-codex-" + key} {
+				value := strings.TrimSpace(view.Get(path).String())
+				if value != "" {
+					return value
+				}
+			}
+		}
+		for _, path := range []string{"x-codex-turn-metadata", "client_metadata.x-codex-turn-metadata"} {
+			metadata := view.Get(path)
+			if !metadata.Exists() {
+				continue
+			}
+			raw := strings.TrimSpace(metadata.String())
+			if metadata.Type == gjson.JSON {
+				raw = strings.TrimSpace(metadata.Raw)
+			}
+			if raw == "" || !gjson.Valid(raw) {
+				continue
+			}
+			for _, key := range keys {
+				if value := strings.TrimSpace(gjson.Get(raw, key).String()); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeCodexBodyThreadProjection(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.LastIndex(value, ":"); idx > 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return normalizeOpenAIWSSessionPreemptionThreadID(value)
+}
+
+func extractCodexBodyExplicitThreadID(body []byte) string {
+	return normalizeCodexBodyThreadProjection(codexBodyIdentityValue(body,
+		"thread_id",
+		"thread-id",
+		"window_id",
+		"window-id",
+	))
+}
+
+func extractCodexBodyConversationID(body []byte) string {
+	return normalizeCodexBodyThreadProjection(codexBodyIdentityValue(body,
+		"conversation_id",
+		"conversation-id",
+	))
+}
+
+func extractCodexBodyParentThreadID(body []byte) string {
+	return normalizeCodexBodyThreadProjection(codexBodyIdentityValue(body,
+		"parent_thread_id",
+		"parent-thread-id",
+	))
+}
+
+func extractCodexBodyForkedFromThreadID(body []byte) string {
+	return normalizeCodexBodyThreadProjection(codexBodyIdentityValue(body,
+		"forked_from_thread_id",
+		"forked-from-thread-id",
+	))
+}
+
+func extractCodexBodyWindowNumber(body []byte) (uint64, bool) {
+	root := gjson.ParseBytes(body)
+	views := []gjson.Result{root}
+	if response := root.Get("response"); response.Exists() && response.IsObject() {
+		views = append(views, response)
+	}
+	for _, view := range views {
+		for _, path := range []string{"window_number", "client_metadata.window_number", "x-codex-window-id", "client_metadata.x-codex-window-id"} {
+			value := view.Get(path)
+			if !value.Exists() {
+				continue
+			}
+			if value.Type == gjson.Number {
+				if number, err := strconv.ParseUint(value.Raw, 10, 64); err == nil {
+					return number, true
+				}
+			}
+			raw := strings.TrimSpace(value.String())
+			if idx := strings.LastIndex(raw, ":"); idx >= 0 {
+				raw = strings.TrimSpace(raw[idx+1:])
+			}
+			if number, err := strconv.ParseUint(raw, 10, 64); err == nil {
+				return number, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // applyCodexFingerprintHeaders 按预计算的收敛 ID 改写出站 HTTP 头中的设备指纹。
@@ -917,13 +1207,25 @@ func captureCodexFingerprintOriginalBodySessionIDRaw(ids *codexFingerprintIDs, v
 }
 
 func shouldRewriteCodexFingerprintPromptCacheKey(ids *codexFingerprintIDs, promptCacheKey string) bool {
-	if ids == nil || !ids.originalBodySessionIDCaptured || ids.originalBodySessionID == "" || ids.sessionID == "" {
+	if ids == nil {
 		return false
 	}
-	if ids.mode != codexFingerprintSession && ids.mode != codexFingerprintFull {
+	if !ids.promptCacheDefaultCaptured {
+		ids.promptCacheDefaultCaptured = true
+		ids.promptCacheWasSessionDefault = ids.originalBodySessionIDCaptured &&
+			ids.originalBodySessionID != "" &&
+			ids.sessionID != "" &&
+			(ids.mode == codexFingerprintSession || ids.mode == codexFingerprintFull) &&
+			promptCacheKey == ids.originalBodySessionID
+	}
+	if !ids.promptCacheWasSessionDefault || ids.sessionID == "" {
 		return false
 	}
-	return promptCacheKey == ids.originalBodySessionID
+	// Once the first frame proved that prompt_cache_key was the client's
+	// session default, preserve that semantic across same-account replay.  The
+	// replay body may have passed through account scoping again, so comparing its
+	// current value with the original session would no longer be reliable.
+	return true
 }
 
 func applyCodexFingerprintPromptCacheKey(reqBody map[string]any, ids *codexFingerprintIDs) bool {

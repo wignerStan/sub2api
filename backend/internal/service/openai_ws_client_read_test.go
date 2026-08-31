@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,6 +167,132 @@ func TestReadOpenAIWSClientMessage_InterTurnIdleProbesHealthyCodexPeer(t *testin
 	case <-clientReadDone:
 	case <-time.After(time.Second):
 		t.Fatal("client reader did not exit after server transport closed")
+	}
+}
+
+func TestReadOpenAIWSClientMessage_NonTerminalUpstreamProbeKeepsClientAlive(t *testing.T) {
+	controlCtx := withOpenAIWSClientIdleProbe(context.Background(), true)
+	probeCalls := atomic.Int32{}
+	probeFailed := make(chan struct{}, 1)
+	serverResult := make(chan openAIWSClientReadResult, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverResult <- openAIWSClientReadResult{err: err}
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		msgType, payload, readErr := ReadOpenAIWSClientMessageWithIdlePing(
+			controlCtx,
+			conn,
+			500*time.Millisecond,
+			coderws.StatusNormalClosure,
+			openAIWSClientInterTurnIdleReason,
+			func(context.Context) error {
+				probeCalls.Add(1)
+				select {
+				case probeFailed <- struct{}{}:
+				default:
+				}
+				return newOpenAIWSIdlePingNonTerminalError(errors.New("upstream lease retired"))
+			},
+		)
+		serverResult <- openAIWSClientReadResult{messageType: msgType, payload: payload, err: readErr}
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	// Keep the downstream reader active so the server's protocol Ping receives
+	// a Pong. The auxiliary upstream probe fails independently and must not close
+	// this client socket.
+	clientReadDone := make(chan error, 1)
+	go func() {
+		_, _, readErr := clientConn.Read(context.Background())
+		clientReadDone <- readErr
+	}()
+
+	select {
+	case <-probeFailed:
+	case <-clientReadDone:
+		t.Fatal("client was closed by a non-terminal upstream probe failure")
+	case <-time.After(time.Second):
+		t.Fatal("non-terminal upstream probe was not attempted")
+	}
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.6-sol"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	select {
+	case result := <-serverResult:
+		require.NoError(t, result.err)
+		require.Equal(t, coderws.MessageText, result.messageType)
+		require.JSONEq(t, `{"type":"response.create","model":"gpt-5.6-sol"}`, string(result.payload))
+	case <-time.After(time.Second):
+		t.Fatal("client frame was not accepted after upstream probe failure")
+	}
+	require.Equal(t, int32(1), probeCalls.Load())
+
+	select {
+	case <-clientReadDone:
+	case <-time.After(time.Second):
+		t.Fatal("client reader did not terminate after server transport closed")
+	}
+}
+
+func TestReadOpenAIWSClientMessage_ProbesBeforeApplicationIdleDeadline(t *testing.T) {
+	controlCtx := withOpenAIWSClientIdleProbe(context.Background(), true)
+	pingSeen := make(chan struct{}, 1)
+	serverReady := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		close(serverReady)
+		_, _, _ = ReadOpenAIWSClientMessage(controlCtx, conn, 600*time.Millisecond, coderws.StatusNormalClosure, openAIWSClientInterTurnIdleReason)
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{
+		OnPingReceived: func(context.Context, []byte) bool {
+			select {
+			case pingSeen <- struct{}{}:
+			default:
+			}
+			return true
+		},
+	})
+	cancelDial()
+	require.NoError(t, err)
+	defer clientConn.CloseNow()
+	<-serverReady
+
+	// The configured application deadline is intentionally longer than the
+	// heartbeat interval (600ms/3).  A protocol Ping must arrive first; the old
+	// implementation stayed silent until the deadline itself fired.
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, readErr := clientConn.Read(context.Background())
+		readDone <- readErr
+	}()
+	select {
+	case <-pingSeen:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("did not observe a protocol ping before the application idle deadline")
+	}
+	_ = clientConn.CloseNow()
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("client reader did not terminate")
 	}
 }
 

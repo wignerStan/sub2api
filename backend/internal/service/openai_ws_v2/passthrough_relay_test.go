@@ -51,6 +51,19 @@ type cancelJoinProbeFrameConn struct {
 	returnOnce   sync.Once
 }
 
+type relayPingProbeConn struct {
+	FrameConn
+	pingCh chan struct{}
+}
+
+func (c *relayPingProbeConn) Ping(context.Context) error {
+	select {
+	case c.pingCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func newPassthroughTestFrameConn(frames []passthroughTestFrame, autoClose bool) *passthroughTestFrameConn {
 	c := &passthroughTestFrameConn{
 		readCh: make(chan passthroughTestFrame, len(frames)+1),
@@ -258,6 +271,61 @@ func TestRelay_BasicRelayAndUsage(t *testing.T) {
 	require.Len(t, clientWrites, 1)
 	require.Equal(t, coderws.MessageText, clientWrites[0].msgType)
 	require.JSONEq(t, `{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":7,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}}}`, string(clientWrites[0].payload))
+}
+
+func TestRunRelayKeepaliveSendsProtocolPingAfterIdle(t *testing.T) {
+	probe := &relayPingProbeConn{
+		FrameConn: newPassthroughTestFrameConn(nil, false),
+		pingCh:    make(chan struct{}, 1),
+	}
+	exitCh := make(chan relayExitSignal, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lastActivity := &atomic.Int64{}
+	lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	go runRelayKeepalive(
+		ctx,
+		"upstream",
+		probe,
+		10*time.Millisecond,
+		100*time.Millisecond,
+		lastActivity,
+		time.Now,
+		nil,
+		exitCh,
+	)
+	select {
+	case <-probe.pingCh:
+	case <-time.After(time.Second):
+		t.Fatal("idle relay did not send a protocol ping")
+	}
+}
+
+func TestRunRelayKeepaliveProbesBothIndependentHops(t *testing.T) {
+	clientProbe := &relayPingProbeConn{
+		FrameConn: newPassthroughTestFrameConn(nil, false),
+		pingCh:    make(chan struct{}, 1),
+	}
+	upstreamProbe := &relayPingProbeConn{
+		FrameConn: newPassthroughTestFrameConn(nil, false),
+		pingCh:    make(chan struct{}, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lastActivity := &atomic.Int64{}
+	lastActivity.Store(time.Now().UnixNano())
+	go runRelayKeepalive(ctx, "client", clientProbe, 10*time.Millisecond, 100*time.Millisecond, lastActivity, time.Now, nil, make(chan relayExitSignal, 1))
+	go runRelayKeepalive(ctx, "upstream", upstreamProbe, 10*time.Millisecond, 100*time.Millisecond, lastActivity, time.Now, nil, make(chan relayExitSignal, 1))
+	select {
+	case <-clientProbe.pingCh:
+	case <-time.After(time.Second):
+		t.Fatal("client hop did not receive a protocol ping")
+	}
+	select {
+	case <-upstreamProbe.pingCh:
+	case <-time.After(time.Second):
+		t.Fatal("upstream hop did not receive a protocol ping")
+	}
 }
 
 func TestRelay_FunctionCallOutputBytesPreserved(t *testing.T) {

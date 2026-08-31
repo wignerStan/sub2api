@@ -508,6 +508,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
+		// The map-based forward path has already staged the client body before
+		// this seam runs. Resolve from the original request carriers only; using
+		// the transformed body here would mistake account-scoped retry metadata
+		// for a new client thread after scheduler failover.
 		fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 		if fpIDs != nil && (!isCompactRequest || decoded["client_metadata"] != nil) {
 			if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
