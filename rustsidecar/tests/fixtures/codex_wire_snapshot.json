@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-08-31T10:27:51.746609+00:00",
+  "generated_at": "2026-09-01T09:08:13.682501+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "d58d0e5841e0de08e251673db2d5af8cf3a1ad51",
-      "date": "2026-08-31T08:31:23Z",
-      "message": "Allow models to enable token budgeting by default (#41803)",
-      "html_url": "https://github.com/openai/codex/commit/d58d0e5841e0de08e251673db2d5af8cf3a1ad51"
+      "sha": "2b7c279735d0d096cf7b34fe98938f46792f4d4f",
+      "date": "2026-09-01T07:32:54Z",
+      "message": "Report turn trigger and source in turn analytics (#42003)",
+      "html_url": "https://github.com/openai/codex/commit/2b7c279735d0d096cf7b34fe98938f46792f4d4f"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
@@ -107,7 +107,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 251,
+          "line": 254,
           "symbol": "ChatGPT-Account-ID"
         }
       },
@@ -118,7 +118,7 @@
         "layer": "auth/account",
         "source": {
           "path": "codex-rs/backend-client/src/client.rs",
-          "line": 257,
+          "line": 260,
           "symbol": "X-OpenAI-Fedramp"
         }
       }
