@@ -2087,6 +2087,27 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			h.closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
 			return false
 		}
+		// 池模式：同账号重试
+		if failoverErr.RetryableOnSameAccount {
+			retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
+			if sameAccountRetryAllowed(failoverErr, sameAccountRetryCount[account.ID], retryLimit) {
+				sameAccountRetryCount[account.ID]++
+				retryDelay := sameAccountRetryDelayFor(failoverErr, sameAccountRetryCount[account.ID])
+				reqLog.Warn("openai.websocket.pool_mode_same_account_retry",
+					zap.Int64("account_id", account.ID),
+					zap.Int("upstream_status", failoverErr.StatusCode),
+					zap.Int("retry_limit", retryLimit),
+					zap.Int("retry_count", sameAccountRetryCount[account.ID]),
+					zap.Duration("retry_delay", retryDelay),
+				)
+				select {
+				case <-ctx.Done():
+					return false
+				case <-time.After(retryDelay):
+				}
+				return ensureUserSlotHeld()
+			}
+		}
 		if ctx.Err() != nil {
 			return false
 		}
@@ -3291,6 +3312,7 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 	errorCode := "upstream_ws_failover_exhausted"
 	message := "upstream websocket proxy failed"
 	closeStatus := coderws.StatusInternalError
+	passthroughBody := true
 
 	if failoverErr != nil {
 		if reason := strings.TrimSpace(string(failoverErr.Reason)); reason != "" {
@@ -3301,6 +3323,7 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 			errorType = "api_error"
 			message = service.GrokCredentialUnavailableClientMessage
 			closeStatus = coderws.StatusTryAgainLater
+			passthroughBody = false
 		} else {
 			switch failoverErr.StatusCode {
 			case http.StatusTooManyRequests:
@@ -3308,8 +3331,16 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 				errorType = "rate_limit_error"
 				message = "upstream rate limit exceeded, please retry later"
 				closeStatus = coderws.StatusTryAgainLater
-			case 529, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			case http.StatusInternalServerError:
+				intendedStatus = http.StatusInternalServerError
+				errorType = "internal_server_error"
+				errorCode = "internal_server_error"
+				message = "The server encountered an internal error. Please retry your request."
+				closeStatus = coderws.StatusTryAgainLater
+				passthroughBody = false
+			case 529, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 				intendedStatus = failoverErr.StatusCode
+				errorType = "api_error"
 				message = "upstream service temporarily unavailable"
 				closeStatus = coderws.StatusTryAgainLater
 			case http.StatusUnauthorized, http.StatusForbidden:
@@ -3322,6 +3353,7 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 
 		if h != nil && h.errorPassthroughService != nil {
 			if rule := h.errorPassthroughService.MatchRule(service.PlatformOpenAI, failoverErr.StatusCode, failoverErr.ResponseBody); rule != nil {
+				passthroughBody = rule.PassthroughBody
 				if rule.ResponseCode != nil && *rule.ResponseCode > 0 {
 					intendedStatus = *rule.ResponseCode
 				}
@@ -3336,6 +3368,10 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 				case intendedStatus == http.StatusUnauthorized || intendedStatus == http.StatusForbidden:
 					errorType = "authentication_error"
 					closeStatus = coderws.StatusPolicyViolation
+				case intendedStatus == http.StatusInternalServerError:
+					errorType = "internal_server_error"
+					errorCode = "internal_server_error"
+					closeStatus = coderws.StatusTryAgainLater
 				case intendedStatus >= 500:
 					errorType = "api_error"
 					closeStatus = coderws.StatusTryAgainLater
@@ -3348,7 +3384,7 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 	}
 
 	service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
-	writeOpenAIWSFailoverErrorEvent(conn, failoverErr, intendedStatus, errorType, errorCode, message)
+	writeOpenAIWSFailoverErrorEvent(conn, failoverErr, intendedStatus, errorType, errorCode, message, passthroughBody)
 	closeOpenAIClientWS(conn, closeStatus, message)
 }
 

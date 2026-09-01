@@ -90,7 +90,7 @@ func TestGetPoolModeRetryCount(t *testing.T) {
 				Platform: PlatformOpenAI,
 				Credentials: map[string]any{
 					"pool_mode":             true,
-					"pool_mode_retry_count": 99,
+					"pool_mode_retry_count": 999,
 				},
 			},
 			expected: maxPoolModeRetryCount,

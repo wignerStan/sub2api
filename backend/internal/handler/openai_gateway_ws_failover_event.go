@@ -44,11 +44,12 @@ func writeOpenAIWSFailoverErrorEvent(
 	errorType string,
 	errorCode string,
 	message string,
+	passthroughBody bool,
 ) bool {
 	if conn == nil {
 		return false
 	}
-	payload := buildOpenAIWSFailoverErrorEvent(failoverErr, status, errorType, errorCode, message)
+	payload := buildOpenAIWSFailoverErrorEvent(failoverErr, status, errorType, errorCode, message, passthroughBody)
 	if len(payload) == 0 {
 		return false
 	}
@@ -63,6 +64,7 @@ func buildOpenAIWSFailoverErrorEvent(
 	errorType string,
 	errorCode string,
 	message string,
+	passthroughBody bool,
 ) []byte {
 	if status < http.StatusBadRequest || status > 599 {
 		status = http.StatusBadGateway
@@ -84,7 +86,10 @@ func buildOpenAIWSFailoverErrorEvent(
 		message = "upstream websocket proxy failed"
 	}
 
-	upstream := decodeOpenAIWSFailoverUpstreamEnvelope(failoverErr)
+	var upstream openAIWSFailoverUpstreamEnvelope
+	if passthroughBody {
+		upstream = decodeOpenAIWSFailoverUpstreamEnvelope(failoverErr)
+	}
 	fields := upstream.fields
 	errorBody := upstream.errorBody
 	if len(errorBody) == 0 {
@@ -214,6 +219,11 @@ func openAIWSFailoverErrorHeaders(failoverErr *service.UpstreamFailoverError, ev
 		if isSafeOpenAIWSRetryAfter(candidate) {
 			return map[string]string{"retry-after": candidate}
 		}
+	}
+	// Fallback to a short retry delay (3 seconds) for transient errors
+	// to prevent client CLI from escalating to hours-long exponential backoff.
+	if failoverErr == nil || failoverErr.StatusCode == http.StatusServiceUnavailable || failoverErr.StatusCode == http.StatusTooManyRequests || failoverErr.StatusCode >= 500 {
+		return map[string]string{"retry-after": "3"}
 	}
 	return nil
 }

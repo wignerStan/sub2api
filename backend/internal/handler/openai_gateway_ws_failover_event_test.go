@@ -65,6 +65,7 @@ func TestBuildOpenAIWSFailoverErrorEventPreservesUpstreamQuota(t *testing.T) {
 		"rate_limit_error",
 		"upstream_ws_failover_exhausted",
 		"generic message must not replace the provider error",
+		true,
 	)
 	event := decodeOpenAIWSFailoverErrorEvent(t, payload)
 
@@ -103,6 +104,7 @@ func TestBuildOpenAIWSFailoverErrorEventWrapsHandshakeHTTPBody(t *testing.T) {
 		"rate_limit_error",
 		"upstream_ws_failover_exhausted",
 		"generic message",
+		true,
 	)
 	event := decodeOpenAIWSFailoverErrorEvent(t, payload)
 
@@ -133,6 +135,7 @@ func TestBuildOpenAIWSFailoverErrorEventFallsBackSafely(t *testing.T) {
 		"rate_limit_error",
 		"upstream_ws_failover_exhausted",
 		"upstream rate limit exceeded, please retry later",
+		true,
 	)
 	event := decodeOpenAIWSFailoverErrorEvent(t, payload)
 
@@ -142,7 +145,7 @@ func TestBuildOpenAIWSFailoverErrorEventFallsBackSafely(t *testing.T) {
 		"code":"rate_limit_exceeded",
 		"message":"upstream rate limit exceeded, please retry later"
 	}`, string(event.Error))
-	require.Empty(t, event.Headers)
+	require.Equal(t, map[string]string{"retry-after": "3"}, event.Headers)
 }
 
 func TestCloseOpenAIWSFailoverExhaustedSendsUpstreamErrorBeforeClose(t *testing.T) {

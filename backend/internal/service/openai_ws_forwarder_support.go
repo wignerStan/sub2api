@@ -694,6 +694,7 @@ func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Contex
 }
 
 func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Account, headers http.Header, responseBody []byte, message string) *UpstreamFailoverError {
+	retryableOnSameAccount := account != nil && account.IsPoolMode() && account.IsPoolModeRetryableStatus(http.StatusTooManyRequests)
 	return s.newOpenAIAccountFailoverError(
 		account,
 		http.StatusTooManyRequests,
@@ -701,7 +702,7 @@ func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Accoun
 		responseBody,
 		strings.TrimSpace(message),
 		false,
-		false,
+		retryableOnSameAccount,
 	)
 }
 
