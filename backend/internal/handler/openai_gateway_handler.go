@@ -2048,6 +2048,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
+	var poolRetrySelection *service.AccountSelectionResult
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	wsAttemptMessage := append([]byte(nil), firstMessage...)
@@ -2075,12 +2076,15 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return true
 		}
 	}
-	handleWSFailover := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
-		if ctx.Err() != nil {
+	handleWSFailover := func(selection *service.AccountSelectionResult, failoverErr *service.UpstreamFailoverError) bool {
+		if ctx.Err() != nil || selection == nil || selection.Account == nil {
 			return false
 		}
+		account := selection.Account
 		if failoverErr.ShouldReportAccountScheduleFailure() {
-			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, wsForwardModel, false, nil), false, nil, failoverErr)
+			if !failoverErr.RetryableOnSameAccount {
+				h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, wsForwardModel, false, nil), false, nil, failoverErr)
+			}
 		}
 		releaseAccountSlot()
 		if !failoverErr.ShouldRetryNextAccount() {
@@ -2100,6 +2104,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					zap.Int("retry_count", sameAccountRetryCount[account.ID]),
 					zap.Duration("retry_delay", retryDelay),
 				)
+				poolRetrySelection = selection
 				select {
 				case <-ctx.Done():
 					return false
@@ -2155,38 +2160,46 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		reqLog.Debug("openai.websocket_account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			ctx,
-			apiKey.GroupID,
-			previousResponseID,
-			sessionHash,
-			reqModel,
-			failedAccountIDs,
-			requiredTransport,
-			requiredCapability,
-			false,
-			previousResponseCanMove,
-			!imageIntent,
-			requestPlatform,
-		)
-		if err != nil {
-			reqLog.Warn("openai.websocket_account_select_failed",
-				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
-				zap.Int("excluded_account_count", len(failedAccountIDs)),
+		var selection *service.AccountSelectionResult
+		var scheduleDecision service.OpenAIAccountScheduleDecision
+		var err error
+		if poolRetrySelection != nil {
+			selection = poolRetrySelection
+			poolRetrySelection = nil
+		} else {
+			reqLog.Debug("openai.websocket_account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
+			selection, scheduleDecision, err = h.gatewayService.SelectAccountWithSchedulerForCapability(
+				ctx,
+				apiKey.GroupID,
+				previousResponseID,
+				sessionHash,
+				reqModel,
+				failedAccountIDs,
+				requiredTransport,
+				requiredCapability,
+				false,
+				previousResponseCanMove,
+				!imageIntent,
+				requestPlatform,
 			)
-			if lastFailoverErr != nil {
-				h.closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
-			} else {
-				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
-				cls = classifySelectionFailureError(err, cls)
-				h.closeOpenAIWSFailoverExhausted(c, wsConn, &service.UpstreamFailoverError{
-					StatusCode:    http.StatusServiceUnavailable,
-					Reason:        service.GatewayFailureReason(cls.ErrType),
-					ClientMessage: cls.Message,
-				})
+			if err != nil {
+				reqLog.Warn("openai.websocket_account_select_failed",
+					zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
+					zap.Int("excluded_account_count", len(failedAccountIDs)),
+				)
+				if lastFailoverErr != nil {
+					h.closeOpenAIWSFailoverExhausted(c, wsConn, lastFailoverErr)
+				} else {
+					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
+					cls = classifySelectionFailureError(err, cls)
+					h.closeOpenAIWSFailoverExhausted(c, wsConn, &service.UpstreamFailoverError{
+						StatusCode:    http.StatusServiceUnavailable,
+						Reason:        service.GatewayFailureReason(cls.ErrType),
+						ClientMessage: cls.Message,
+					})
+				}
+				return
 			}
-			return
 		}
 		if selection == nil || selection.Account == nil {
 			if lastFailoverErr != nil {
@@ -2285,7 +2298,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			}
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
-				if handleWSFailover(account, failoverErr) {
+				if handleWSFailover(selection, failoverErr) {
 					continue
 				}
 				return
@@ -2620,7 +2633,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					wsFirstMessage = wsAttemptMessage
 					continue
 				}
-				if handleWSFailover(account, failoverErr) {
+				if handleWSFailover(selection, failoverErr) {
 					break
 				}
 				return
