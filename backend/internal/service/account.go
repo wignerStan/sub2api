@@ -2162,6 +2162,24 @@ func (a *Account) ResolveOpenAIResponsesWebSocketV2Mode(defaultMode string) stri
 	return resolvedDefault
 }
 
+// HasExplicitOpenAIResponsesWebSocketV2Mode 检查账号是否显式配置了 mode 字符串（而非旧版 boolean 开关）。
+func (a *Account) HasExplicitOpenAIResponsesWebSocketV2Mode() bool {
+	if a == nil || a.Extra == nil {
+		return false
+	}
+	if a.IsOpenAIOAuthLike() {
+		if v, ok := a.Extra["openai_oauth_responses_websockets_v2_mode"].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	if a.IsOpenAIApiKey() {
+		if v, ok := a.Extra["openai_apikey_responses_websockets_v2_mode"].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // IsOpenAIWSForceHTTPEnabled 返回账号级"强制 HTTP"开关。
 // 字段：accounts.extra.openai_ws_force_http。
 func (a *Account) IsOpenAIWSForceHTTPEnabled() bool {

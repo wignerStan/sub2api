@@ -293,8 +293,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	forceHTTPBridge := account.Platform == PlatformGrok ||
 		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account))
 	modeRouterV2Enabled := s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled
+	useModeRouter := modeRouterV2Enabled || account.HasExplicitOpenAIResponsesWebSocketV2Mode()
 	ingressMode := OpenAIWSIngressModeCtxPool
-	if modeRouterV2Enabled && !forceHTTPBridge {
+	if useModeRouter && !forceHTTPBridge {
 		ingressMode = account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault)
 		if ingressMode == OpenAIWSIngressModeOff {
 			return NewOpenAIWSClientCloseError(
@@ -336,7 +337,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if !forceHTTPBridge && wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 		return fmt.Errorf("websocket ingress requires ws_v2 transport, got=%s", wsDecision.Transport)
 	}
-	dedicatedMode := modeRouterV2Enabled && ingressMode == OpenAIWSIngressModeDedicated
+	dedicatedMode := useModeRouter && ingressMode == OpenAIWSIngressModeDedicated
 
 	wsURL := ""
 	wsHost := "-"

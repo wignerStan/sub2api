@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/model"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -205,6 +206,94 @@ func TestCloseOpenAIWSFailoverExhaustedSendsUpstreamErrorBeforeClose(t *testing.
 	require.ErrorAs(t, err, &closeErr)
 	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
 	require.Equal(t, "upstream rate limit exceeded, please retry later", closeErr.Reason)
+
+	select {
+	case err := <-serverErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("websocket failover close did not complete")
+	}
+}
+
+type testErrorPassthroughRepo struct {
+	rules []*model.ErrorPassthroughRule
+}
+
+func (r *testErrorPassthroughRepo) List(ctx context.Context) ([]*model.ErrorPassthroughRule, error) {
+	return r.rules, nil
+}
+func (r *testErrorPassthroughRepo) GetByID(ctx context.Context, id int64) (*model.ErrorPassthroughRule, error) {
+	return nil, nil
+}
+func (r *testErrorPassthroughRepo) Create(ctx context.Context, rule *model.ErrorPassthroughRule) (*model.ErrorPassthroughRule, error) {
+	return rule, nil
+}
+func (r *testErrorPassthroughRepo) Update(ctx context.Context, rule *model.ErrorPassthroughRule) (*model.ErrorPassthroughRule, error) {
+	return rule, nil
+}
+func (r *testErrorPassthroughRepo) Delete(ctx context.Context, id int64) error {
+	return nil
+}
+
+func TestCloseOpenAIWSFailoverExhausted_ErrorPassthroughRule(t *testing.T) {
+	customCode := http.StatusTooManyRequests
+	customMsg := "Custom tier limit reached: please upgrade your plan"
+	rule := &model.ErrorPassthroughRule{
+		ID:            1,
+		Name:          "Test Rule",
+		Enabled:       true,
+		Priority:      10,
+		ErrorCodes:    []int{403},
+		Platforms:     []string{"openai"},
+		ResponseCode:  &customCode,
+		CustomMessage: &customMsg,
+	}
+
+	epSvc := service.NewErrorPassthroughService(&testErrorPassthroughRepo{rules: []*model.ErrorPassthroughRule{rule}}, nil)
+	h := &OpenAIGatewayHandler{
+		errorPassthroughService: epSvc,
+	}
+
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = r
+		h.closeOpenAIWSFailoverExhausted(ginCtx, conn, &service.UpstreamFailoverError{
+			StatusCode:   http.StatusForbidden,
+			ResponseBody: []byte(`{"error":{"message":"forbidden by upstream policy"}}`),
+		})
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelRead()
+	msgType, payload, err := clientConn.Read(readCtx)
+	require.NoError(t, err)
+	require.Equal(t, coderws.MessageText, msgType)
+
+	event := decodeOpenAIWSFailoverErrorEvent(t, payload)
+	require.Equal(t, "error", event.Type)
+	require.Equal(t, http.StatusTooManyRequests, event.Status)
+
+	_, _, err = clientConn.Read(readCtx)
+	var closeErr coderws.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
+	require.Equal(t, customMsg, closeErr.Reason)
 
 	select {
 	case err := <-serverErr:

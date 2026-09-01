@@ -264,3 +264,40 @@ func TestOpenAIWSProtocolResolver_Resolve_ModeRouterV2(t *testing.T) {
 		require.Equal(t, "account_concurrency_invalid", decision.Reason)
 	})
 }
+
+func TestOpenAIWSProtocolResolver_Resolve_ExplicitAccountModeWithoutModeRouterV2Enabled(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = false // Global mode router is OFF
+
+	t.Run("explicit http_bridge mode routes to http_sse even when ModeRouterV2Enabled is false", func(t *testing.T) {
+		account := &Account{
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Concurrency: 1,
+			Extra: map[string]any{
+				"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge,
+			},
+		}
+		decision := NewOpenAIWSProtocolResolver(cfg).Resolve(account)
+		require.Equal(t, OpenAIUpstreamTransportHTTPSSE, decision.Transport)
+		require.Equal(t, "ws_v2_mode_http_bridge", decision.Reason)
+	})
+
+	t.Run("explicit passthrough mode routes to ws v2 even when ModeRouterV2Enabled is false", func(t *testing.T) {
+		account := &Account{
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeOAuth,
+			Concurrency: 1,
+			Extra: map[string]any{
+				"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
+			},
+		}
+		decision := NewOpenAIWSProtocolResolver(cfg).Resolve(account)
+		require.Equal(t, OpenAIUpstreamTransportResponsesWebsocketV2, decision.Transport)
+		require.Equal(t, "ws_v2_mode_passthrough", decision.Reason)
+	})
+}
