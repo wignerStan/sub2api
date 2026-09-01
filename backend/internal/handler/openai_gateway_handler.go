@@ -3307,6 +3307,7 @@ func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failover
 	}
 
 	service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
+	writeOpenAIWSFailoverErrorEvent(conn, failoverErr, intendedStatus, errorType, errorCode, message)
 	closeOpenAIClientWS(conn, closeStatus, message)
 }
 
