@@ -705,22 +705,6 @@ func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Accoun
 	)
 }
 
-// newOpenAIWSDialRateLimitFailoverError keeps the HTTP rejection body
-// and headers captured by the WebSocket dialer. The downstream socket
-// has already upgraded, so the handler needs this original payload to
-// reconstruct a protocol-level error after account failover is exhausted.
-func (s *OpenAIGatewayService) newOpenAIWSDialRateLimitFailoverError(account *Account, dialErr *openAIWSDialError, message string) *UpstreamFailoverError {
-	if dialErr == nil {
-		return s.newOpenAIWSRateLimitFailoverError(account, nil, nil, message)
-	}
-	return s.newOpenAIWSRateLimitFailoverError(
-		account,
-		dialErr.ResponseHeaders,
-		dialErr.ResponseBody,
-		message,
-	)
-}
-
 func classifyOpenAIWSErrorEventFromRaw(codeRaw, errTypeRaw, msgRaw string) (string, bool) {
 	code := strings.ToLower(strings.TrimSpace(codeRaw))
 	errType := strings.ToLower(strings.TrimSpace(errTypeRaw))

@@ -805,19 +805,7 @@ func TestResponsesWebSocketCredentialFailoverLoop(t *testing.T) {
 		writeFirst(t, conn)
 
 		readCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		msgType, payload, err := conn.Read(readCtx)
-		require.NoError(t, err)
-		require.Equal(t, coderws.MessageText, msgType)
-		event := decodeOpenAIWSFailoverErrorEvent(t, payload)
-		require.Equal(t, "error", event.Type)
-		require.Equal(t, http.StatusServiceUnavailable, event.Status)
-		var eventError struct {
-			Message string `json:"message"`
-		}
-		require.NoError(t, json.Unmarshal(event.Error, &eventError))
-		require.Contains(t, eventError.Message, service.GrokCredentialUnavailableClientMessage)
-
-		_, _, err = conn.Read(readCtx)
+		_, _, err := conn.Read(readCtx)
 		cancel()
 		var closeErr coderws.CloseError
 		require.ErrorAs(t, err, &closeErr)
