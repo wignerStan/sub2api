@@ -3365,6 +3365,19 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 			}
 		}
 
+		if failoverErr.ClientStatusCode > 0 {
+			intendedStatus = failoverErr.ClientStatusCode
+			if failoverErr.ClientStatusCode == http.StatusInternalServerError {
+				errorType = "internal_server_error"
+				errorCode = "internal_server_error"
+				message = "The server encountered an internal error. Please retry your request."
+				passthroughBody = false
+			}
+		}
+		if failoverErr.ClientMessage != "" {
+			message = failoverErr.ClientMessage
+		}
+
 		if h != nil && h.errorPassthroughService != nil {
 			if rule := h.errorPassthroughService.MatchRule(service.PlatformOpenAI, failoverErr.StatusCode, failoverErr.ResponseBody); rule != nil {
 				passthroughBody = rule.PassthroughBody

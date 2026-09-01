@@ -358,6 +358,10 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
 		failoverErr.SameAccountRetryDeadline = s.openAIOAuth429RetryDeadline(account)
 		failoverErr.SameAccountRetryDelay = openAIOAuth429SameAccountRetryDelay(responseHeaders, failoverErr.SameAccountRetryDeadline)
 	}
+	if account != nil && account.IsCustomErrorCodesEnabled() && !account.ShouldHandleErrorCode(statusCode) {
+		failoverErr.ClientStatusCode = http.StatusInternalServerError
+		failoverErr.ClientMessage = "The server encountered an internal error. Please retry your request."
+	}
 	return failoverErr
 }
 
