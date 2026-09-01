@@ -3329,7 +3329,8 @@ func (h *OpenAIGatewayHandler) closeOpenAIWSFailoverExhausted(c *gin.Context, co
 			case http.StatusTooManyRequests:
 				intendedStatus = http.StatusTooManyRequests
 				errorType = "rate_limit_error"
-				message = "upstream rate limit exceeded, please retry later"
+				errorCode = "rate_limit_exceeded"
+				message = "Rate limit reached. Please try again in 3s."
 				closeStatus = coderws.StatusTryAgainLater
 			case http.StatusInternalServerError:
 				intendedStatus = http.StatusInternalServerError

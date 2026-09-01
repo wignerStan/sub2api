@@ -208,7 +208,7 @@ func TestCloseOpenAIWSFailoverExhaustedSendsUpstreamErrorBeforeClose(t *testing.
 	var closeErr coderws.CloseError
 	require.ErrorAs(t, err, &closeErr)
 	require.Equal(t, coderws.StatusTryAgainLater, closeErr.Code)
-	require.Equal(t, "upstream rate limit exceeded, please retry later", closeErr.Reason)
+	require.Equal(t, "Rate limit reached. Please try again in 3s.", closeErr.Reason)
 
 	select {
 	case err := <-serverErr:
