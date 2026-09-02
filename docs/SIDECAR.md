@@ -1,0 +1,78 @@
+# Sub2API ↔ sub2api-sidecar Contract
+
+The Rust sidecar lives in its own repository (`sub2api-sidecar`, split from
+this repo's archived `rustsidecar/` tree). This document is the interface
+contract the Go gateway depends on.
+
+## Layering
+
+| Layer | Owns |
+|---|---|
+| Go gateway | business logic: accounts, groups, quota, scheduling, billing, REST web API |
+| Rust sidecar | egress boundary: rustls TLS disguise, identity mimic, loopback E2EE, Responses WS pump, DB-direct account resolution |
+
+## Routing boundaries
+
+Through the sidecar (OAuth-origin hosts only — `chatgpt.com`,
+`auth.openai.com`; `api.openai.com` API-key traffic stays native Go):
+
+- `/backend-api/codex/*`
+- `/backend-api/conversation`, `/backend-api/conversation/*`
+- `/backend-api/wham/*`
+- `/backend-api/files`
+- `auth.openai.com` `/api/accounts/*`
+
+Never through the sidecar (sidecar blocks them; Go keeps Chrome TLS
+impersonation to satisfy Cloudflare):
+
+- `/backend-api/settings/*`, `/backend-api/accounts/*`,
+  `/backend-api/subscriptions/*` (ChatGPT web management surface)
+
+## Loopback control headers (Go → sidecar)
+
+| Header | Meaning |
+|---|---|
+| `x-s2s-token` | shared secret (`SUB2API_SIDECAR_TOKEN`) |
+| `x-s2s-enc: 1` | request loopback E2EE negotiation / response echo on 101 |
+| `x-upstream-url` | real upstream URL the sidecar must dial |
+| `x-upstream-proxy` | base64-encoded per-account upstream proxy (`socks5`→`socks5h` normalized) |
+| `x-upstream-account-id` | scheduler-owned account ID (overrides any client-supplied value) |
+
+`stripSidecarControlHeaders` removes all of these from client input before
+rebuilding them from trusted scheduler arguments (anti-smuggling). Dot-segment
+and userinfo URLs are rejected.
+
+## E2EE framing
+
+Record: `[0xE2][version=1][len u32 BE][nonce 12B][ciphertext+16B tag]`,
+AES-256-GCM, HKDF-SHA256 with info `"loopback-channel"` (WS) /
+`"forward-channel"` (HTTP), max payload 64 MB (DoS bound). Truncated or
+trailing-byte streams fail closed (`errSidecarE2EETrunc` /
+`errSidecarE2EETrailing`). Go: `service/sidecar_e2ee.go`; Rust:
+`src/e2ee.rs` (byte-for-byte parity — change both together).
+
+## WS pump semantics
+
+- The sidecar dials the upstream **before** answering the local upgrade; an
+  upstream 429/401 relays the original status, `Retry-After`,
+  `X-RateLimit-*` headers and JSON body to the client (Codex CLI retry
+  semantics must survive — never invent a bare 429).
+- Responses WS has a 60-minute absolute upstream lifetime; ping only guards
+  idle. Root/fork (main/subagent) sessions are isolated by
+  `thread_id`/`conversation_id`, never by shared `session_id`.
+- WS and HTTP auto-passthrough are mutually exclusive for OAuth accounts;
+  under `SUB2API_PATCH` the gateway forces WS v2 + `passthrough` mode.
+
+## Deployment
+
+`systemd` pair on the host: `sub2api.service` (Go) + `sub2api-sidecar.service`
+(Rust, `SUB2API_SIDECAR_ADDR=127.0.0.1:21333`, `SUB2API_SIDECAR_TOKEN=…`,
+`DATABASE_URL=postgres://…`). Gateway drop-in sets
+`SUB2API_SIDECAR_ENABLED=true`, `SUB2API_SIDECAR_BASE_URL=http://127.0.0.1:21333`,
+same token. The gateway fail-closes to the native transport if the sidecar is
+not configured; a configured-but-unreachable sidecar surfaces upstream errors
+honestly. Start sidecar first, then gateway.
+
+Capture utilities for wire debugging (`scripts/` in the sidecar repo):
+`dummy_codex_server.py` (zero-filter dump server) and `codex_dump_proxy.py`
+(dump-and-forward proxy in front of a running gateway).
