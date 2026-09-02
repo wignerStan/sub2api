@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,12 +25,12 @@ func TestReadOpenAIWSClientMessage_ControlCloseFrames(t *testing.T) {
 		wantReason    string
 	}{
 		{
-			name:          "inter-turn idle sends normal close",
+			name:          "inter-turn idle sends normal close for generic clients",
 			timeout:       25 * time.Millisecond,
 			timeoutStatus: coderws.StatusNormalClosure,
-			timeoutReason: "websocket idle timeout",
+			timeoutReason: openAIWSClientInterTurnIdleReason,
 			wantStatus:    coderws.StatusNormalClosure,
-			wantReason:    "websocket idle timeout",
+			wantReason:    openAIWSClientInterTurnIdleReason,
 		},
 		{
 			name:          "first message timeout sends policy close",
@@ -100,6 +101,254 @@ func TestReadOpenAIWSClientMessage_ControlCloseFrames(t *testing.T) {
 				t.Fatal("server read goroutine did not exit after close handshake")
 			}
 		})
+	}
+}
+
+func TestReadOpenAIWSClientMessage_InterTurnIdleProbesHealthyCodexPeer(t *testing.T) {
+	controlCtx, cancelControl := context.WithCancelCause(
+		withOpenAIWSClientIdleProbe(context.Background(), true),
+	)
+	defer cancelControl(context.Canceled)
+
+	serverResult := make(chan openAIWSClientReadResult, 1)
+	readStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverResult <- openAIWSClientReadResult{err: err}
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		close(readStarted)
+		messageType, payload, readErr := ReadOpenAIWSClientMessage(
+			controlCtx,
+			conn,
+			50*time.Millisecond,
+			coderws.StatusNormalClosure,
+			openAIWSClientInterTurnIdleReason,
+		)
+		serverResult <- openAIWSClientReadResult{messageType: messageType, payload: payload, err: readErr}
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+	<-readStarted
+
+	// Keep the peer reader active so coder/websocket can process server pings
+	// and emit pongs while the Codex session has no application frames to send.
+	clientReadDone := make(chan error, 1)
+	go func() {
+		_, _, readErr := clientConn.Read(context.Background())
+		clientReadDone <- readErr
+	}()
+
+	// Cross multiple application-idle intervals. The old behavior closed the
+	// root socket at the first interval even though the transport was healthy.
+	time.Sleep(180 * time.Millisecond)
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.6-sol"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	select {
+	case result := <-serverResult:
+		require.NoError(t, result.err)
+		require.Equal(t, coderws.MessageText, result.messageType)
+		require.JSONEq(t, `{"type":"response.create","model":"gpt-5.6-sol"}`, string(result.payload))
+	case <-time.After(time.Second):
+		t.Fatal("healthy idle Codex websocket did not accept the next turn")
+	}
+
+	select {
+	case <-clientReadDone:
+	case <-time.After(time.Second):
+		t.Fatal("client reader did not exit after server transport closed")
+	}
+}
+
+func TestReadOpenAIWSClientMessage_NonTerminalUpstreamProbeKeepsClientAlive(t *testing.T) {
+	controlCtx := withOpenAIWSClientIdleProbe(context.Background(), true)
+	probeCalls := atomic.Int32{}
+	probeFailed := make(chan struct{}, 1)
+	serverResult := make(chan openAIWSClientReadResult, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverResult <- openAIWSClientReadResult{err: err}
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		msgType, payload, readErr := ReadOpenAIWSClientMessageWithIdlePing(
+			controlCtx,
+			conn,
+			500*time.Millisecond,
+			coderws.StatusNormalClosure,
+			openAIWSClientInterTurnIdleReason,
+			func(context.Context) error {
+				probeCalls.Add(1)
+				select {
+				case probeFailed <- struct{}{}:
+				default:
+				}
+				return newOpenAIWSIdlePingNonTerminalError(errors.New("upstream lease retired"))
+			},
+		)
+		serverResult <- openAIWSClientReadResult{messageType: msgType, payload: payload, err: readErr}
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	// Keep the downstream reader active so the server's protocol Ping receives
+	// a Pong. The auxiliary upstream probe fails independently and must not close
+	// this client socket.
+	clientReadDone := make(chan error, 1)
+	go func() {
+		_, _, readErr := clientConn.Read(context.Background())
+		clientReadDone <- readErr
+	}()
+
+	select {
+	case <-probeFailed:
+	case <-clientReadDone:
+		t.Fatal("client was closed by a non-terminal upstream probe failure")
+	case <-time.After(time.Second):
+		t.Fatal("non-terminal upstream probe was not attempted")
+	}
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.6-sol"}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	select {
+	case result := <-serverResult:
+		require.NoError(t, result.err)
+		require.Equal(t, coderws.MessageText, result.messageType)
+		require.JSONEq(t, `{"type":"response.create","model":"gpt-5.6-sol"}`, string(result.payload))
+	case <-time.After(time.Second):
+		t.Fatal("client frame was not accepted after upstream probe failure")
+	}
+	require.Equal(t, int32(1), probeCalls.Load())
+
+	select {
+	case <-clientReadDone:
+	case <-time.After(time.Second):
+		t.Fatal("client reader did not terminate after server transport closed")
+	}
+}
+
+func TestReadOpenAIWSClientMessage_ProbesBeforeApplicationIdleDeadline(t *testing.T) {
+	controlCtx := withOpenAIWSClientIdleProbe(context.Background(), true)
+	pingSeen := make(chan struct{}, 1)
+	serverReady := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		close(serverReady)
+		_, _, _ = ReadOpenAIWSClientMessage(controlCtx, conn, 600*time.Millisecond, coderws.StatusNormalClosure, openAIWSClientInterTurnIdleReason)
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{
+		OnPingReceived: func(context.Context, []byte) bool {
+			select {
+			case pingSeen <- struct{}{}:
+			default:
+			}
+			return true
+		},
+	})
+	cancelDial()
+	require.NoError(t, err)
+	defer clientConn.CloseNow()
+	<-serverReady
+
+	// The configured application deadline is intentionally longer than the
+	// heartbeat interval (600ms/3).  A protocol Ping must arrive first; the old
+	// implementation stayed silent until the deadline itself fired.
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, readErr := clientConn.Read(context.Background())
+		readDone <- readErr
+	}()
+	select {
+	case <-pingSeen:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("did not observe a protocol ping before the application idle deadline")
+	}
+	_ = clientConn.CloseNow()
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("client reader did not terminate")
+	}
+}
+
+func TestReadOpenAIWSClientMessage_InterTurnIdleClosesUnresponsiveCodexPeer(t *testing.T) {
+	controlCtx, cancelControl := context.WithCancelCause(
+		withOpenAIWSClientIdleProbe(context.Background(), true),
+	)
+	defer cancelControl(context.Canceled)
+
+	serverResult := make(chan error, 1)
+	readStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverResult <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		close(readStarted)
+		_, _, err = ReadOpenAIWSClientMessage(
+			controlCtx,
+			conn,
+			25*time.Millisecond,
+			coderws.StatusNormalClosure,
+			openAIWSClientInterTurnIdleReason,
+		)
+		serverResult <- err
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+	<-readStarted
+
+	// Do not read yet: without a peer reader the ping cannot be serviced, so a
+	// genuinely stuck client is still reclaimed after the bounded probe.
+	time.Sleep(650 * time.Millisecond)
+	readCtx, cancelRead := context.WithTimeout(context.Background(), time.Second)
+	_, _, err = clientConn.Read(readCtx)
+	cancelRead()
+	var clientClose coderws.CloseError
+	require.ErrorAs(t, err, &clientClose)
+	require.Equal(t, coderws.StatusNormalClosure, clientClose.Code)
+	require.Equal(t, openAIWSClientInterTurnIdleReason, clientClose.Reason)
+
+	select {
+	case serverErr := <-serverResult:
+		var closeErr *OpenAIWSClientCloseError
+		require.ErrorAs(t, serverErr, &closeErr)
+		require.Equal(t, coderws.StatusNormalClosure, closeErr.StatusCode())
+		require.Equal(t, openAIWSClientInterTurnIdleReason, closeErr.Reason())
+	case <-time.After(time.Second):
+		t.Fatal("server read goroutine did not exit after idle liveness failure")
 	}
 }
 
