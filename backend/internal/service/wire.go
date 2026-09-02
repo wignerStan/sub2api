@@ -32,6 +32,13 @@ type BuildInfo struct {
 	BuildType string
 }
 
+// ProvideOpenAISidecarRuntime installs the process-wide gateway.sidecar routing
+// config so OAuth lifecycle egress without direct config access (PAT whoami,
+// agent-identity registration, usage probes) leaves through the rustls sidecar.
+func ProvideOpenAISidecarRuntime(cfg *config.Config) {
+	SetSidecarRuntimeConfig(cfg)
+}
+
 // ProvidePricingService creates and initializes PricingService
 func ProvidePricingService(cfg *config.Config, remoteClient PricingRemoteClient) (*PricingService, error) {
 	svc := NewPricingService(cfg, remoteClient)
