@@ -1,13 +1,133 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	coderws "github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
+
+type recordingOpenAIWSDialer struct {
+	urls []string
+}
+
+func (d *recordingOpenAIWSDialer) Dial(
+	_ context.Context,
+	wsURL string,
+	_ http.Header,
+	_ string,
+) (openAIWSClientConn, int, http.Header, error) {
+	d.urls = append(d.urls, wsURL)
+	return nil, 0, nil, errors.New("fallback used")
+}
+
+func TestSidecarOpenAIWSClientDialerFallsBackOutsideCodex(t *testing.T) {
+	fallback := &recordingOpenAIWSDialer{}
+	settings := SidecarSettings{
+		Enabled: true,
+		BaseURL: "http://127.0.0.1:9",
+		Token:   "tok",
+	}
+	dialer := &sidecarOpenAIWSClientDialer{cfg: &config.Config{}, settings: settings, fallback: fallback}
+
+	_, _, _, err := dialer.Dial(context.Background(), "wss://api.openai.com/v1/responses", http.Header{}, "")
+	require.EqualError(t, err, "fallback used")
+	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, _, err = dialer.Dial(ctx, "wss://chatgpt.com/backend-api/codex/call_proxy", http.Header{}, "")
+	require.Error(t, err)
+	require.NotEqual(t, "fallback used", err.Error())
+	require.Equal(t, []string{"wss://api.openai.com/v1/responses"}, fallback.urls)
+}
+
+func TestSidecarOpenAIWSClientDialerTrustedAccountSelector(t *testing.T) {
+	seen := make(chan [2]string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- [2]string{
+			r.Header.Get(SidecarAccountIDHeader),
+			r.Header.Get("x-account-id"),
+		}
+		http.Error(w, "expected handshake failure", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	dialer := &sidecarOpenAIWSClientDialer{
+		cfg: &config.Config{},
+		settings: SidecarSettings{
+			Enabled: true,
+			BaseURL: server.URL,
+			Token:   "tok",
+		},
+		fallback: &recordingOpenAIWSDialer{},
+	}
+	headers := http.Header{}
+	headers.Set(SidecarAccountIDHeader, "999")
+	headers.Set("x-account-id", "998")
+	_, _, _, err := dialer.DialForAccount(
+		context.Background(),
+		"wss://chatgpt.com/backend-api/codex/call_proxy",
+		headers,
+		"",
+		42,
+	)
+	require.Error(t, err)
+	require.Equal(t, [2]string{"42", ""}, <-seen)
+}
+
+func TestStripSidecarControlHeaders(t *testing.T) {
+	headers := http.Header{
+		"Authorization":         {"Bearer keep"},
+		"X-Account-Id":          {"1"},
+		"X-Upstream-Account-Id": {"2"},
+		"X-Upstream-Url":        {"https://example.invalid"},
+		"X-Upstream-Proxy":      {"proxy"},
+		"X-S2s-Token":           {"token"},
+		"X-S2s-Enc":             {"1"},
+		"X-S2s-Enc-Len":         {"10"},
+	}
+	stripSidecarControlHeaders(headers)
+	require.Equal(t, "Bearer keep", headers.Get("Authorization"))
+	for _, name := range []string{
+		"x-account-id",
+		SidecarAccountIDHeader,
+		"x-upstream-url",
+		"x-upstream-proxy",
+		"x-s2s-token",
+		SidecarE2EEHeader,
+		SidecarE2EEOrigLenHeader,
+	} {
+		require.Empty(t, headers.Get(name), name)
+	}
+}
+
+func TestSidecarOpenAIWSClientDialerRejectsInvalidProxy(t *testing.T) {
+	fallback := &recordingOpenAIWSDialer{}
+	settings := SidecarSettings{
+		Enabled: true,
+		BaseURL: "http://127.0.0.1:9",
+		Token:   "tok",
+	}
+	dialer := &sidecarOpenAIWSClientDialer{cfg: &config.Config{}, settings: settings, fallback: fallback}
+
+	_, _, _, err := dialer.Dial(
+		context.Background(),
+		"wss://chatgpt.com/backend-api/codex/call_proxy",
+		http.Header{},
+		"ftp://127.0.0.1:21",
+	)
+	require.Error(t, err)
+	require.Empty(t, fallback.urls)
+}
 
 func TestCoderOpenAIWSClientDialer_ProxyHTTPClientReuse(t *testing.T) {
 	dialer := newDefaultOpenAIWSClientDialer()
@@ -111,6 +231,170 @@ func TestCoderOpenAIWSClientDialer_ProxyTransportTLSHandshakeTimeout(t *testing.
 	require.Equal(t, 10*time.Second, transport.TLSHandshakeTimeout)
 }
 
-func TestCoderOpenAIWSClientConn_DoesNotSupportIdlePingWithoutReader(t *testing.T) {
+func TestCoderOpenAIWSClientConn_NilDoesNotSupportIdlePingWithoutReader(t *testing.T) {
 	require.False(t, (&coderOpenAIWSClientConn{}).SupportsIdlePingWithoutReader())
+}
+
+func TestCoderOpenAIWSClientConn_PingStartsReaderPumpAndQueuesData(t *testing.T) {
+	serverReady := make(chan struct{})
+	serverDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			close(serverDone)
+			return
+		}
+		defer func() {
+			_ = conn.CloseNow()
+			close(serverDone)
+		}()
+		close(serverReady)
+		// Keep a real Reader active so coder/websocket can consume the ping and
+		// produce its pong.  The data frame is written while the client adapter
+		// is still between turns; it must be available to the next ReadMessage.
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for {
+				if _, _, readErr := conn.Read(context.Background()); readErr != nil {
+					return
+				}
+			}
+		}()
+		time.Sleep(20 * time.Millisecond)
+		writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+		_ = conn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.completed"}`))
+		cancelWrite()
+		<-readDone
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	client, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	adapter := &coderOpenAIWSClientConn{conn: client}
+	<-serverReady
+
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), time.Second)
+	require.NoError(t, adapter.Ping(pingCtx))
+	cancelPing()
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), time.Second)
+	payload, err := adapter.ReadMessage(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"response.completed"}`, string(payload))
+	require.True(t, adapter.SupportsIdlePingWithoutReader())
+	require.NoError(t, adapter.Close())
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-serverDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestCoderOpenAIWSClientConn_ReadPumpDoesNotStarvePongBehindBurst(t *testing.T) {
+	serverReady := make(chan struct{})
+	serverDone := make(chan struct{})
+	serverHold := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			close(serverDone)
+			return
+		}
+		defer func() {
+			_ = conn.CloseNow()
+			close(serverDone)
+		}()
+		close(serverReady)
+		// Keep the server reader active so the client's protocol Ping receives a
+		// Pong.  Send more frames than the old bounded pump queue could hold
+		// before the client starts consuming; the reader must continue draining
+		// control frames instead of blocking on data delivery.
+		go func() {
+			for {
+				if _, _, readErr := conn.Read(context.Background()); readErr != nil {
+					return
+				}
+			}
+		}()
+		for i := 0; i < 128; i++ {
+			writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+			if writeErr := conn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.output_text.delta","index":0}`)); writeErr != nil {
+				cancelWrite()
+				return
+			}
+			cancelWrite()
+		}
+		<-serverHold
+	}))
+	defer server.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+	client, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	adapter := &coderOpenAIWSClientConn{conn: client}
+	defer adapter.Close()
+	<-serverReady
+
+	// Give the server enough time to queue the burst in the transport before
+	// probing.  The exact sleep is deliberately below the test timeout.
+	time.Sleep(30 * time.Millisecond)
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), time.Second)
+	require.NoError(t, adapter.Ping(pingCtx))
+	cancelPing()
+	readCtx, cancelRead := context.WithTimeout(context.Background(), time.Second)
+	_, err = adapter.ReadMessage(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	close(serverHold)
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("burst read-pump server did not terminate")
+	}
+}
+
+func TestCoderOpenAIWSClientConn_GracefulCloseWithActiveReaderPump(t *testing.T) {
+	serverDone := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		// Keep a reader active so the peer can consume the close handshake.
+		for {
+			_, _, readErr := conn.Read(context.Background())
+			if readErr != nil {
+				serverDone <- readErr
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client, _, err := coderws.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	adapter := &coderOpenAIWSClientConn{conn: client}
+	require.True(t, adapter.ensureReadPump())
+
+	closeErr := adapter.CloseGracefully(coderws.StatusNormalClosure, "done")
+	// coder/websocket may report the peer's close frame to the concurrently
+	// running pump while Close waits for its handshake; the wire close is still
+	// valid, so both nil and net.ErrClosed-style wrappers are acceptable here.
+	_ = closeErr
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not observe graceful close")
+	}
 }
