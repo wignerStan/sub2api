@@ -2035,15 +2035,8 @@ func isSub2apiPatchEnabled() bool {
 // 新字段：accounts.extra.openai_passthrough。
 // 兼容字段：accounts.extra.openai_oauth_passthrough（历史 OAuth 开关）。
 // 字段缺失或类型不正确时，按 false（关闭）处理。
-// 当环境变量 SUB2API_PATCH 启用时，OpenAI OAuth 账号强制透传。
 func (a *Account) IsOpenAIPassthroughEnabled() bool {
-	if a == nil || !a.IsOpenAI() {
-		return false
-	}
-	if isSub2apiPatchEnabled() && a.IsOpenAIOAuthLike() {
-		return true
-	}
-	if a.Extra == nil {
+	if a == nil || !a.IsOpenAI() || a.Extra == nil {
 		return false
 	}
 	if enabled, ok := a.Extra["openai_passthrough"].(bool); ok {

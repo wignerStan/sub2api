@@ -206,6 +206,9 @@ func (a *Account) GetCodexFingerprintMode() codexFingerprintMode {
 	if a == nil || !a.IsOpenAIOAuthLike() {
 		return codexFingerprintOff
 	}
+	if isSub2apiPatchEnabled() {
+		return codexFingerprintOff
+	}
 	return codexFingerprintModeFromExtra(a.Extra)
 }
 

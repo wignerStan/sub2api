@@ -328,20 +328,17 @@ func TestAccount_OpenAIWSExtraFlags(t *testing.T) {
 func TestAccount_Sub2apiPatchOverride(t *testing.T) {
 	t.Setenv("SUB2API_PATCH", "true")
 
-	t.Run("OpenAI OAuth 账号强制透传且开启 WS passthrough", func(t *testing.T) {
+	t.Run("OpenAI OAuth 账号强制开启 WS v2 且强制 WS passthrough 模式", func(t *testing.T) {
 		account := &Account{
 			Platform: PlatformOpenAI,
 			Type:     AccountTypeOAuth,
 			Extra: map[string]any{
-				"openai_passthrough":                        false,
-				"openai_oauth_passthrough":                  false,
-				"openai_oauth_responses_websockets_v2_mode": "off",
+				"openai_oauth_responses_websockets_v2_mode":    "off",
 				"openai_oauth_responses_websockets_v2_enabled": false,
 			},
 		}
-		require.True(t, account.IsOpenAIPassthroughEnabled(), "OAuth 必须强制 passthrough = true")
 		require.True(t, account.IsOpenAIResponsesWebSocketV2Enabled(), "OAuth 必须强制 ws v2 = true")
-		require.Equal(t, OpenAIWSIngressModePassthrough, account.ResolveOpenAIResponsesWebSocketV2Mode("off"), "OAuth 必须强制 mode = passthrough")
+		require.Equal(t, OpenAIWSIngressModePassthrough, account.ResolveOpenAIResponsesWebSocketV2Mode("off"), "OAuth 必须强制 ws mode = passthrough")
 	})
 
 	t.Run("OpenAI APIKey 账号不被强制覆盖", func(t *testing.T) {
@@ -349,12 +346,25 @@ func TestAccount_Sub2apiPatchOverride(t *testing.T) {
 			Platform: PlatformOpenAI,
 			Type:     AccountTypeAPIKey,
 			Extra: map[string]any{
-				"openai_passthrough": false,
 				"openai_apikey_responses_websockets_v2_mode": "ctx_pool",
+				"openai_apikey_responses_websockets_v2_enabled": true,
 			},
 		}
-		require.False(t, account.IsOpenAIPassthroughEnabled())
+		require.True(t, account.IsOpenAIResponsesWebSocketV2Enabled())
 		require.Equal(t, OpenAIWSIngressModeCtxPool, account.ResolveOpenAIResponsesWebSocketV2Mode("off"))
+	})
+
+	t.Run("启用 SUB2API_PATCH 时 Go 端指纹拟态强制关闭（由 Sidecar 全权处理）", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				"codex_fingerprint_mode": "session",
+				"codex_fingerprint_seed": "test-seed-12345",
+			},
+		}
+		require.Equal(t, codexFingerprintOff, account.GetCodexFingerprintMode())
+		require.Nil(t, resolveCodexFingerprintIDsFromRequest(account, nil))
 	})
 
 	t.Run("非 OpenAI 平台不被影响", func(t *testing.T) {
@@ -362,10 +372,10 @@ func TestAccount_Sub2apiPatchOverride(t *testing.T) {
 			Platform: PlatformAnthropic,
 			Type:     AccountTypeOAuth,
 			Extra: map[string]any{
-				"openai_passthrough": false,
+				"openai_oauth_responses_websockets_v2_mode": "passthrough",
 			},
 		}
-		require.False(t, account.IsOpenAIPassthroughEnabled())
+		require.False(t, account.IsOpenAIResponsesWebSocketV2Enabled())
 		require.Equal(t, OpenAIWSIngressModeOff, account.ResolveOpenAIResponsesWebSocketV2Mode("off"))
 	})
 }
