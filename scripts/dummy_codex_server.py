@@ -23,8 +23,25 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 os.makedirs(DUMP_DIR, exist_ok=True)
 
+# Thread-safe monotonic counter to guarantee unique dump dir names.
+# now_str() alone is only microsecond-resolution: under ThreadingHTTPServer two
+# threads (e.g. concurrent WS + HTTP) can hit the same microsecond and collide on
+# the same session_dir, silently interleaving frame files. _next_seq()
+# appends a per-process monotonic sequence so every session dir is distinct.
+_unique_lock = threading.Lock()
+_unique_seq = 0
+
+def _next_seq():
+    global _unique_seq
+    with _unique_lock:
+        _unique_seq += 1
+        return _unique_seq
+
 def now_str():
     return datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+
+def unique_tag():
+    return f"{now_str()}_{_next_seq():05d}"
 
 def parse_ws_frame(buf):
     """Parses a WebSocket frame. Returns (fin, rsv, opcode, payload_bytes, remaining_buf)"""
@@ -111,7 +128,7 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
 
         headers_dict = dict(self.headers)
         ts = now_str()
-        session_dir = os.path.join(DUMP_DIR, f"ws_{ts}")
+        session_dir = os.path.join(DUMP_DIR, f"ws_{unique_tag()}")
         os.makedirs(session_dir, exist_ok=True)
 
         print(f"\n{'='*90}\n[WS CONNECT in Thread {threading.current_thread().name}] Path: {self.path} | Client: {self.client_address}\n{'='*90}", flush=True)
@@ -287,7 +304,7 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
 
         req_ts = now_str()
         safe_path = self.path.split('?')[0].replace('/', '_').strip('_') or 'root'
-        dump_dir = os.path.join(DUMP_DIR, f"http_{req_ts}_{method}_{safe_path}")
+        dump_dir = os.path.join(DUMP_DIR, f"http_{unique_tag()}_{method}_{safe_path}")
         os.makedirs(dump_dir, exist_ok=True)
 
         headers_dict = dict(self.headers)
