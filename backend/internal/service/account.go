@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net/url"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -2024,13 +2025,25 @@ func (a *Account) IsOveragesEnabled() bool {
 	return false
 }
 
+func isSub2apiPatchEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("SUB2API_PATCH")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
 // IsOpenAIPassthroughEnabled 返回 OpenAI 账号是否启用"自动透传（仅替换认证）"。
 //
 // 新字段：accounts.extra.openai_passthrough。
 // 兼容字段：accounts.extra.openai_oauth_passthrough（历史 OAuth 开关）。
 // 字段缺失或类型不正确时，按 false（关闭）处理。
+// 当环境变量 SUB2API_PATCH 启用时，OpenAI OAuth 账号强制透传。
 func (a *Account) IsOpenAIPassthroughEnabled() bool {
-	if a == nil || !a.IsOpenAI() || a.Extra == nil {
+	if a == nil || !a.IsOpenAI() {
+		return false
+	}
+	if isSub2apiPatchEnabled() && a.IsOpenAIOAuthLike() {
+		return true
+	}
+	if a.Extra == nil {
 		return false
 	}
 	if enabled, ok := a.Extra["openai_passthrough"].(bool); ok {
@@ -2055,8 +2068,15 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 // 优先级：
 // 1. 按账号类型读取分类型字段
 // 2. 分类型字段缺失时，回退兼容字段
+// 当环境变量 SUB2API_PATCH 启用时，OpenAI OAuth 账号强制开启 WS v2。
 func (a *Account) IsOpenAIResponsesWebSocketV2Enabled() bool {
-	if a == nil || !a.IsOpenAI() || a.Extra == nil {
+	if a == nil || !a.IsOpenAI() {
+		return false
+	}
+	if isSub2apiPatchEnabled() && a.IsOpenAIOAuthLike() {
+		return true
+	}
+	if a.Extra == nil {
 		return false
 	}
 	if a.IsOpenAIOAuthLike() {
@@ -2119,15 +2139,19 @@ func normalizeOpenAIWSIngressDefaultMode(mode string) string {
 // ResolveOpenAIResponsesWebSocketV2Mode 返回账号在 WSv2 ingress 下的有效模式（off/ctx_pool/passthrough）。
 //
 // 优先级：
-// 1. 分类型 mode 新字段（string）
-// 2. 分类型 enabled 旧字段（bool）
-// 3. 兼容 enabled 旧字段（bool）
-// 4. defaultMode（非法时回退 ctx_pool）
+// 1. 当 SUB2API_PATCH 启用且为 OAuth 时强制 passthrough
+// 2. 分类型 mode 新字段（string）
+// 3. 分类型 enabled 旧字段（bool）
+// 4. 兼容 enabled 旧字段（bool）
+// 5. defaultMode（非法时回退 ctx_pool）
 func (a *Account) ResolveOpenAIResponsesWebSocketV2Mode(defaultMode string) string {
-	resolvedDefault := normalizeOpenAIWSIngressDefaultMode(defaultMode)
 	if a == nil || !a.IsOpenAI() {
 		return OpenAIWSIngressModeOff
 	}
+	if isSub2apiPatchEnabled() && a.IsOpenAIOAuthLike() {
+		return OpenAIWSIngressModePassthrough
+	}
+	resolvedDefault := normalizeOpenAIWSIngressDefaultMode(defaultMode)
 	if a.Extra == nil {
 		return resolvedDefault
 	}
