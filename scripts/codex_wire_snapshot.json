@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-09-01T09:08:13.682501+00:00",
+  "generated_at": "2026-09-02T08:21:39.971995+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "2b7c279735d0d096cf7b34fe98938f46792f4d4f",
-      "date": "2026-09-01T07:32:54Z",
-      "message": "Report turn trigger and source in turn analytics (#42003)",
-      "html_url": "https://github.com/openai/codex/commit/2b7c279735d0d096cf7b34fe98938f46792f4d4f"
+      "sha": "eb10d91e48ccbd0930427461fb392337addb1ac0",
+      "date": "2026-09-02T05:23:24Z",
+      "message": "Add Windows voice runtime preparation (#42209)",
+      "html_url": "https://github.com/openai/codex/commit/eb10d91e48ccbd0930427461fb392337addb1ac0"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
