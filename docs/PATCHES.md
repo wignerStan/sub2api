@@ -87,6 +87,19 @@ paths yet (matching the reviewed migrate state):
 4. If upstream codex wire format changed, update the sidecar first (see the
    sidecar repo README; `codex_wire_audit.py` snapshots), then re-verify.
 
+## Identity convergence ownership
+
+Under `SUB2API_PATCH` the Go-side mimic is fully disabled
+(`GetCodexFingerprintMode() = off`) and the **Rust sidecar is the sole
+identity engine**. The complete Go convergence semantics (mode machine,
+thread-keyed derivation, parent/fork topology, body enrichment, header/body
+injection, prompt_cache_key rewrite — the sync-183 fix lineage) were ported to
+`sub2api-sidecar/src/mimic/converge.rs` on branch `feat/converge-mimic-port`.
+Per-account mode comes from `accounts.extra.codex_fingerprint_mode`; the
+deployment default is `SUB2API_PATCH_DEFAULT_CODEX_FINGERPRINT`
+(`SUB2API_SIDECAR_DEFAULT_CODEX_FINGERPRINT` alias), unset = off. See the
+sidecar repo README for the full ported contract and test matrix.
+
 ## Archive
 
 `migrate/v0.2.0-clean-sidecar` is the historical integration branch

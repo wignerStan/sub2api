@@ -9,7 +9,15 @@ contract the Go gateway depends on.
 | Layer | Owns |
 |---|---|
 | Go gateway | business logic: accounts, groups, quota, scheduling, billing, REST web API |
-| Rust sidecar | egress boundary: rustls TLS disguise, identity mimic, loopback E2EE, Responses WS pump, DB-direct account resolution |
+| Rust sidecar | egress boundary: rustls TLS disguise, **full identity mimic (convergence engine)**, loopback E2EE, Responses WS pump, DB-direct account resolution |
+
+Under `SUB2API_PATCH` the sidecar is the sole identity engine (Go mimic off):
+mode machine (`accounts.extra.codex_fingerprint_mode`, default via
+`SUB2API_PATCH_DEFAULT_CODEX_FINGERPRINT`, unset = off), thread-keyed
+derivation (root/fork sharing a session-id stay distinct), body topology
+enrichment on the first WS frame, and converged injection into headers,
+`client_metadata`, embedded turn metadata and `prompt_cache_key`. See the
+sidecar repo README (`Identity convergence`) for the ported contract.
 
 ## Routing boundaries
 
