@@ -14,6 +14,7 @@ import socket
 import struct
 import sys
 import threading
+import traceback
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -22,8 +23,25 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 os.makedirs(DUMP_DIR, exist_ok=True)
 
+# Thread-safe monotonic counter to guarantee unique dump dir names.
+# now_str() alone is only microsecond-resolution: under ThreadingHTTPServer two
+# threads (e.g. concurrent WS + HTTP) can hit the same microsecond and collide on
+# the same session_dir, silently interleaving frame files. _next_seq()
+# appends a per-process monotonic sequence so every session dir is distinct.
+_unique_lock = threading.Lock()
+_unique_seq = 0
+
+def _next_seq():
+    global _unique_seq
+    with _unique_lock:
+        _unique_seq += 1
+        return _unique_seq
+
 def now_str():
     return datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+
+def unique_tag():
+    return f"{now_str()}_{_next_seq():05d}"
 
 def parse_ws_frame(buf):
     """Parses a WebSocket frame. Returns (fin, rsv, opcode, payload_bytes, remaining_buf)"""
@@ -110,7 +128,7 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
 
         headers_dict = dict(self.headers)
         ts = now_str()
-        session_dir = os.path.join(DUMP_DIR, f"ws_{ts}")
+        session_dir = os.path.join(DUMP_DIR, f"ws_{unique_tag()}")
         os.makedirs(session_dir, exist_ok=True)
 
         print(f"\n{'='*90}\n[WS CONNECT in Thread {threading.current_thread().name}] Path: {self.path} | Client: {self.client_address}\n{'='*90}", flush=True)
@@ -201,10 +219,67 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
                     if parsed_json:
                         print(json.dumps(parsed_json, indent=2, ensure_ascii=False)[:3000], flush=True)
 
+                    # Distinguish realtime (session.* / no Responses request body)
+                    # from codex Responses-over-WebSocket (response.create + stream/input).
+                    is_codex_responses = (
+                        isinstance(parsed_json, dict)
+                        and ev_type == "response.create"
+                        and parsed_json.get("stream") is True
+                    )
+
                     if ev_type == "session.update":
                         ack = {"type": "session.updated", "session": {"id": f"sess_{ts}", "object": "realtime.session"}}
                         sock.sendall(make_ws_frame(0x1, json.dumps(ack).encode('utf-8')))
+                    elif is_codex_responses:
+                        # codex Responses-over-WebSocket protocol: emit SSE-style
+                        # ResponsesStreamEvent JSON, one event per text frame.
+                        # codex's parser dispatches on `type` and stops at
+                        # `response.completed`. Shape mirrors real /v1/responses stream.
+                        resp_id = f"resp_{now_str()}"
+                        item_id = f"item_{now_str()}"
+                        def _s(**kw):
+                            return kw
+                        events = [
+                            _s(type="response.created", sequence_number=1,
+                                response={"id": resp_id, "object": "response",
+                                          "status": "in_progress", "model": "gpt-5.6-sol",
+                                          "output": [], "usage": None}),
+                            _s(type="response.in_progress", sequence_number=2,
+                                response={"id": resp_id, "object": "response"}),
+                            _s(type="response.output_item.added", sequence_number=3,
+                                output_index=0,
+                                item={"id": item_id, "type": "message", "role": "assistant",
+                                      "status": "in_progress",
+                                      "content": [{"type": "output_text", "text": ""}]}),
+                            _s(type="response.content_part.added", sequence_number=4,
+                                item_id=item_id, output_index=0, content_index=0,
+                                part={"type": "output_text", "text": "", "annotations": []}),
+                            _s(type="response.output_text.delta", sequence_number=5,
+                                item_id=item_id, output_index=0, content_index=0,
+                                delta="[dummy responses-ws] full payload captured 100%."),
+                            _s(type="response.output_text.done", sequence_number=6,
+                                item_id=item_id, output_index=0, content_index=0,
+                                text="[dummy responses-ws] full payload captured 100%.",
+                                annotations=[]),
+                            _s(type="response.content_part.done", sequence_number=7,
+                                item_id=item_id, output_index=0, content_index=0,
+                                part={"type": "output_text", "text": "[dummy responses-ws] full payload captured 100%.", "annotations": []}),
+                            _s(type="response.output_item.done", sequence_number=8,
+                                output_index=0,
+                                item={"id": item_id, "type": "message", "role": "assistant",
+                                      "status": "completed",
+                                      "content": [{"type": "output_text", "text": "[dummy responses-ws] full payload captured 100%.", "annotations": []}]}),
+                            _s(type="response.completed", sequence_number=9,
+                                response={"id": resp_id, "object": "response", "status": "completed",
+                                          "model": "gpt-5.6-sol", "output": [],
+                                          "usage": {"input_tokens": 50, "input_tokens_details": {"cached_tokens": 0},
+                                                    "output_tokens": 50, "output_tokens_details": {"reasoning_tokens": 0},
+                                                    "total_tokens": 100}}),
+                        ]
+                        for ev in events:
+                            sock.sendall(make_ws_frame(0x1, json.dumps(ev).encode('utf-8')))
                     elif ev_type == "response.create":
+                        # Bare realtime response.create (no Responses stream flag): Realtime mock.
                         resp_id = f"resp_{now_str()}"
                         item_id = f"item_{now_str()}"
                         mock_frames = [
@@ -221,6 +296,7 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             print(f"[WS EXCEPTION] {e}", flush=True)
+            traceback.print_exc()
 
     def handle_http(self, method):
         content_len = int(self.headers.get('Content-Length', 0))
@@ -228,7 +304,7 @@ class MultiThreadedCatchAllHandler(BaseHTTPRequestHandler):
 
         req_ts = now_str()
         safe_path = self.path.split('?')[0].replace('/', '_').strip('_') or 'root'
-        dump_dir = os.path.join(DUMP_DIR, f"http_{req_ts}_{method}_{safe_path}")
+        dump_dir = os.path.join(DUMP_DIR, f"http_{unique_tag()}_{method}_{safe_path}")
         os.makedirs(dump_dir, exist_ok=True)
 
         headers_dict = dict(self.headers)
