@@ -1,0 +1,50 @@
+[package]
+name = "codex-websocket-client"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies.codex-http-client]
+path = "../http-client"
+
+[dependencies.futures]
+version = "0.3"
+default-features = false
+
+[dependencies.rustls]
+version = "0.23"
+features = [ "aws_lc_rs", "std",]
+default-features = false
+
+[dependencies.tokio]
+version = "1"
+features = [ "net", "rt", "time",]
+
+[dependencies.tokio-rustls]
+version = "0.26.4"
+
+[dependencies.tokio-tungstenite]
+git = "https://github.com/openai-oss-forks/tokio-tungstenite"
+rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186"
+features = ["proxy", "rustls-tls-native-roots"]
+
+[dependencies.url]
+version = "2"
+
+[dev-dependencies.codex-utils-rustls-provider]
+path = "../utils-rustls-provider"
+
+[dev-dependencies.pretty_assertions]
+version = "1.4.1"
+
+[dev-dependencies.rcgen]
+version = "0.14.7"
+features = [ "aws_lc_rs", "pem",]
+default-features = false
+
+[dev-dependencies.tokio]
+version = "1"
+features = [ "macros", "test-util",]
