@@ -2033,6 +2033,10 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 	if a == nil || !a.IsOpenAI() || a.Extra == nil {
 		return false
 	}
+	// SUB2API_PATCH hook: OAuth 走 WS-only，强制禁用 HTTP 透传（见 account_patch.go）。
+	if sub2apiPatchDisableOpenAIHTTPPassthrough(a) {
+		return false
+	}
 	if enabled, ok := a.Extra["openai_passthrough"].(bool); ok {
 		return enabled
 	}
@@ -2058,6 +2062,10 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 func (a *Account) IsOpenAIResponsesWebSocketV2Enabled() bool {
 	if a == nil || !a.IsOpenAI() || a.Extra == nil {
 		return false
+	}
+	// SUB2API_PATCH hook: OAuth 强制开启 WS v2（见 account_patch.go）。
+	if sub2apiPatchForceOpenAIWSV2(a) {
+		return true
 	}
 	if a.IsOpenAIOAuthLike() {
 		if enabled, ok := a.Extra["openai_oauth_responses_websockets_v2_enabled"].(bool); ok {
@@ -2124,10 +2132,14 @@ func normalizeOpenAIWSIngressDefaultMode(mode string) string {
 // 3. 兼容 enabled 旧字段（bool）
 // 4. defaultMode（非法时回退 ctx_pool）
 func (a *Account) ResolveOpenAIResponsesWebSocketV2Mode(defaultMode string) string {
-	resolvedDefault := normalizeOpenAIWSIngressDefaultMode(defaultMode)
 	if a == nil || !a.IsOpenAI() {
 		return OpenAIWSIngressModeOff
 	}
+	// SUB2API_PATCH hook: OAuth 强制 passthrough 模式（见 account_patch.go）。
+	if sub2apiPatchForceOpenAIWSModePassthrough(a) {
+		return OpenAIWSIngressModePassthrough
+	}
+	resolvedDefault := normalizeOpenAIWSIngressDefaultMode(defaultMode)
 	if a.Extra == nil {
 		return resolvedDefault
 	}

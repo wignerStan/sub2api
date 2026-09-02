@@ -206,6 +206,10 @@ func (a *Account) GetCodexFingerprintMode() codexFingerprintMode {
 	if a == nil || !a.IsOpenAIOAuthLike() {
 		return codexFingerprintOff
 	}
+	// SUB2API_PATCH hook: Go 侧拟态全关，身份收敛由 Rust sidecar 全权处理。
+	if isSub2apiPatchEnabled() {
+		return codexFingerprintOff
+	}
 	return codexFingerprintModeFromExtra(a.Extra)
 }
 
