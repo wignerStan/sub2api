@@ -1,0 +1,30 @@
+name: codex-wire-tools-ci
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/codex_wire_audit.py'
+      - 'scripts/dummy_codex_server.py'
+      - 'scripts/CODEX_WIRE_AUDIT.md'
+      - '.github/workflows/codex-wire-tools-ci.yml'
+  push:
+    paths:
+      - 'scripts/codex_wire_audit.py'
+      - 'scripts/dummy_codex_server.py'
+      - '.github/workflows/codex-wire-tools-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run wire tool self-tests
+        run: |
+          python3 scripts/codex_wire_audit.py --self-test
+          python3 scripts/dummy_codex_server.py --self-test
