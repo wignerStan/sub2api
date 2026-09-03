@@ -41,13 +41,13 @@ base_url + token are both present, the sidecar is enabled.
 | `repository/req_client_pool.go` | `reqClientOptions.Sidecar*` + `SidecarAwareRoundTripper` wrap; `sidecarOptsFromConfig` | `service/openai_sidecar_tls.go` |
 | `repository/openai_oauth_service.go` | constructor threads `*config.Config` for sidecar-aware OAuth exchange/refresh clients | `service/openai_sidecar_tls.go` |
 | `service/openai_privacy_service.go` | broadened Cloudflare-challenge body markers (lowercase match, `challenge-platform`, `<html`) | inline (small robustness fix) |
-| `service/openai_ws_client.go` | coder dialer strips sidecar control headers; conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
+| `service/openai_ws_client.go` | coder dialer strips sidecar control headers (incl. forged `x-s2s-account-switched`); conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
 | `service/openai_account_runtime_block_fastpath.go` | `blockAccountSchedulingLocked`: remember block reason; `ClearAccountSchedulingBlock`: delete reason | `service/openai_guardian_route.go` |
 | `service/openai_ws_pool.go` / `openai_ws_forwarder.go` | dialer construction → `openAIWSDefaultDialer()` (sidecar-aware when configured) | `service/openai_ws_pool_sidecar.go` |
 | `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: WS delta turn whose continuation chain (response→account binding) belongs to another account → return the retryable `previous_response_not_found` error + benign close | `service/openai_ws_sidecar_account_switch.go` |
 | `handler/openai_gateway_handler.go` | WS + HTTP failover loops: stamp the scheduler switch onto the request ctx | `service/openai_ws_sidecar_account_switch.go` |
-| `service/openai_ws_forwarder_v2.go` | WS dial seam: switch-stamped ctx → `x-s2s-account-switched` dial header (sidecar-gated) | `service/openai_ws_sidecar_account_switch.go` |
-| `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount`: switch-stamped ctx → `x-s2s-account-switched` header | same file (patch-owned) |
+| `service/openai_ws_forwarder_v2.go` | WS dial seam: switch-stamped ctx rides the dial headers — value rebuilt from scheduler-owned ctx post-strip inside the sidecar dialer (sidecar-gated) | `service/openai_ws_client_sidecar.go` |
+| `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount`: switch-stamped ctx → `x-s2s-account-switched` header rebuilt post-strip | same file (patch-owned) |
 | `service/openai_ws_v2_passthrough_adapter.go` | `openAIWSClientFrameConn.WriteFrame`: +1 line downstream capacity-shed rewrite (`server_is_overloaded`/`slow_down` → `server_error` in the client copy only) | `service/openai_ws_v2_relay_patch.go` |
 | `service/openai_ws_v2_passthrough_adapter.go` | response.create frame path: +3 lines `openAIWSRelayBeforeTurnPatch` before `BeforeRequest` (per-turn profit gate + pricingAt freeze in passthrough mode) | `service/openai_ws_v2_relay_patch.go` |
 | `service/openai_gateway_upstream_errors.go` | `newOpenAIAccountFailoverErrorWithClassificationHeaders`: +1 line `applyOpenAIAccountCustomErrorMappingPatch` (account-level custom error-code mapping) | `service/openai_ws_v2_relay_patch.go` |

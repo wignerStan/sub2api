@@ -182,6 +182,35 @@ func TestForwardHTTPViaSidecarTrustedAccountSelector(t *testing.T) {
 	require.Equal(t, [3]string{"", "", ""}, <-seen)
 }
 
+// x-s2s-account-switched 是控制头：客户端伪造的同名头必须在 loopback hop 前
+// 被剥掉；scheduler-stamped 的合法值在 strip 之后从 request ctx 重建。
+func TestForwardHTTPViaSidecarStripsClientSwitchHeaderAndRebuilds(t *testing.T) {
+	seen := make(chan string, 2)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get(openAISidecarAccountSwitchHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer sidecar.Close()
+	cfg := sidecarTestConfig(t, sidecar.URL)
+
+	smuggled, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	smuggled.Header.Set(openAISidecarAccountSwitchHeader, "42")
+	resp, err := ForwardHTTPViaSidecarForAccount(cfg, sidecar.Client(), smuggled, "", 5)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, "", <-seen, "client-supplied switch header must be stripped")
+
+	switched, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	switched.Header.Set(openAISidecarAccountSwitchHeader, "43")
+	switched = switched.WithContext(WithOpenAISidecarAccountSwitch(switched.Context(), 3))
+	resp, err = ForwardHTTPViaSidecarForAccount(cfg, sidecar.Client(), switched, "", 5)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, "3", <-seen, "scheduler-owned switch value must be rebuilt post-strip")
+}
+
 func TestApplySidecarHTTPClientRoutesOAuthHosts(t *testing.T) {
 	var baseHits atomic.Int64
 	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {

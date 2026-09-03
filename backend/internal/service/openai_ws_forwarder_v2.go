@@ -162,12 +162,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 	// PATCH hook: 换号后的拨号头携带 x-s2s-account-switched（failover 事件经
 	// request ctx 传入；换号必重建新 WS，sidecar 据此在握手期做关联切分，
-	// 控制头不转发上游）。
-	if sidecarRuntime() != nil {
-		if switchFrom := openAISidecarAccountSwitchHeaderValue(ctx, account.ID); switchFrom != "" {
-			wsHeaders.Set(openAISidecarAccountSwitchHeader, switchFrom)
-		}
-	}
+	// 控制头不转发上游）。头值由 sidecar dialer 在 strip 之后从 ctx 重建
+	// （openai_ws_client_sidecar.go），此处不再预写，防止客户端伪造的同名头
+	// 与合法值混淆。
 	logOpenAIWSModeDebug(
 		"acquire_start account_id=%d account_type=%s transport=%s preferred_conn_id=%s has_previous_response_id=%v session_hash=%s has_turn_state=%v turn_state_len=%d has_turn_metadata=%v turn_metadata_len=%d store_disabled=%v store_disabled_conn_mode=%s retry_last_reason=%s force_new_conn=%v header_user_agent=%s header_openai_beta=%s header_originator=%s header_accept_language=%s header_session_id=%s header_conversation_id=%s session_id_source=%s conversation_id_source=%s has_prompt_cache_key=%v has_chatgpt_account_id=%v has_authorization=%v has_session_id=%v has_conversation_id=%v proxy_enabled=%v",
 		account.ID,

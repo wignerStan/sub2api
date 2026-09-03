@@ -54,6 +54,10 @@ func stripSidecarControlHeaders(headers http.Header) {
 		"x-s2s-token",
 		SidecarE2EEHeader,
 		SidecarE2EEOrigLenHeader,
+		// 换号信号同样属于控制头：客户端可能伪造 x-s2s-account-switched 触发
+		// sidecar 的错误关联切分。合法值由出站 seam 在 strip 之后按
+		// scheduler-owned ctx 重建（见 sidecar dialer 与 HTTP forward）。
+		openAISidecarAccountSwitchHeader,
 	} {
 		headers.Del(name)
 	}
@@ -107,6 +111,11 @@ func (d *sidecarOpenAIWSClientDialer) dial(
 	stripSidecarControlHeaders(header)
 	if accountID > 0 {
 		header.Set(SidecarAccountIDHeader, strconv.FormatInt(accountID, 10))
+	}
+	// 换号信号在 strip 之后重建：值来自 scheduler-owned ctx（handler 的
+	// failover 事件），客户端伪造的同名头已在上面被剥掉。
+	if from := openAISidecarAccountSwitchHeaderValue(ctx, accountID); from != "" {
+		header.Set(openAISidecarAccountSwitchHeader, from)
 	}
 	opts := &coderws.DialOptions{
 		HTTPHeader:      header,

@@ -274,11 +274,6 @@ func ForwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Re
 // the tunnel to the scheduler-selected account. The caller-provided account ID
 // always overrides client-controlled headers.
 func ForwardHTTPViaSidecarForAccount(cfg *config.Config, client *http.Client, req *http.Request, proxyURL string, accountID int64) (*http.Response, error) {
-	// PATCH hook: 调度器切换账号时告知 sidecar（HTTP 用 header；WS 用虚拟帧，
-	// 见 openai_ws_sidecar_account_switch.go）。sidecar 按控制头剥离，不转发上游。
-	if from := openAISidecarAccountSwitchHeaderValue(req.Context(), accountID); from != "" {
-		req.Header.Set(openAISidecarAccountSwitchHeader, from)
-	}
 	return forwardHTTPViaSidecar(cfg, client, req, proxyURL, accountID)
 }
 
@@ -309,6 +304,12 @@ func forwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Re
 	stripSidecarControlHeaders(clone.Header)
 	if accountID > 0 {
 		clone.Header.Set(SidecarAccountIDHeader, strconv.FormatInt(accountID, 10))
+	}
+	// PATCH hook: 调度器切换账号时告知 sidecar（HTTP 用 header；WS 用拨号头，
+	// 见 openai_ws_sidecar_account_switch.go）。头值在 strip 之后按
+	// scheduler-owned ctx 重建，客户端伪造的同名头已被剥掉。
+	if from := openAISidecarAccountSwitchHeaderValue(req.Context(), accountID); from != "" {
+		clone.Header.Set(openAISidecarAccountSwitchHeader, from)
 	}
 	clone.Header.Set("x-s2s-token", settings.Token)
 	clone.Header.Set("x-upstream-url", originalURL)
