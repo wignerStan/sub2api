@@ -85,7 +85,9 @@ trailing-byte streams fail closed (`errSidecarE2EETrunc` /
 - **Account-switch signaling**: WS mode uses a virtual frame
   (`x-s2s-vframe: account-switch`), HTTP mode the `x-s2s-account-switched`
   header (value = previous account id). On signal the pool evicts every other
-  account's idle socket for that thread scope; the frame/header never reach
+  account's idle socket for that thread scope, strips the server-issued
+  `x-codex-turn-state`, and regenerates the codex-shaped `prompt_cache_key`
+  under the new account's converged identity; the frame/header never reach
   upstream.
 
 ## Deployment
