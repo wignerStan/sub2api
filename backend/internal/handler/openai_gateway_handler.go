@@ -876,6 +876,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						return
 					}
 					switchCount++
+					// PATCH hook: 标记本次为调度器账号切换，HTTP 侧以
+					// x-s2s-account-switched header 通知 sidecar。
+					c.Request = c.Request.WithContext(service.WithOpenAISidecarAccountSwitch(c.Request.Context(), account.ID))
 					if h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return

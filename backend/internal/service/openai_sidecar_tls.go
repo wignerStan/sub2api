@@ -274,6 +274,11 @@ func ForwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Re
 // the tunnel to the scheduler-selected account. The caller-provided account ID
 // always overrides client-controlled headers.
 func ForwardHTTPViaSidecarForAccount(cfg *config.Config, client *http.Client, req *http.Request, proxyURL string, accountID int64) (*http.Response, error) {
+	// PATCH hook: 调度器切换账号时告知 sidecar（HTTP 用 header；WS 用虚拟帧，
+	// 见 openai_ws_sidecar_account_switch.go）。sidecar 按控制头剥离，不转发上游。
+	if from := openAISidecarAccountSwitchHeaderValue(req.Context(), accountID); from != "" {
+		req.Header.Set(openAISidecarAccountSwitchHeader, from)
+	}
 	return forwardHTTPViaSidecar(cfg, client, req, proxyURL, accountID)
 }
 

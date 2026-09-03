@@ -1587,6 +1587,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			sessionLease = acquiredLease
 			sessionConnID = strings.TrimSpace(sessionLease.ConnID())
+			// PATCH hook: 调度器切换账号时先发 sidecar 虚拟帧（见 openai_ws_sidecar_account_switch.go）。
+			maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
 			if storeDisabled {
 				pinSessionConn(sessionConnID)
 			} else {
@@ -1695,6 +1697,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				sessionLease = acquiredLease
 				sessionConnID = strings.TrimSpace(sessionLease.ConnID())
+				// PATCH hook: 同上（preflight ping 失败重拨后的切换通知）。
+				maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
 				if storeDisabled {
 					pinSessionConn(sessionConnID)
 				}
