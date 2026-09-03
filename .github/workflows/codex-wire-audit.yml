@@ -23,9 +23,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run wire audit self-test
+      - name: Run wire tool self-tests
         run: |
           python3 scripts/codex_wire_audit.py --self-test
+          python3 scripts/dummy_codex_server.py --self-test
 
       - name: Fetch and generate latest upstream Codex wire schema snapshot
         env:
