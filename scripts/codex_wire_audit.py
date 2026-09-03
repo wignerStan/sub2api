@@ -363,12 +363,9 @@ def discover_header_candidates(sources: dict[str, str]) -> list[str]:
     cmap = consts(sources)
     found: set[str] = set()
 
-    # Header constants are safe candidates; explicitly exclude client_metadata constants.
-    for token, value in const_definitions(sources):
-        if "HEADER" in token and "CLIENT_METADATA_KEY" not in token:
-            found.add(value)
-
-    # Direct literals are accepted only in header-specific APIs / variables.
+    # Only header-specific APIs count. A constant name ending in _HEADER is not
+    # enough: some Codex constants (for example installation identity) are used
+    # only as client_metadata keys.
     literal_patterns = [
         r'insert_header\([^,]+,\s*"([A-Za-z0-9_-]+)"',
         r'\.(?:header)\(\s*"([A-Za-z0-9_-]+)"',
@@ -377,6 +374,7 @@ def discover_header_candidates(sources: dict[str, str]) -> list[str]:
     token_patterns = [
         r'insert_header\([^,]+,\s*(?:http::header::)?([A-Z][A-Z0-9_]*)',
         r'\b(?:headers|extra_headers|default_headers|provider_headers)\.insert\(\s*(?:http::header::)?([A-Z][A-Z0-9_]*)',
+        r'HeaderName::from_static\(\s*([A-Z][A-Z0-9_]*)',
     ]
     for text in sources.values():
         for pattern in literal_patterns:
@@ -665,6 +663,7 @@ struct Demo<'a> {
 const X_REAL_HEADER: &str = "x-real-header";
 const WS_REQUEST_HEADER_THING_CLIENT_METADATA_KEY: &str = "ws_request_header_thing";
 fn f(headers: &mut HeaderMap, client_metadata: &mut HashMap<String, String>) {
+    headers.insert(X_REAL_HEADER, v);
     headers.insert("x-literal-header", v);
     insert_header(headers, "session-id", v);
     client_metadata.insert("turn_id".to_string(), v.to_string());
