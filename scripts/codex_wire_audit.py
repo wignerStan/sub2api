@@ -432,10 +432,13 @@ def build_report(
         header("x-client-request-id", "set from thread_id", http, FILES["http"], '"x-client-request-id"', optional=False),
         header("x-openai-internal-codex-responses-lite", "Responses Lite only; real HTTP request header", core, FILES["core"], "X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER", "true"),
         header("x-codex-turn-state", "replayed within the same turn after server supplies it", core, FILES["core"], "X_CODEX_TURN_STATE_HEADER"),
-        header("x-codex-inference-call-id", "rollout inference tracing enabled", inference, FILES["inference"], "INFERENCE_CALL_ID_HEADER", "UUID-like inference call id", "tracking", category="tracking"),
         header("Accept", "HTTP streaming Responses", http, FILES["http"], "http::header::ACCEPT", "text/event-stream", "http", optional=False),
         header("Content-Type", "JSON body", request, FILES["request"], "CONTENT_TYPE", "application/json", "http", optional=False),
         header("Content-Encoding", "request compression enabled", request, FILES["request"], "CONTENT_ENCODING", "zstd", "http"),
+    ]
+
+    http_tracking_headers = [
+        header("x-codex-inference-call-id", "rollout inference tracing enabled", inference, FILES["inference"], "INFERENCE_CALL_ID_HEADER", "UUID-like inference call id", "tracking", category="tracking"),
     ]
 
     ws_headers = common_responses_headers + [
@@ -463,7 +466,7 @@ def build_report(
 
     declared = {
         h["name"]
-        for h in account_headers + http_headers + ws_headers
+        for h in account_headers + http_headers + http_tracking_headers + ws_headers
     }
     candidate_sources = {k: v for k, v in s.items() if k != "ws"}
     candidates = discover_header_candidates(candidate_sources)
@@ -497,6 +500,7 @@ def build_report(
         "responses_http": {
             "request": "POST /responses (and Responses-compatible Guardian routes)",
             "http_headers": http_headers,
+            "tracking_headers": http_tracking_headers,
             "dynamic_header_sources": [{
                 "name": "provider.headers",
                 "optional": True,
@@ -601,6 +605,9 @@ def print_text(r: dict[str, Any]) -> None:
     print("\n=== 2. RESPONSES / HTTP ===")
     print("HTTP headers:")
     print_headers(r["responses_http"]["http_headers"])
+    if r["responses_http"].get("tracking_headers"):
+        print("Optional tracking headers:")
+        print_headers(r["responses_http"]["tracking_headers"])
     print("client_metadata:")
     print_cm(r["responses_http"]["client_metadata"])
 
