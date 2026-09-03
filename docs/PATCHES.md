@@ -98,7 +98,9 @@ paths yet (matching the reviewed migrate state):
 3. Run: `go build ./...` and
    `go test ./internal/service/ ./internal/repository/ -run 'Sidecar|E2EE|Patch|Passthrough|Guardian|WS' -count=1`.
 4. If upstream codex wire format changed, update the sidecar first (see the
-   sidecar repo README; `codex_wire_audit.py` snapshots), then re-verify.
+   sidecar repo README; `codex_wire_audit.py` composes the fingerprint set
+   from one immutable `openai/codex` SHA — no capture snapshots), then
+   re-verify.
 
 ## Upstream WS connection pool (sidecar-owned transport)
 
