@@ -44,6 +44,9 @@ base_url + token are both present, the sidecar is enabled.
 | `service/openai_ws_client.go` | coder dialer strips sidecar control headers; conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
 | `service/openai_account_runtime_block_fastpath.go` | `blockAccountSchedulingLocked`: remember block reason; `ClearAccountSchedulingBlock`: delete reason | `service/openai_guardian_route.go` |
 | `service/openai_ws_pool.go` / `openai_ws_forwarder.go` | dialer construction → `openAIWSDefaultDialer()` (sidecar-aware when configured) | `service/openai_ws_pool_sidecar.go` |
+| `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: emit sidecar account-switch virtual frame when the continuation chain is bound to another account | `service/openai_ws_sidecar_account_switch.go` |
+| `handler/openai_gateway_handler.go` | HTTP responses failover loop: mark request context on scheduler account switch | `service/openai_ws_sidecar_account_switch.go` |
+| `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount` sets `x-s2s-account-switched` from the ctx marker | same file (patch-owned) |
 
 Upstream files that stay **byte-identical** on this branch (all patch content
 in sidecar/guardian files): `service/openai_gateway_service.go` (whitelist
@@ -99,6 +102,26 @@ construction, preemption/state stores. The wiring is the
 pool and passthrough WS dials relay through the sidecar, whose pool reuses
 sockets per thread scope (root/subagent stay independent); without it the
 native path is untouched. Live counters: `GET /v1/pool-stats` on the sidecar.
+
+## Account-switch signaling
+
+When the scheduler rebinds a session to a different account, the sidecar must
+evict the previous account's thread-scoped sockets (routing hints, turn-state
+and continuation chains must not leak across accounts):
+
+- **WS**: virtual frame `{"x-s2s-vframe":"account-switch",
+  "previous_account_id":N,"account_id":M}` inside the hop — consumed by the
+  sidecar, never forwarded upstream. Emitted when a session's
+  `previous_response_id` chain is bound to another account (response→account
+  state store) and after preflight-ping re-dials.
+- **HTTP**: `x-s2s-account-switched: <previous account id>` request header on
+  sidecar forwards (stripped from upstream egress).
+
+The WS/HTTP mutual exclusion stays intact in both modes: under
+`SUB2API_PATCH` OAuth accounts are forced WS-only (HTTP auto-passthrough
+disabled); with the patch off, account config rules. OAuth HTTPS egress
+routes through the sidecar regardless of WS mode (host-based dispatch, no WS
+dependency).
 
 ## Identity convergence ownership
 
