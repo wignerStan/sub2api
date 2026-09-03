@@ -77,6 +77,11 @@ trailing-byte streams fail closed (`errSidecarE2EETrunc` /
   surfaces the cached handshake response headers on the local 101. The
   gateway owns business logic (scheduling, quota, failover, replay payloads);
   the sidecar owns connection lifetime. Counters: `/v1/pool-stats`.
+- **Account-switch signaling**: WS mode uses a virtual frame
+  (`x-s2s-vframe: account-switch`), HTTP mode the `x-s2s-account-switched`
+  header (value = previous account id). On signal the pool evicts every other
+  account's idle socket for that thread scope; the frame/header never reach
+  upstream.
 
 ## Deployment
 
