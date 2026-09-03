@@ -44,8 +44,9 @@ base_url + token are both present, the sidecar is enabled.
 | `service/openai_ws_client.go` | coder dialer strips sidecar control headers; conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
 | `service/openai_account_runtime_block_fastpath.go` | `blockAccountSchedulingLocked`: remember block reason; `ClearAccountSchedulingBlock`: delete reason | `service/openai_guardian_route.go` |
 | `service/openai_ws_pool.go` / `openai_ws_forwarder.go` | dialer construction → `openAIWSDefaultDialer()` (sidecar-aware when configured) | `service/openai_ws_pool_sidecar.go` |
-| `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: emit sidecar account-switch virtual frame when the continuation chain is bound to another account | `service/openai_ws_sidecar_account_switch.go` |
-| `handler/openai_gateway_handler.go` | HTTP responses failover loop: mark request context on scheduler account switch | `service/openai_ws_sidecar_account_switch.go` |
+| `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: turn-shape account-switch dispatch (delta → retryable error; full → vframe + turn-state purge) | `service/openai_ws_sidecar_account_switch.go` |
+| `service/openai_ws_forwarder_v2.go` | dial-time: sticky-route mismatch/miss → `x-s2s-account-switched` dial header (sidecar-gated) | `service/openai_ws_sidecar_account_switch.go` |
+| `handler/openai_gateway_handler.go` | HTTP responses selection point: sticky-route mismatch/miss → switch-marked request ctx | `service/openai_ws_sidecar_account_switch.go` |
 | `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount` sets `x-s2s-account-switched` from the ctx marker | same file (patch-owned) |
 
 Upstream files that stay **byte-identical** on this branch (all patch content
@@ -105,27 +106,38 @@ native path is untouched. Live counters: `GET /v1/pool-stats` on the sidecar.
 
 ## Account-switch signaling
 
-When the scheduler rebinds a session to a different account mid-WS-turn, the
-gateway itself returns the downstream error: a Realtime-style `error` event
-carrying code `previous_response_not_found` (Codex classifies it as retryable
-→ discard the WS, reconnect, resend the full request context), followed by a
-benign `NormalClosure` — the handler neither failovers again nor charges
-account health. The same hook notifies the sidecar (virtual frame) and
-purges the session's harvested `x-codex-turn-state` so the reconnect dial on
-the new account starts clean.
+Signaling is keyed on the turn shape (Codex responses semantics):
 
-- **WS**: virtual frame `{"x-s2s-vframe":"account-switch",
-  "previous_account_id":N,"account_id":M}` inside the hop — consumed by the
-  sidecar, never forwarded upstream. Emitted when a session's
-  `previous_response_id` chain is bound to another account (response→account
-  state store), after preflight-ping re-dials, and on post-reconnect
-  recognition (session switch memory, 15m TTL).
-- **Sidecar purge at first switch**: per-hop flag removes `x-codex-turn-state`
-  (flat client_metadata, both envelopes) and the root `prompt_cache_key` from
-  every subsequent frame; dial-time purge strips the harvested turn-state
-  header for switched scopes (15m TTL).
-- **HTTP**: `x-s2s-account-switched: <previous account id>` request header on
-  sidecar forwards (stripped from upstream egress; informational).
+- **WS delta turn** (`previous_response_id` present): the chain binding
+  (response→account state store) belongs to the account that issued it. When
+  the scheduler has moved the session to another account, the gateway itself
+  returns the downstream error: a Realtime-style `error` event with code
+  `previous_response_not_found` (Codex classifies it as retryable → discard
+  the WS, reconnect, resend the full request context), followed by a benign
+  `NormalClosure` (no failover loop, no account-health charge). No virtual
+  frame: the reconnect abandons the old hop on its own.
+- **WS full turn** (no `previous_response_id`): the request is self-contained,
+  so it proceeds — but when the sticky route (redis session→account) hit a
+  different account (previous unschedulable, abandoned by the scheduler) or
+  missed entirely (fresh correlation), the hook first sends the sidecar
+  virtual frame (previous account id `0` when unknown) and deletes the
+  session's harvested `x-codex-turn-state` binding
+  (`DeleteSessionTurnState` — `BindSessionTurnState` treats empty as no-op).
+- **New WS connections**: the dial carries `x-s2s-account-switched: <previous
+  account id>` (0 when unknown) whenever the sticky route mismatches or
+  misses, so the sidecar strips the old account's turn-state at handshake
+  time (sidecar-gated; the header is a control header, never forwarded).
+- **HTTPS** is always full: one selection-point hook compares the selected
+  account against the sticky route and marks the outbound ctx;
+  `ForwardHTTPViaSidecarForAccount` turns the marker into the
+  `x-s2s-account-switched` header (stripped from upstream egress).
+- **Sidecar reaction** (see the sidecar README): strip server-issued
+  `x-codex-turn-state`, invalidate the previous account's sticky identity-map
+  entry, and regenerate the codex-shaped `prompt_cache_key` under the new
+  account's converged identity (never delete the carrier).
+
+Recognition is structural — turn shape + sticky route — not remembered
+state: there is no session-switch memory to expire.
 
 The WS/HTTP mutual exclusion stays intact in both modes: under
 `SUB2API_PATCH` OAuth accounts are forced WS-only (HTTP auto-passthrough
@@ -141,9 +153,13 @@ identity engine**. The complete Go convergence semantics (mode machine,
 thread-keyed derivation, parent/fork topology, body enrichment, header/body
 injection, prompt_cache_key rewrite — the sync-183 fix lineage) were ported to
 `sub2api-sidecar/src/mimic/converge.rs` on branch `feat/converge-mimic-port`.
-Per-account mode comes from `accounts.extra.codex_fingerprint_mode`; the
-deployment default is `SUB2API_PATCH_DEFAULT_CODEX_FINGERPRINT`
-(`SUB2API_SIDECAR_DEFAULT_CODEX_FINGERPRINT` alias), unset = off. See the
+The sidecar's mode machine has a single converged level: `Device`
+(installation + full session-family regeneration; the legacy session/full
+levels are gone). Per-account mode comes from
+`accounts.extra.codex_fingerprint_mode` (`session`/`full` coerce to
+`device`); the deployment default is
+`SUB2API_PATCH_DEFAULT_CODEX_FINGERPRINT`
+(`SUB2API_SIDECAR_DEFAULT_CODEX_FINGERPRINT` alias), unset = device. See the
 sidecar repo README for the full ported contract and test matrix.
 
 ## Archive
