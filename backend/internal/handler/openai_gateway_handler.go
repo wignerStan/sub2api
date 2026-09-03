@@ -715,12 +715,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
-		// PATCH hook: HTTP 恒为 full turn —— sticky 路由命中不同账号（旧账号
-		// 不可调度被放弃）或未命中时挂切换标记，sidecar 转发层据此发
-		// x-s2s-account-switched 控制头完成跨账号关联切分。
-		c.Request = c.Request.WithContext(service.OpenAISidecarHTTPSwitchContext(
-			c.Request.Context(), h.gatewayService, apiKey.GroupID, sessionHash, account.ID,
-		))
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {
@@ -882,6 +876,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						return
 					}
 					switchCount++
+					// PATCH hook: 标记本次为调度器账号切换，HTTP 侧以
+					// x-s2s-account-switched header 通知 sidecar。
+					c.Request = c.Request.WithContext(service.WithOpenAISidecarAccountSwitch(c.Request.Context(), account.ID))
 					if h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
