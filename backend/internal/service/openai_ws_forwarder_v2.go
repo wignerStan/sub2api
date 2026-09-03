@@ -160,6 +160,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if buildHdrErr != nil {
 		return nil, fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
+	// PATCH hook: 新连接拨号 —— sticky 路由命中不同账号（旧账号不可调度
+	// 被放弃）或未命中时，拨号头携带 x-s2s-account-switched，sidecar 在
+	// 握手期剥离旧账号签发的 x-codex-turn-state（控制头不转发上游）。
+	if sidecarRuntime() != nil {
+		if switchFrom := openAIWSSidecarDialSwitchValue(ctx, s, groupID, sessionHash, account.ID); switchFrom != "" {
+			wsHeaders.Set(openAISidecarAccountSwitchHeader, switchFrom)
+		}
+	}
 	logOpenAIWSModeDebug(
 		"acquire_start account_id=%d account_type=%s transport=%s preferred_conn_id=%s has_previous_response_id=%v session_hash=%s has_turn_state=%v turn_state_len=%d has_turn_metadata=%v turn_metadata_len=%d store_disabled=%v store_disabled_conn_mode=%s retry_last_reason=%s force_new_conn=%v header_user_agent=%s header_openai_beta=%s header_originator=%s header_accept_language=%s header_session_id=%s header_conversation_id=%s session_id_source=%s conversation_id_source=%s has_prompt_cache_key=%v has_chatgpt_account_id=%v has_authorization=%v has_session_id=%v has_conversation_id=%v proxy_enabled=%v",
 		account.ID,

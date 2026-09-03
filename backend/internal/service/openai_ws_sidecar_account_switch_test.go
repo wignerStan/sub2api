@@ -3,18 +3,19 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOpenAIWSSidecarAccountSwitchFrame(t *testing.T) {
-	// 无切换场景不产帧。
-	require.Nil(t, openAIWSSidecarAccountSwitchFrame(0, 5))
+	// 同账号不产帧；sticky 未命中（previous=0，未知）仍产帧。
 	require.Nil(t, openAIWSSidecarAccountSwitchFrame(5, 5))
-	require.Nil(t, openAIWSSidecarAccountSwitchFrame(-1, 5))
 
 	frame := openAIWSSidecarAccountSwitchFrame(3, 5)
 	require.NotNil(t, frame)
@@ -23,6 +24,132 @@ func TestOpenAIWSSidecarAccountSwitchFrame(t *testing.T) {
 	require.Equal(t, "account-switch", decoded["x-s2s-vframe"])
 	require.Equal(t, float64(3), decoded["previous_account_id"])
 	require.Equal(t, float64(5), decoded["account_id"])
+
+	unknown := openAIWSSidecarAccountSwitchFrame(0, 5)
+	require.NotNil(t, unknown)
+	var unknownDecoded map[string]any
+	require.NoError(t, json.Unmarshal(unknown, &unknownDecoded))
+	require.Equal(t, float64(0), unknownDecoded["previous_account_id"])
+}
+
+func TestOpenAIWSSidecarAccountSwitchDownstreamEvent(t *testing.T) {
+	event := openAIWSSidecarAccountSwitchDownstreamEvent(3, 5)
+	require.NotNil(t, event)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(event, &decoded))
+	require.Equal(t, "error", decoded["type"])
+	errObj, ok := decoded["error"].(map[string]any)
+	require.True(t, ok)
+	// previous_response_not_found 被 Codex 分类为 retryable：客户端丢弃当前
+	// WS、重连并以全量上下文重放。
+	require.Equal(t, "previous_response_not_found", errObj["code"])
+}
+
+// sticky 路由比对核心：命中不同账号 → (旧账号, true)；未命中 → (0, true)；
+// 同账号 / 查询失败 → 无信号。
+func TestOpenAIWSSidecarSwitchFromForTurn(t *testing.T) {
+	ctx := context.Background()
+	bound3 := func(_ context.Context, _ int64, _ string) (int64, error) {
+		return 3, nil
+	}
+
+	from, ok := openAIWSSidecarSwitchFromForTurn(ctx, bound3, 1, "hash", 5)
+	require.True(t, ok)
+	require.Equal(t, int64(3), from)
+
+	_, ok = openAIWSSidecarSwitchFromForTurn(ctx, bound3, 1, "hash", 3)
+	require.False(t, ok, "同账号 sticky 命中不需要信号")
+
+	miss := func(_ context.Context, _ int64, _ string) (int64, error) {
+		return 0, nil
+	}
+	from, ok = openAIWSSidecarSwitchFromForTurn(ctx, miss, 1, "hash", 5)
+	require.True(t, ok, "sticky 未命中也发信号（视为需要新账号关联）")
+	require.Equal(t, int64(0), from)
+
+	failing := func(_ context.Context, _ int64, _ string) (int64, error) {
+		return 0, errors.New("cache down")
+	}
+	_, ok = openAIWSSidecarSwitchFromForTurn(ctx, failing, 1, "hash", 5)
+	require.False(t, ok, "cache 故障不放大为请求失败")
+
+	_, ok = openAIWSSidecarSwitchFromForTurn(ctx, bound3, 1, "", 5)
+	require.False(t, ok, "无 sessionHash 不发信号")
+}
+
+// WS ingress 切换判定按 turn 形态分流：
+//   - delta turn：续链绑定（response→account）指向其他账号 → retryable 错误
+//     事件 + 良性 NormalClosure；绑定同账号 / 无绑定 → 放行。
+//   - full turn：sticky 命中不同账号或未命中 → 虚拟帧 + 清洗 turn-state 绑定
+//     后放行；同账号命中 → 无信号不清洗。
+func TestOpenAIWSSidecarOnAccountSwitchTurnBranches(t *testing.T) {
+	ctx := context.Background()
+	const groupID = int64(7)
+	const sessionHash = "turn-branch-hash"
+
+	bound3 := func(_ context.Context, _ int64, _ string) (int64, error) {
+		return 3, nil
+	}
+	same5 := func(_ context.Context, _ int64, _ string) (int64, error) {
+		return 5, nil
+	}
+	lease := &openAIWSConnLease{}
+	account5 := &Account{ID: 5}
+
+	t.Run("delta turn + 绑定指向其他账号: 返回 retryable 良性关闭错误", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp-1", 3, time.Hour))
+		err := openAIWSSidecarOnAccountSwitch(ctx, bound3, store, groupID, sessionHash, "resp-1", account5, lease, nil, nil, time.Second)
+		require.Error(t, err)
+		var closeErr *OpenAIWSClientCloseError
+		require.True(t, errors.As(err, &closeErr), "良性 NormalClosure，handler 不再触发账号 failover")
+		require.Equal(t, websocket.StatusNormalClosure, closeErr.StatusCode())
+	})
+
+	t.Run("delta turn + 绑定同账号: 放行", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp-1", 3, time.Hour))
+		account3 := &Account{ID: 3}
+		err := openAIWSSidecarOnAccountSwitch(ctx, bound3, store, groupID, sessionHash, "resp-1", account3, lease, nil, nil, time.Second)
+		require.NoError(t, err)
+	})
+
+	t.Run("delta turn + 无绑定: 放行（由上游自然报错兜底）", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		err := openAIWSSidecarOnAccountSwitch(ctx, bound3, store, groupID, sessionHash, "resp-missing", account5, lease, nil, nil, time.Second)
+		require.NoError(t, err)
+	})
+
+	t.Run("full turn + sticky 命中不同账号: 发虚拟帧 + 清洗 turn-state + 放行", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		store.BindSessionTurnState(groupID, sessionHash, "old-turn-state", time.Hour)
+		err := openAIWSSidecarOnAccountSwitch(ctx, bound3, store, groupID, sessionHash, "", account5, lease, nil, nil, time.Second)
+		require.NoError(t, err, "full turn 自含全量上下文，直接放行")
+		if _, ok := store.GetSessionTurnState(groupID, sessionHash); ok {
+			t.Fatal("turn-state 绑定应被清洗为空")
+		}
+	})
+
+	t.Run("full turn + sticky 未命中: 同样发信号并清洗", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		store.BindSessionTurnState(groupID, sessionHash, "old-turn-state", time.Hour)
+		miss := func(_ context.Context, _ int64, _ string) (int64, error) { return 0, nil }
+		err := openAIWSSidecarOnAccountSwitch(ctx, miss, store, groupID, sessionHash, "", account5, lease, nil, nil, time.Second)
+		require.NoError(t, err)
+		if _, ok := store.GetSessionTurnState(groupID, sessionHash); ok {
+			t.Fatal("sticky 未命中（需要新账号关联）也应清洗 turn-state")
+		}
+	})
+
+	t.Run("full turn + sticky 同账号: 无信号不清洗", func(t *testing.T) {
+		store := NewOpenAIWSStateStore(&schedulerTestGatewayCache{})
+		store.BindSessionTurnState(groupID, sessionHash, "kept", time.Hour)
+		err := openAIWSSidecarOnAccountSwitch(ctx, same5, store, groupID, sessionHash, "", account5, lease, nil, nil, time.Second)
+		require.NoError(t, err)
+		if state, ok := store.GetSessionTurnState(groupID, sessionHash); !ok || state != "kept" {
+			t.Fatal("同账号 sticky 命中不应清洗 turn-state")
+		}
+	})
 }
 
 func TestOpenAISidecarAccountSwitchHeaderValue(t *testing.T) {
@@ -32,6 +159,10 @@ func TestOpenAISidecarAccountSwitchHeaderValue(t *testing.T) {
 	require.Empty(t, openAISidecarAccountSwitchHeaderValue(ctx, 3))
 	require.Empty(t, openAISidecarAccountSwitchHeaderValue(context.Background(), 5))
 	require.Empty(t, openAISidecarAccountSwitchHeaderValue(context.Background(), 0))
+
+	// previous=0（未知切换前账号）也产头，值为 0：sidecar 收到即做关联清洗。
+	unknownCtx := WithOpenAISidecarAccountSwitch(context.Background(), 0)
+	require.Equal(t, "0", openAISidecarAccountSwitchHeaderValue(unknownCtx, 5))
 }
 
 // Req: WS=no 的 OAuth 账号 HTTPS 出站仍走 sidecar（sidecar 判定只看目标

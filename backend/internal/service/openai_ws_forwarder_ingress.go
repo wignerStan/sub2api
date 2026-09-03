@@ -1587,8 +1587,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			sessionLease = acquiredLease
 			sessionConnID = strings.TrimSpace(sessionLease.ConnID())
-			// PATCH hook: 调度器切换账号时先发 sidecar 虚拟帧（见 openai_ws_sidecar_account_switch.go）。
-			maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
+			// PATCH hook: 调度器切换账号 → 下游 retryable 错误 + sidecar 虚拟帧
+			// （见 openai_ws_sidecar_account_switch.go）。
+			if switchErr := openAIWSSidecarOnAccountSwitch(ctx, openAIWSSidecarStickyAccountFunc(s), stateStore, groupID, sessionHash, currentPreviousResponseID, account, sessionLease, clientConn, hooks, s.openAIWSWriteTimeout()); switchErr != nil {
+				return switchErr
+			}
 			if storeDisabled {
 				pinSessionConn(sessionConnID)
 			} else {
@@ -1698,7 +1701,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				sessionLease = acquiredLease
 				sessionConnID = strings.TrimSpace(sessionLease.ConnID())
 				// PATCH hook: 同上（preflight ping 失败重拨后的切换通知）。
-				maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
+				if switchErr := openAIWSSidecarOnAccountSwitch(ctx, openAIWSSidecarStickyAccountFunc(s), stateStore, groupID, sessionHash, currentPreviousResponseID, account, sessionLease, clientConn, hooks, s.openAIWSWriteTimeout()); switchErr != nil {
+					return switchErr
+				}
 				if storeDisabled {
 					pinSessionConn(sessionConnID)
 				}
