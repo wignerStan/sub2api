@@ -365,5 +365,6 @@ pub const EXPLICITLY_STRIPPED_TRACE_AND_TRACKING_NAMES: &[&str] = &[
     "baggage",
     "cookie",
     "set-cookie",
+    "x-codex-inference-call-id",
     "x-codex-routing-hint",
 ];
