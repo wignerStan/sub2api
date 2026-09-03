@@ -287,7 +287,7 @@ func (s *OpenAIGatewayService) getOpenAIWSPassthroughDialer() openAIWSClientDial
 	}
 	s.openaiWSPassthroughDialerOnce.Do(func() {
 		if s.openaiWSPassthroughDialer == nil {
-			s.openaiWSPassthroughDialer = newDefaultOpenAIWSClientDialer()
+			s.openaiWSPassthroughDialer = openAIWSDefaultDialer() // PATCH hook: sidecar-aware dialer
 		}
 	})
 	return s.openaiWSPassthroughDialer
