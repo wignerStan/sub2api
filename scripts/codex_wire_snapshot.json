@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-09-02T08:21:39.971995+00:00",
+  "generated_at": "2026-09-03T08:30:53.988100+00:00",
   "source": {
     "repo": "openai/codex",
     "ref": "main",
     "commit": {
-      "sha": "eb10d91e48ccbd0930427461fb392337addb1ac0",
-      "date": "2026-09-02T05:23:24Z",
-      "message": "Add Windows voice runtime preparation (#42209)",
-      "html_url": "https://github.com/openai/codex/commit/eb10d91e48ccbd0930427461fb392337addb1ac0"
+      "sha": "728cb12fe5794b0c3a8e776fb4994b1650b973a8",
+      "date": "2026-09-03T06:02:25Z",
+      "message": "Expose thread originators through the app-server API (#42458)",
+      "html_url": "https://github.com/openai/codex/commit/728cb12fe5794b0c3a8e776fb4994b1650b973a8"
     },
     "files": [
       "codex-rs/backend-client/src/client.rs",
