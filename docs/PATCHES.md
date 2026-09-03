@@ -105,17 +105,27 @@ native path is untouched. Live counters: `GET /v1/pool-stats` on the sidecar.
 
 ## Account-switch signaling
 
-When the scheduler rebinds a session to a different account, the sidecar must
-evict the previous account's thread-scoped sockets (routing hints, turn-state
-and continuation chains must not leak across accounts):
+When the scheduler rebinds a session to a different account mid-WS-turn, the
+gateway itself returns the downstream error: a Realtime-style `error` event
+carrying code `previous_response_not_found` (Codex classifies it as retryable
+→ discard the WS, reconnect, resend the full request context), followed by a
+benign `NormalClosure` — the handler neither failovers again nor charges
+account health. The same hook notifies the sidecar (virtual frame) and
+purges the session's harvested `x-codex-turn-state` so the reconnect dial on
+the new account starts clean.
 
 - **WS**: virtual frame `{"x-s2s-vframe":"account-switch",
   "previous_account_id":N,"account_id":M}` inside the hop — consumed by the
   sidecar, never forwarded upstream. Emitted when a session's
   `previous_response_id` chain is bound to another account (response→account
-  state store) and after preflight-ping re-dials.
+  state store), after preflight-ping re-dials, and on post-reconnect
+  recognition (session switch memory, 15m TTL).
+- **Sidecar purge at first switch**: per-hop flag removes `x-codex-turn-state`
+  (flat client_metadata, both envelopes) and the root `prompt_cache_key` from
+  every subsequent frame; dial-time purge strips the harvested turn-state
+  header for switched scopes (15m TTL).
 - **HTTP**: `x-s2s-account-switched: <previous account id>` request header on
-  sidecar forwards (stripped from upstream egress).
+  sidecar forwards (stripped from upstream egress; informational).
 
 The WS/HTTP mutual exclusion stays intact in both modes: under
 `SUB2API_PATCH` OAuth accounts are forced WS-only (HTTP auto-passthrough
