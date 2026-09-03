@@ -1,30 +1,35 @@
 package service
 
-// PATCH: 调度器切换账号时通知 sidecar，避免跨账号污染同一线程范围的连接
-// 亲和/路由提示/续链缓存（docs/06：session_id 由 root+所有子线程共享，而
-// 传输与 delta 链按 thread 独立）。
-// - WS 模式：在 sidecar hop 上发一个"虚拟帧"（sidecar 侧消费，不转发上游）。
-// - HTTP 模式：走 x-s2s-account-switched header（sidecar 按控制头剥离）。
-// 补丁原则：判断逻辑全部收在本文件；上游文件只有 1–3 行的挂点。
+// PATCH: 调度器切换账号时的信号语义（Go nearly passthrough）：
+//   - WS delta turn（previous_response_id 非空）：续链（response→account 绑定）
+//     属于其他账号 = 调度器换了账号 → 直接向下游返回 retryable 错误事件
+//     （previous_response_not_found，Codex responses_retry 语义：丢弃当前 WS →
+//     重连 → 全量重放）+ 良性 NormalClosure。这是唯一的决策 hook。
+//   - 其它一律加 header：x-s2s-account-switched（值 = 切换前账号 ID），由
+//     failover 事件经 request ctx带到出站 seam（HTTP 转发 / WS 拨号头）；
+//     sidecar按控制头剥离，不转发上游。
+//   - 虚拟帧（vframe）协议已废除：换号必然伴随重建新 WS（delta 错误 → 客户端
+//     重连），header 走拨号/请求头即可。
+// 补丁原则：判断逻辑全部收在本文件；上游文件只有 1–3 行挂点。
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"time"
+
+	coderws "github.com/coder/websocket"
 )
 
-// openAIWSSidecarVFrameMarker 是 sidecar 虚拟帧协议字段名。
-const openAIWSSidecarVFrameMarker = "x-s2s-vframe"
-
-// x-s2s-account-switched 是 HTTP 侧告知 sidecar 账号切换的控制头，
-// 值为切换前（previous）的账号 ID；sidecar 按控制头剥离，不转发上游。
+// x-s2s-account-switched 是告知 sidecar 账号切换的控制头，值为切换前
+// （previous）的账号 ID；sidecar 按控制头剥离，不转发上游。
 const openAISidecarAccountSwitchHeader = "x-s2s-account-switched"
 
 type openAISidecarAccountSwitchContextKey struct{}
 
 // WithOpenAISidecarAccountSwitch 标记"本次尝试是调度器从 fromAccountID 切换
-// 过来的"。由 handler 的 failover 分支在切换后挂到请求 ctx 上。
+// 过来的"。由 handler 的 failover 分支在切换后挂到请求 ctx 上；出站 seam
+// （HTTP 转发 / WS 拨号头）据此加 x-s2s-account-switched。
 func WithOpenAISidecarAccountSwitch(ctx context.Context, fromAccountID int64) context.Context {
 	if fromAccountID <= 0 {
 		return ctx
@@ -40,15 +45,21 @@ func openAISidecarAccountSwitchFrom(ctx context.Context) int64 {
 	return from
 }
 
-// openAIWSSidecarAccountSwitchFrame 构造 WS 虚拟帧；无需通知时返回 nil。
-func openAIWSSidecarAccountSwitchFrame(previousAccountID, accountID int64) json.RawMessage {
-	if previousAccountID <= 0 || previousAccountID == accountID {
-		return nil
-	}
+// openAIWSSidecarAccountSwitchDownstreamEvent 构造发给下游 Codex 客户端的
+// error event。previous_response_not_found 被 Codex 分类为 retryable：丢弃
+// 当前 WS → 重连 → 全量重放（显式 drop previous_response_id）。
+func openAIWSSidecarAccountSwitchDownstreamEvent(previousAccountID, accountID int64) []byte {
 	payload, err := json.Marshal(map[string]any{
-		openAIWSSidecarVFrameMarker: "account-switch",
-		"previous_account_id":       previousAccountID,
-		"account_id":                accountID,
+		"event_id": newOpenAIFastPolicyWSEventID(),
+		"type":     "error",
+		"error": map[string]any{
+			"type": "invalid_request_error",
+			"code": "previous_response_not_found",
+			"message": fmt.Sprintf(
+				"upstream account switched by scheduler (previous account %d); reconnect and resend the full request context",
+				previousAccountID,
+			),
+		},
 	})
 	if err != nil {
 		return nil
@@ -56,47 +67,48 @@ func openAIWSSidecarAccountSwitchFrame(previousAccountID, accountID int64) json.
 	return payload
 }
 
-// maybeWriteOpenAIWSSidecarAccountSwitchFrame 在新 sessionLease 建立后调用：
-// 会话续链（previous_response_id 的 response→account 绑定）属于另一个账号 =
-// 调度器切换了账号，先向 sidecar 发虚拟帧再写正式 turn payload。发送失败仅
-// 记日志，绝不影响业务链路。
-func maybeWriteOpenAIWSSidecarAccountSwitchFrame(
+// openAIWSSidecarOnDeltaTurnSwitch 在新 sessionLease 建立后调用（WS delta
+// turn 的切换判定）：续链绑定属于另一个账号 = 调度器切换了账号 → 向下游写
+// error event 后返回良性 NormalClosure（调用方原样返回给 handler，不再触发
+// 账号 failover）。非 delta turn / 绑定同账号 / 无绑定 → 返回 nil 放行，
+// 换号信号由 header 通道承载。
+func openAIWSSidecarOnDeltaTurnSwitch(
 	ctx context.Context,
 	stateStore OpenAIWSStateStore,
 	groupID int64,
 	previousResponseID string,
 	account *Account,
-	lease *openAIWSConnLease,
+	clientConn *coderws.Conn,
+	hooks *OpenAIWSIngressHooks,
 	writeTimeout time.Duration,
-) {
-	if lease == nil || account == nil || stateStore == nil || previousResponseID == "" {
-		return
+) error {
+	if account == nil || stateStore == nil || previousResponseID == "" {
+		return nil
 	}
 	previousAccountID, err := stateStore.GetResponseAccount(ctx, groupID, previousResponseID)
 	if err != nil || previousAccountID <= 0 || previousAccountID == account.ID {
-		return
+		return nil
 	}
-	frame := openAIWSSidecarAccountSwitchFrame(previousAccountID, account.ID)
-	if frame == nil {
-		return
-	}
-	if writeErr := lease.WriteJSONWithContextTimeout(ctx, frame, writeTimeout); writeErr != nil {
-		logOpenAIWSModeInfo(
-			"ingress_ws_sidecar_switch_frame_write_fail account_id=%d previous_account_id=%d cause=%s",
-			account.ID,
-			previousAccountID,
-			truncateOpenAIWSLogValue(writeErr.Error(), openAIWSLogValueMaxLen),
-		)
-		return
+	if clientConn != nil {
+		if eventBytes := openAIWSSidecarAccountSwitchDownstreamEvent(previousAccountID, account.ID); eventBytes != nil {
+			writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, writeTimeout)
+			_ = clientConn.Write(writeCtx, coderws.MessageText, eventBytes)
+			cancel()
+		}
 	}
 	logOpenAIWSModeInfo(
-		"ingress_ws_sidecar_switch_frame_sent account_id=%d previous_account_id=%d",
+		"ingress_ws_sidecar_switch_delta_error account_id=%d previous_account_id=%d",
 		account.ID,
 		previousAccountID,
 	)
+	return NewOpenAIWSClientCloseError(
+		coderws.StatusNormalClosure,
+		"upstream account switched by scheduler; please reconnect",
+		nil,
+	)
 }
 
-// openAISidecarAccountSwitchHeaderValue 返回 HTTP 侧的切换通知头值；
+// openAISidecarAccountSwitchHeaderValue 返回出站切换通知头值；
 // 无切换（未标记 / 同账号）时返回空串。
 func openAISidecarAccountSwitchHeaderValue(ctx context.Context, accountID int64) string {
 	from := openAISidecarAccountSwitchFrom(ctx)

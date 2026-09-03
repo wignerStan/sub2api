@@ -2447,6 +2447,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return false
 		}
 		h.gatewayService.RecordOpenAIAccountSwitch()
+		// PATCH hook: 调度器 failover 换号 → 通知 sidecar（重连拨号头携带）。
+		c.Request = c.Request.WithContext(service.WithOpenAISidecarAccountSwitch(c.Request.Context(), account.ID))
 		failedAccountIDs[account.ID] = struct{}{}
 		lastFailoverErr = failoverErr
 		if switchCount >= maxAccountSwitches {

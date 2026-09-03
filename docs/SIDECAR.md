@@ -82,13 +82,20 @@ trailing-byte streams fail closed (`errSidecarE2EETrunc` /
   surfaces the cached handshake response headers on the local 101. The
   gateway owns business logic (scheduling, quota, failover, replay payloads);
   the sidecar owns connection lifetime. Counters: `/v1/pool-stats`.
-- **Account-switch signaling**: WS mode uses a virtual frame
-  (`x-s2s-vframe: account-switch`), HTTP mode the `x-s2s-account-switched`
-  header (value = previous account id). On signal the pool evicts every other
-  account's idle socket for that thread scope, strips the server-issued
-  `x-codex-turn-state`, and regenerates the codex-shaped `prompt_cache_key`
-  under the new account's converged identity; the frame/header never reach
-  upstream.
+- **Account-switch signaling (two channels)**: the gateway stamps scheduler
+  failover events onto the request ctx (in-process, zero delay) and the
+  WS dial / HTTP forward seams emit `x-s2s-account-switched: <previous
+  account id>`; WS delta turns whose continuation chain is bound elsewhere
+  get the retryable `previous_response_not_found` error from the gateway
+  itself, so a switch always re-establishes the WS. The sidecar also
+  subscribes to redis keyevents on the sticky-binding keys
+  (`sticky_session:*`; needs `notify-keyspace-events` incl. `$g`) and warms
+  its hot caches for the switched-to account. Incoming dials double-validate
+  (hot cache; header-before-notify waits bounded); on signal the pool evicts
+  every other account's socket for the thread scope, strips the
+  server-issued `x-codex-turn-state`, and regenerates the codex-shaped
+  `prompt_cache_key` under the new account's converged identity. Nothing
+  reaches upstream.
 
 ## Deployment
 

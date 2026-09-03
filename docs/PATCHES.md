@@ -44,9 +44,10 @@ base_url + token are both present, the sidecar is enabled.
 | `service/openai_ws_client.go` | coder dialer strips sidecar control headers; conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
 | `service/openai_account_runtime_block_fastpath.go` | `blockAccountSchedulingLocked`: remember block reason; `ClearAccountSchedulingBlock`: delete reason | `service/openai_guardian_route.go` |
 | `service/openai_ws_pool.go` / `openai_ws_forwarder.go` | dialer construction → `openAIWSDefaultDialer()` (sidecar-aware when configured) | `service/openai_ws_pool_sidecar.go` |
-| `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: emit the sidecar account-switch virtual frame when the continuation chain (response→account binding) belongs to another account | `service/openai_ws_sidecar_account_switch.go` |
-| `handler/openai_gateway_handler.go` | HTTP responses failover loop: mark the request ctx on a scheduler account switch | `service/openai_ws_sidecar_account_switch.go` |
-| `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount` sets `x-s2s-account-switched` from the ctx marker | same file (patch-owned) |
+| `service/openai_ws_forwarder_ingress.go` | after `sessionLease` acquisition: WS delta turn whose continuation chain (response→account binding) belongs to another account → return the retryable `previous_response_not_found` error + benign close | `service/openai_ws_sidecar_account_switch.go` |
+| `handler/openai_gateway_handler.go` | WS + HTTP failover loops: stamp the scheduler switch onto the request ctx | `service/openai_ws_sidecar_account_switch.go` |
+| `service/openai_ws_forwarder_v2.go` | WS dial seam: switch-stamped ctx → `x-s2s-account-switched` dial header (sidecar-gated) | `service/openai_ws_sidecar_account_switch.go` |
+| `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount`: switch-stamped ctx → `x-s2s-account-switched` header | same file (patch-owned) |
 
 Upstream files that stay **byte-identical** on this branch (all patch content
 in sidecar/guardian files): `service/openai_gateway_service.go` (whitelist
@@ -105,24 +106,38 @@ native path is untouched. Live counters: `GET /v1/pool-stats` on the sidecar.
 
 ## Account-switch signaling
 
-The gateway stays a passthrough: it only reports the scheduler's account
-switch as a fact, and the sidecar owns every identity-correlation reaction.
+Two channels; the gateway stays nearly passthrough and owns no identity
+correlation logic:
 
-- **WS**: after a new `sessionLease` is established, if the session's
-  continuation chain (`previous_response_id` → response→account state store)
-  is bound to another account, the hook writes one virtual frame
-  `{"x-s2s-vframe":"account-switch","previous_account_id":N,"account_id":M}`
-  onto the hop — consumed by the sidecar, never forwarded upstream. Send
-  failure is log-only.
-- **HTTP**: the failover loop marks the request ctx when the scheduler
-  switches accounts; `ForwardHTTPViaSidecarForAccount` turns the marker into
-  the `x-s2s-account-switched: <previous account id>` header (stripped from
-  upstream egress).
-- **Sidecar reaction** (see the sidecar README): evict every other account's
-  idle socket for the thread scope, strip the server-issued
-  `x-codex-turn-state` from the hop and at dial time for switched scopes, and
-  regenerate the codex-shaped `prompt_cache_key` under the new account's
-  converged identity (never delete the carrier).
+1. **Header channel** — the gateway hooks scheduler failover events directly
+   (in-process fact: zero delay, works when redis is down). The failover
+   loops stamp the switch onto the request ctx (1 line each); the sidecar
+   forward/dial seams turn it into `x-s2s-account-switched: <previous account
+   id>` (control header, stripped from upstream egress). A switch always
+   re-establishes the WS: delta turns (continuation chain bound to another
+   account, via the response→account state store) get the retryable
+   `previous_response_not_found` error event + benign `NormalClosure` from
+   the gateway itself (Codex discards the WS, reconnects, full-replays), so
+   headers always ride a fresh dial.
+2. **Redis notify channel** — the gateway's existing sticky-binding writes
+   (`sticky_session:{group}:{hash}`) publish redis keyevents; the sidecar
+   subscribes and warms its hot caches (db profile → hot cache) for the
+   switched-to account ahead of its traffic. Requires redis
+   `notify-keyspace-events` to include string + generic events (e.g.
+   `KEg$`, or `KEA`). Zero gateway patches.
+
+The sidecar double-validates incoming traffic: header consistency (previous
+account != current account, hot path); a dial that beats the redis event
+waits (bounded) for the ledger entry, on timeout the header stays
+authoritative. The correlation split then runs sidecar-side: old account's
+identity entries invalidated (moka L1 + redis L2), pooled sockets evicted
+for the thread scope, hop-level `x-codex-turn-state` stripping seeded, and
+the codex-shaped `prompt_cache_key` regenerated under the new account's
+identity. The gateway never touches `x-codex-turn-state` bindings for
+switching.
+
+The original sub2api ctx-pool transport mode is retired: the switch hooks
+live in the WS v2 ingress general path, never in pool-mode forwarder paths.
 
 ## Identity convergence ownership
 

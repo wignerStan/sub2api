@@ -1587,8 +1587,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			sessionLease = acquiredLease
 			sessionConnID = strings.TrimSpace(sessionLease.ConnID())
-			// PATCH hook: 调度器切换账号时先发 sidecar 虚拟帧（见 openai_ws_sidecar_account_switch.go）。
-			maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
+			// PATCH hook: WS delta turn 续链绑定换号 → 直接返回 retryable 错误（见 openai_ws_sidecar_account_switch.go）。
+			if switchErr := openAIWSSidecarOnDeltaTurnSwitch(ctx, stateStore, groupID, currentPreviousResponseID, account, clientConn, hooks, s.openAIWSWriteTimeout()); switchErr != nil {
+				return switchErr
+			}
 			if storeDisabled {
 				pinSessionConn(sessionConnID)
 			} else {
@@ -1697,8 +1699,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				sessionLease = acquiredLease
 				sessionConnID = strings.TrimSpace(sessionLease.ConnID())
-				// PATCH hook: 同上（preflight ping 失败重拨后的切换通知）。
-				maybeWriteOpenAIWSSidecarAccountSwitchFrame(ctx, stateStore, groupID, currentPreviousResponseID, account, sessionLease, s.openAIWSWriteTimeout())
+				// PATCH hook: 同上（preflight ping 失败重拨后的 delta 切换判定）。
+				if switchErr := openAIWSSidecarOnDeltaTurnSwitch(ctx, stateStore, groupID, currentPreviousResponseID, account, clientConn, hooks, s.openAIWSWriteTimeout()); switchErr != nil {
+				return switchErr
+			}
 				if storeDisabled {
 					pinSessionConn(sessionConnID)
 				}
