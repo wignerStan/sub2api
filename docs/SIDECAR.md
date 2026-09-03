@@ -14,7 +14,9 @@ contract the Go gateway depends on.
 Under `SUB2API_PATCH` the sidecar is the sole identity engine (Go mimic off):
 single converged level `Device` — installation convergence plus full
 session-family regeneration (`session_id`/`thread_id`/window chain/turn ids
-thread-keyed so root/fork sharing a session-id stay distinct, codex-shaped
+thread-keyed so agent-tree members sharing a session-id stay distinct
+(per docs/06 §4.4: a fork of a root thread starts a NEW tree with a new
+session id — only subagents inherit the root's session id), codex-shaped
 `prompt_cache_key` regeneration, body topology enrichment on the first WS
 frame), a write-back sticky identity map per (account, client thread) over
 infra cache tiers (moka L1 + redis L2), and converged injection into headers,
