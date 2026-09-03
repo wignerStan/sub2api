@@ -650,6 +650,9 @@ func (c *openAIWSClientFrameConn) WriteFrame(ctx context.Context, msgType coderw
 		if c.restoreToolNames != nil {
 			payload = c.restoreToolNames(payload)
 		}
+		// PATCH hook (sync-183 1dc0a0900): 下行直写容量降载改写，逻辑见
+		// openai_ws_v2_relay_patch.go。
+		payload = openAIWSRewriteDownstreamCapacityShedPatch(payload)
 	}
 	return c.conn.Write(ctx, msgType, payload)
 }
@@ -1048,6 +1051,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				requestModelForThisFrame = usageMeta.requestModelForFrame(payload)
 				if requestModelForThisFrame == "" {
 					requestModelForThisFrame = capturedSessionModel
+				}
+				// PATCH hook (sync-183 a0cfa8002): passthrough 模式恢复 BeforeTurn
+				// turn 级准入门，逻辑见 openai_ws_v2_relay_patch.go。
+				if err := openAIWSRelayBeforeTurnPatch(hooks, turnNo); err != nil {
+					return payload, nil, err
 				}
 				if hooks != nil && hooks.BeforeRequest != nil {
 					if err := hooks.BeforeRequest(turnNo, payload, requestModelForThisFrame); err != nil {

@@ -48,6 +48,11 @@ base_url + token are both present, the sidecar is enabled.
 | `handler/openai_gateway_handler.go` | WS + HTTP failover loops: stamp the scheduler switch onto the request ctx | `service/openai_ws_sidecar_account_switch.go` |
 | `service/openai_ws_forwarder_v2.go` | WS dial seam: switch-stamped ctx → `x-s2s-account-switched` dial header (sidecar-gated) | `service/openai_ws_sidecar_account_switch.go` |
 | `service/openai_sidecar_tls.go` | `ForwardHTTPViaSidecarForAccount`: switch-stamped ctx → `x-s2s-account-switched` header | same file (patch-owned) |
+| `service/openai_ws_v2_passthrough_adapter.go` | `openAIWSClientFrameConn.WriteFrame`: +1 line downstream capacity-shed rewrite (`server_is_overloaded`/`slow_down` → `server_error` in the client copy only) | `service/openai_ws_v2_relay_patch.go` |
+| `service/openai_ws_v2_passthrough_adapter.go` | response.create frame path: +3 lines `openAIWSRelayBeforeTurnPatch` before `BeforeRequest` (per-turn profit gate + pricingAt freeze in passthrough mode) | `service/openai_ws_v2_relay_patch.go` |
+| `service/openai_gateway_upstream_errors.go` | `newOpenAIAccountFailoverErrorWithClassificationHeaders`: +1 line `applyOpenAIAccountCustomErrorMappingPatch` (account-level custom error-code mapping) | `service/openai_ws_v2_relay_patch.go` |
+| `handler/openai_gateway_handler.go` | `closeOpenAIWSFailoverExhausted`: +2 lines → patched close (structured error event, rate-limit message alignment, passthrough rules, client overrides) | `handler/openai_ws_failover_close_patch.go` |
+| `handler/openai_gateway_handler.go` | `ResponsesWebSocket`: +3 lines bind `errorPassthroughService` into gin ctx (HTTP paths already bind it) | `handler/openai_ws_failover_close_patch.go` |
 
 Upstream files that stay **byte-identical** on this branch (all patch content
 in sidecar/guardian files): `service/openai_gateway_service.go` (whitelist
@@ -63,6 +68,9 @@ files, the WS forwarder/pool files.
 | `service/sidecar_e2ee.go` | AES-256-GCM record codec, HKDF keys, 64 MB cap (Go↔rust parity with sidecar `src/e2ee.rs`) |
 | `service/openai_ws_client_sidecar.go` | WS dialer selector, sidecar `/v1/ws` dialer, E2EE conn wrapper |
 | `service/openai_guardian_route.go` | Guardian route detection, dedicated URLs, schedulability gates, block-reason state |
+| `service/openai_ws_v2_relay_patch.go` | sync-183 WS relay/failover parity: downstream capacity-shed rewrite, passthrough BeforeTurn gate, account custom-error-code mapping |
+| `handler/openai_gateway_ws_failover_event.go` | Structured failover error event writer (Responses WS error contract before the close frame, retry-after fallback) |
+| `handler/openai_ws_failover_close_patch.go` | sync-183 failover-exhausted close end-state (event + rule matching + client overrides), `SUB2API_PATCH`-gated |
 
 ## Intended next hook points (defined, not yet wired)
 
