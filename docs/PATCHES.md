@@ -43,6 +43,7 @@ base_url + token are both present, the sidecar is enabled.
 | `service/openai_privacy_service.go` | broadened Cloudflare-challenge body markers (lowercase match, `challenge-platform`, `<html`) | inline (small robustness fix) |
 | `service/openai_ws_client.go` | coder dialer strips sidecar control headers; conn read pump; `ensureReadPump` before publish | `service/openai_ws_client_sidecar.go` |
 | `service/openai_account_runtime_block_fastpath.go` | `blockAccountSchedulingLocked`: remember block reason; `ClearAccountSchedulingBlock`: delete reason | `service/openai_guardian_route.go` |
+| `service/openai_ws_pool.go` / `openai_ws_forwarder.go` | dialer construction → `openAIWSDefaultDialer()` (sidecar-aware when configured) | `service/openai_ws_pool_sidecar.go` |
 
 Upstream files that stay **byte-identical** on this branch (all patch content
 in sidecar/guardian files): `service/openai_gateway_service.go` (whitelist
@@ -86,6 +87,18 @@ paths yet (matching the reviewed migrate state):
    `go test ./internal/service/ ./internal/repository/ -run 'Sidecar|E2EE|Patch|Passthrough|Guardian|WS' -count=1`.
 4. If upstream codex wire format changed, update the sidecar first (see the
    sidecar repo README; `codex_wire_audit.py` snapshots), then re-verify.
+
+## Upstream WS connection pool (sidecar-owned transport)
+
+The ctx_pool transport engine is owned by the sidecar (`src/ws_pool.rs` in the
+sidecar repo): thread-scoped socket reuse, exclusive leases, 55m/60m rotation,
+acquire-time and background health pings, idle trimming. The gateway's
+ownership is business-only: scheduling, quota, failover, replay payload
+construction, preemption/state stores. The wiring is the
+`openAIWSDefaultDialer()` hook above — with `SUB2API_SIDECAR_*` configured,
+pool and passthrough WS dials relay through the sidecar, whose pool reuses
+sockets per thread scope (root/subagent stay independent); without it the
+native path is untouched. Live counters: `GET /v1/pool-stats` on the sidecar.
 
 ## Identity convergence ownership
 

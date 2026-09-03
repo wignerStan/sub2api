@@ -70,6 +70,13 @@ trailing-byte streams fail closed (`errSidecarE2EETrunc` /
   `thread_id`/`conversation_id`, never by shared `session_id`.
 - WS and HTTP auto-passthrough are mutually exclusive for OAuth accounts;
   under `SUB2API_PATCH` the gateway forces WS v2 + `passthrough` mode.
+- **Upstream connection pool (ctx pool transport)**: when pooled, the sidecar
+  reuses upstream sockets keyed by `(account, target, proxy, thread scope)` —
+  never the shared `session_id`. Leases are exclusive; 55m proactive rotation
+  and 60m hard lifetime; acquire-time + background health pings; a reused hop
+  surfaces the cached handshake response headers on the local 101. The
+  gateway owns business logic (scheduling, quota, failover, replay payloads);
+  the sidecar owns connection lifetime. Counters: `/v1/pool-stats`.
 
 ## Deployment
 
