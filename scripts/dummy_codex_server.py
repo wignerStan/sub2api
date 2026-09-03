@@ -221,10 +221,7 @@ def sanitize_json(value, key: str | None = None):
         if normalized in REDACT_FIELDS or looks_sensitive_name(normalized):
             return REDACTED
         if normalized == "x-codex-turn-metadata" and isinstance(value, str):
-            try:
-                return sanitize_json(json.loads(value))
-            except json.JSONDecodeError:
-                return REDACTED
+            return sanitize_turn_metadata_string(value)
 
     if isinstance(value, dict):
         return {str(k): sanitize_json(v, str(k)) for k, v in value.items()}
@@ -918,6 +915,11 @@ def self_test() -> None:
         )
         assert payload["type"] == "response.create"
         assert payload["client_metadata"]["thread_id"] == REDACTED
+        body_metadata = json.loads(
+            payload["client_metadata"]["x-codex-turn-metadata"]
+        )
+        assert body_metadata["session_id"] == REDACTED
+        assert body_metadata["request_kind"] == "regular"
         assert payload["input"] == SKIPPED
     finally:
         UNSAFE_FULL_CAPTURE = previous
