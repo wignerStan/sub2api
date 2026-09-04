@@ -928,3 +928,59 @@ func TestApplyCodexFingerprintClientMetadataRaw_NonObjectBodyUntouched(t *testin
 		assert.Equal(t, []byte(body), out)
 	}
 }
+
+// SUB2API_PATCH 主开关：Go 侧拟态全关，身份收敛由 Rust sidecar 全权处理。
+// 补丁开启时必须无视 DB extra 里的显式 opt-in（session/full），否则旧部署
+// （df5470be9 谱系）会继续写入发明形状的扁平 client_metadata["window_id"]，
+// 被 sidecar 的 wire 审计策略 403 拒绝。
+func TestGetCodexFingerprintMode_Sub2apiPatchForcesOffIgnoringDB(t *testing.T) {
+	t.Setenv("SUB2API_PATCH", "1")
+
+	for _, dbMode := range []string{"session", "full", "device"} {
+		account := newTestOAuthAccount(1, map[string]any{
+			codexFingerprintModeExtraKey: dbMode,
+			codexFingerprintSeedExtraKey: testCodexFingerprintSeed,
+		})
+		assert.Equal(t, codexFingerprintOff, account.GetCodexFingerprintMode(),
+			"SUB2API_PATCH 开启时 DB 模式 %q 必须被无视", dbMode)
+	}
+}
+
+func TestResolveCodexFingerprintIDsFromRequest_Sub2apiPatchReturnsNil(t *testing.T) {
+	t.Setenv("SUB2API_PATCH", "1")
+
+	account := newTestOAuthAccount(1, map[string]any{
+		codexFingerprintModeExtraKey: codexFingerprintFull,
+		codexFingerprintSeedExtraKey: testCodexFingerprintSeed,
+	})
+	assert.Nil(t, resolveCodexFingerprintIDsFromRequest(account, nil),
+		"SUB2API_PATCH 开启时收敛 ID 不得解析，apply* 全部 no-op")
+}
+
+// 补丁开启时出站 client_metadata 不得新增任何指纹键（尤其是发明形状的
+// 扁平 window_id —— 真实 codex 只发 x-codex-window-id 与嵌套 turn_metadata）。
+func TestApplyCodexFingerprintClientMetadata_Sub2apiPatchNeverTouches(t *testing.T) {
+	t.Setenv("SUB2API_PATCH", "1")
+
+	account := newTestOAuthAccount(1, map[string]any{
+		codexFingerprintModeExtraKey: codexFingerprintFull,
+		codexFingerprintSeedExtraKey: testCodexFingerprintSeed,
+	})
+	reqBody := map[string]any{
+		"client_metadata": map[string]any{
+			"session_id":              "client-session",
+			"x-codex-window-id":       "client-window",
+			"x-codex-installation-id": "client-install",
+		},
+	}
+	original, err := json.Marshal(reqBody["client_metadata"])
+	require.NoError(t, err)
+
+	ids := resolveCodexFingerprintIDsFromRequest(account, nil)
+	require.Nil(t, ids)
+	assert.False(t, applyCodexFingerprintClientMetadata(reqBody, ids))
+	after, err := json.Marshal(reqBody["client_metadata"])
+	require.NoError(t, err)
+	assert.JSONEq(t, string(original), string(after), "client_metadata 必须逐字节保持原样")
+	assert.NotContains(t, reqBody["client_metadata"], "window_id")
+}
