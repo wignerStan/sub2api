@@ -879,7 +879,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			return fmt.Errorf("refresh ws authentication headers: %w", err)
 		}
 		dialCtx, cancelDial := context.WithTimeout(ctx, s.openAIWSDialTimeout())
-		upstreamConn, statusCode, handshakeHeaders, err = dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+		// PATCH hook: pass the scheduler-owned account ID so the sidecar dialer
+		// derives the WS handshake identity from the account persona (same seed
+		// as the HTTP e2ee forward) instead of the sidecar default profile.
+		if aware, ok := dialer.(openAIWSAccountAwareClientDialer); ok {
+			upstreamConn, statusCode, handshakeHeaders, err = aware.DialForAccount(dialCtx, wsURL, headers, proxyURL, account.ID)
+		} else {
+			upstreamConn, statusCode, handshakeHeaders, err = dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+		}
 		cancelDial()
 		if err == nil {
 			break
