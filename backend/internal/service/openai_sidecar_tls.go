@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"log/slog"
@@ -355,6 +356,22 @@ func forwardHTTPViaSidecar(cfg *config.Config, client *http.Client, req *http.Re
 	return resp, nil
 }
 
+type openAISidecarAccountContextKey struct{}
+
+// WithOpenAISidecarAccount attaches an account ID to ctx for sidecar routing.
+func WithOpenAISidecarAccount(ctx context.Context, accountID int64) context.Context {
+	return context.WithValue(ctx, openAISidecarAccountContextKey{}, accountID)
+}
+
+// OpenAISidecarAccountFrom retrieves the account ID attached to ctx, or 0 if none.
+func OpenAISidecarAccountFrom(ctx context.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	id, _ := ctx.Value(openAISidecarAccountContextKey{}).(int64)
+	return id
+}
+
 // NewSidecarAwareRoundTripper sends official OpenAI OAuth URLs through the
 // rustls sidecar and leaves every other request on base.
 func NewSidecarAwareRoundTripper(cfg *config.Config, base http.RoundTripper, proxyURL string) http.RoundTripper {
@@ -364,10 +381,20 @@ func NewSidecarAwareRoundTripper(cfg *config.Config, base http.RoundTripper, pro
 	return &sidecarAwareRoundTripper{cfg: cfg, base: base, proxyURL: proxyURL}
 }
 
+// NewSidecarAwareRoundTripperForAccount constructs a sidecar-aware transport bound
+// to a specific account ID.
+func NewSidecarAwareRoundTripperForAccount(cfg *config.Config, base http.RoundTripper, proxyURL string, accountID int64) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &sidecarAwareRoundTripper{cfg: cfg, base: base, proxyURL: proxyURL, accountID: accountID}
+}
+
 type sidecarAwareRoundTripper struct {
-	cfg      *config.Config
-	base     http.RoundTripper
-	proxyURL string
+	cfg       *config.Config
+	base      http.RoundTripper
+	proxyURL  string
+	accountID int64
 }
 
 func (t *sidecarAwareRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -379,6 +406,13 @@ func (t *sidecarAwareRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		cfg = sidecarRuntime()
 	}
 	if ShouldUseSidecarTLS(req) && SidecarTLSEnabled(cfg) {
+		accountID := t.accountID
+		if accountID <= 0 && req != nil {
+			accountID = OpenAISidecarAccountFrom(req.Context())
+		}
+		if accountID > 0 {
+			return ForwardHTTPViaSidecarForAccount(cfg, nil, req, t.proxyURL, accountID)
+		}
 		return ForwardHTTPViaSidecar(cfg, nil, req, t.proxyURL)
 	}
 	return t.base.RoundTrip(req)

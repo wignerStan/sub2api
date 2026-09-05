@@ -12,6 +12,8 @@ import (
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/imroc/req/v3"
 )
 
@@ -24,17 +26,12 @@ var ErrSparkShadowResetNotSupported = infraerrors.New(http.StatusConflict, "SPAR
 
 // Endpoints used by the OpenAI/ChatGPT/Codex quota query and reset feature.
 const (
-	chatGPTUsageURL             = "https://chatgpt.com/backend-api/wham/usage"
-	chatGPTRateLimitCreditsURL  = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-	chatGPTRateLimitResetURL    = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
-	openaiQuotaUpstreamTimeout  = 20 * time.Second
-	openaiQuotaCodexBeta        = "codex-1"
-	openaiQuotaCodexOriginator  = "Codex Desktop"
-	openaiQuotaCodexLanguageTag = "zh-CN"
-	openaiQuotaSecFetchSite     = "none"
-	openaiQuotaSecFetchMode     = "no-cors"
-	openaiQuotaSecFetchDest     = "empty"
-	openaiQuotaResetCreditsKey  = "codex_reset_credit_snapshot"
+	chatGPTUsageURL            = "https://chatgpt.com/backend-api/wham/usage"
+	chatGPTRateLimitCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	chatGPTRateLimitResetURL   = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+	openaiQuotaUpstreamTimeout = 20 * time.Second
+	openaiQuotaCodexBeta       = "codex-1"
+	openaiQuotaResetCreditsKey = "codex_reset_credit_snapshot"
 )
 
 // OpenAIRateLimitWindow describes a single rate-limit window returned by
@@ -111,16 +108,27 @@ type OpenAIQuotaResetResult struct {
 	WindowsReset int                     `json:"windows_reset"`
 }
 
+// QuotaClientFactory creates an HTTP client for quota and reset API calls.
+type QuotaClientFactory func(ctx context.Context, accountID int64, proxyURL string) (*req.Client, error)
+
 // OpenAIQuotaService queries and consumes ChatGPT/Codex rate-limit reset credits
-// for OpenAI OAuth accounts. It reuses the privacy client factory so all calls
-// flow through the impersonated HTTP client (Cloudflare-friendly TLS fingerprint).
+// for OpenAI OAuth accounts. When the sidecar tunnel is available, calls route
+// directly via clean Codex transport (bypassing Chrome impersonation); otherwise
+// falls back to the configured client factory.
 type OpenAIQuotaService struct {
 	accountRepo          AccountRepository
 	proxyRepo            ProxyRepository
 	tokenProvider        *OpenAITokenProvider
 	privacyClientFactory PrivacyClientFactory
+	quotaClientFactory   QuotaClientFactory
 	agentIdentityTaskMu  sync.Mutex
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
+}
+
+// SetQuotaClientFactory installs an explicit client factory for quota/reset calls,
+// bypassing default client resolution.
+func (s *OpenAIQuotaService) SetQuotaClientFactory(factory QuotaClientFactory) {
+	s.quotaClientFactory = factory
 }
 
 // NewOpenAIQuotaService constructs a quota service. token provider is required —
@@ -149,7 +157,7 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 		return nil, err
 	}
 
-	client, err := s.privacyClientFactory(proxyURL)
+	client, err := s.getQuotaClient(ctx, accountID, proxyURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
 	}
@@ -341,7 +349,7 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 		return nil, err
 	}
 
-	client, err := s.privacyClientFactory(proxyURL)
+	client, err := s.getQuotaClient(ctx, accountID, proxyURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
 	}
@@ -558,20 +566,57 @@ func (s *OpenAIQuotaService) redactQuotaErrorBody(ctx context.Context, accountID
 	return string(redactAgentIdentitySensitiveBodyForAccount(ctx, s.accountRepo, account, []byte(body)))
 }
 
+func (s *OpenAIQuotaService) getQuotaClient(ctx context.Context, accountID int64, proxyURL string) (*req.Client, error) {
+	if s != nil && s.quotaClientFactory != nil {
+		return s.quotaClientFactory(ctx, accountID, proxyURL)
+	}
+	if SidecarTLSEnabled(nil) {
+		return newCodexQuotaSidecarClient(proxyURL, accountID)
+	}
+	if s != nil && s.privacyClientFactory != nil {
+		return s.privacyClientFactory(proxyURL)
+	}
+	return newCodexQuotaDirectClient(proxyURL)
+}
+
+func newCodexQuotaSidecarClient(proxyURL string, accountID int64) (*req.Client, error) {
+	client := req.C().SetTimeout(openaiQuotaUpstreamTimeout)
+	trimmed, _, err := proxyurl.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if trimmed != "" {
+		client.SetProxyURL(trimmed)
+	}
+	client.GetTransport().WrapRoundTripFunc(func(rt http.RoundTripper) req.HttpRoundTripFunc {
+		wrapped := NewSidecarAwareRoundTripperForAccount(nil, rt, trimmed, accountID)
+		return wrapped.RoundTrip
+	})
+	return client, nil
+}
+
+func newCodexQuotaDirectClient(proxyURL string) (*req.Client, error) {
+	client := req.C().SetTimeout(openaiQuotaUpstreamTimeout)
+	trimmed, _, err := proxyurl.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if trimmed != "" {
+		client.SetProxyURL(trimmed)
+	}
+	return client, nil
+}
+
 // buildCodexCommonHeaders sets the request headers expected by the chatgpt.com
-// backend so calls succeed past Cloudflare/WASM checks.
+// backend matching Codex TUI wire specifications.
 func buildCodexCommonHeaders(accessToken, chatGPTAccountID string, fedRAMP bool) map[string]string {
 	headers := map[string]string{
 		"authorization":      "Bearer " + accessToken,
 		"chatgpt-account-id": chatGPTAccountID,
 		"openai-beta":        openaiQuotaCodexBeta,
-		"oai-language":       openaiQuotaCodexLanguageTag,
-		"originator":         openaiQuotaCodexOriginator,
+		"originator":         openai.CodexDefaultOriginator,
+		"user-agent":         CodexCanonicalUserAgent(),
 		"accept":             "application/json",
-		"sec-fetch-site":     openaiQuotaSecFetchSite,
-		"sec-fetch-mode":     openaiQuotaSecFetchMode,
-		"sec-fetch-dest":     openaiQuotaSecFetchDest,
-		"priority":           "u=4, i",
 	}
 	if fedRAMP {
 		headers["x-openai-fedramp"] = "true"
