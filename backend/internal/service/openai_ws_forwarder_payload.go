@@ -175,7 +175,9 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	}
 	// 终态收口：WS 握手与 HTTP 出站共用同一套身份语义，账号级自定义 UA 同样作为
 	// 管理员显式配置传入（上面写进 headers 的值只在强制统一被关闭时才参与配对）。
-	if account != nil && account.UsesOpenAICodexProtocol() {
+	// SUB2API_PATCH hook: 当 SUB2API_PATCH 开启时，OpenAI OAuth 流量由 Rust sidecar
+	// 统一做拟态与收敛，Go 侧不修改 User-Agent，透传客户端真实 UA 给 sidecar 进行精准 OS 识别。
+	if account != nil && account.UsesOpenAICodexProtocol() && !sub2apiPatchPassthroughUserAgent(account) {
 		enforceCodexIdentityHeadersWithUA(headers, s.codexIdentityOverrideUA(account))
 	}
 

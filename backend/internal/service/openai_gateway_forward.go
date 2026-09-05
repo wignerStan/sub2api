@@ -1429,7 +1429,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 
 	// 终态收口：强制统一 OAuth 出站身份（User-Agent / originator / version 同源自洽）。
 	// 客户端自报身份不参与构造，浏览器型 UA 也因此不会再到达上游（原浏览器 UA 兜底已被吸收）。
-	if account.UsesOpenAICodexProtocol() {
+	// SUB2API_PATCH hook: 当 SUB2API_PATCH 开启时，OpenAI OAuth 流量由 Rust sidecar
+	// 统一做拟态与收敛，Go 侧不修改 User-Agent，透传客户端真实 UA 给 sidecar 进行精准 OS 识别。
+	if account.UsesOpenAICodexProtocol() && !sub2apiPatchPassthroughUserAgent(account) {
 		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
 	}
 

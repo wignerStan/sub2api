@@ -28,3 +28,11 @@ func sub2apiPatchForceOpenAIWSV2(a *Account) bool {
 func sub2apiPatchForceOpenAIWSModePassthrough(a *Account) bool {
 	return isSub2apiPatchEnabled() && a != nil && a.IsOpenAI() && a.IsOpenAIOAuthLike()
 }
+
+// sub2apiPatchPassthroughUserAgent 报告该账号是否应当透传客户端真实的 User-Agent，
+// 不由 Go 侧 enforceCodexIdentityHeaders 改写。在 SUB2API_PATCH 启用时，
+// OpenAI OAuth 流量改由 Rust sidecar 做完整的身份拟态与收敛，Go 侧保持原始 UA 透传，
+// 以便 sidecar 可以从原始 UA 获取真实的 Client OS 证据（如 Linux / Darwin）。
+func sub2apiPatchPassthroughUserAgent(a *Account) bool {
+	return isSub2apiPatchEnabled() && a != nil && a.IsOpenAI() && a.IsOpenAIOAuthLike()
+}

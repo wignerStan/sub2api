@@ -710,7 +710,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	applyStagedCodexFingerprintHeaders(c, account, req.Header)
 	// 终态收口：透传路径的 OAuth 与非透传完全一致，同样强制统一出站身份
 	// （User-Agent / originator / version 同源自洽），客户端自报身份不会到达上游。
-	if account.UsesOpenAICodexProtocol() {
+	// SUB2API_PATCH hook: 当 SUB2API_PATCH 开启时，OpenAI OAuth 流量由 Rust sidecar
+	// 统一做拟态与收敛，Go 侧不修改 User-Agent，透传客户端真实 UA 给 sidecar 进行精准 OS 识别。
+	if account.UsesOpenAICodexProtocol() && !sub2apiPatchPassthroughUserAgent(account) {
 		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
 	}
 
